@@ -11,8 +11,13 @@
 #include <chrono>
 #include <span>
 
+// Hash libraries
 #include "contrib/boost/uuid/detail/sha1.hpp"
 #include "contrib/xxHash/xxhash.h"
+#include "contrib/ssdeep/fuzzy.h"
+
+// Resemblance detection support
+#include "contrib/embeddings.cpp/bert.h"
 
 char get_char_with_echo() {
   return getchar();
@@ -202,7 +207,7 @@ namespace fastcdc {
 
 int main(int argc, char* argv[])
 {
-  //get_char_with_echo();
+  get_char_with_echo();
   std::string file_path{ argv[1] };
   uint32_t avg_size = 8192;
   uint32_t min_size = avg_size / 4;
@@ -216,6 +221,15 @@ int main(int argc, char* argv[])
   avg_size = 512;
   max_size = 1024;
 
+  bert_params params;
+  params.model = R"(C:\Users\Administrator\Desktop\fastcdc_test\paraphrase-MiniLM-L3-v2-GGML-q4_0.bin)";
+  params.n_threads = 20;
+  bert_ctx* bctx = bert_load_from_file(params.model);
+  const int bert_max_tokens_num = bert_n_max_tokens(bctx);
+  std::vector<bert_vocab_id> bert_feature_tokens(bert_max_tokens_num);
+  int bert_tokens_num = 0;
+  std::vector<float> bert_embeddings(bert_n_embd(bctx));
+
   auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
   if (!file_stream.is_open()) {
     std::cout << "Can't read file\n";
@@ -223,7 +237,9 @@ int main(int argc, char* argv[])
   }
   uint64_t total_size = 0;
   uint64_t deduped_size = 0;
+  uint64_t delta_compressed_approx_size = 0;
   std::set<std::string> known_hashes{};
+  std::set<std::string> known_delta_hashes{};
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
   auto chunks = fastcdc::chunk_generator(file_stream, min_size, avg_size, max_size, true);
   auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
@@ -232,17 +248,45 @@ int main(int argc, char* argv[])
     total_size += chunk.length;
     // make hashes
     /*
+    // SHA1 boost hash
     boost::uuids::detail::sha1 hasher;
     hasher.process_bytes(chunk.data.data(), chunk.data.size());
     chunk.hash = get_sha1_hash(hasher);
     */
+    /*
+    // xxHash
     XXH3_state_t* state = XXH3_createState();
     XXH3_64bits_reset(state);
     XXH3_64bits_update(state, chunk.data.data(), chunk.data.size());
     XXH64_hash_t result = XXH3_64bits_digest(state);
     XXH3_freeState(state);
     chunk.hash = std::to_string(XXH3_64bits_digest(state));
+    */
+    char* ssdeep_hash = static_cast<char*>(malloc(FUZZY_MAX_RESULT));
+    fuzzy_hash_buf(chunk.data.data(), chunk.data.size(), ssdeep_hash);
+    chunk.hash = ssdeep_hash;
+    // free(ssdeep_hash);
     if (!known_hashes.contains(chunk.hash)) {
+      bert_tokenize(bctx, chunk.hash.c_str(), bert_feature_tokens.data(), &bert_tokens_num, bert_max_tokens_num);
+      bert_forward(bctx, params.n_threads, bert_feature_tokens.data(), bert_tokens_num, bert_embeddings.data());
+
+      bool found_similar = false;
+      int similarity = 0;
+      for (const auto& hash : known_delta_hashes) {
+        similarity = fuzzy_compare(hash.c_str(), chunk.hash.c_str());
+        if (similarity >= 70) {
+          found_similar = true;
+          break;
+        }
+      }
+      if (found_similar) {
+        std::cout << "Yuppi! found similar chunk\n" << std::flush;
+        delta_compressed_approx_size += chunk.length * (1 - similarity);
+      }
+      else
+      {
+        known_delta_hashes.insert(chunk.hash);
+      }
       known_hashes.insert(chunk.hash);
       deduped_size += chunk.length;
     }
@@ -253,12 +297,15 @@ int main(int argc, char* argv[])
   std::cout << std::string("Chunk Sizes:    min ") + std::to_string(min_size) + " - avg " + std::to_string(avg_size) + " - max " + std::to_string(max_size) + "\n" << std::flush;
   std::cout << "Total chunk count: " + std::to_string(chunks.size()) + "\n" << std::flush;
   std::cout << "Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n" << std::flush;
+  std::cout << "Total delta compressed chunk count: " + std::to_string(known_delta_hashes.size()) + "\n" << std::flush;
 
   // Throughput stats
   auto total_size_mbs = total_size / (1024.0 * 1024);
   std::printf("Chunk data total size:    %.1f MB\n", total_size_mbs);
   auto deduped_size_mbs = deduped_size / (1024.0 * 1024);
   std::printf("Chunk data deduped size:    %.1f MB\n", deduped_size_mbs);
+  auto deltad_size_mbs = delta_compressed_approx_size / (1024.0 * 1024);
+  std::printf("Chunk data delta compressed size:    %.1f MB\n", deltad_size_mbs);
   auto chunking_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
   auto chunking_mb_per_nanosecond = total_size_mbs / chunking_elapsed_nanoseconds;
   std::printf("Chunking Throughput:    %.1f MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));

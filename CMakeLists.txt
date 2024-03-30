@@ -69,9 +69,16 @@ if ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
 endif ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
 
 set(XXHASH_SRC "${SRCDIR}/contrib/xxHash/xxhash.c")
+set(SSDEEP_SRC "${SRCDIR}/contrib/ssdeep/fuzzy.c")
+
+add_subdirectory(contrib/embeddings.cpp)
+#set(BERT_SRC "${SRCDIR}/contrib/embeddings.cpp/bert.cpp")
+#set(GGML_INCLUDE_DIR "${SRCDIR}/contrib/embeddings.cpp/ggml/include/ggml")
+#include_directories(AFTER ${GGML_INCLUDE_DIR})
 
 set(DEDUP_PROJ_SRC "${SRCDIR}/dedup_proj.cpp")
 
-add_executable(dedup_proj ${DEDUP_PROJ_SRC} ${XXHASH_SRC} )
+add_executable(dedup_proj ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${SSDEEP_SRC} )
+target_link_libraries(dedup_proj bert)
 
 install(TARGETS dedup_proj DESTINATION bin)
