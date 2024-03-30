@@ -68,8 +68,10 @@ if ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
   add_definitions(-DBIT64)
 endif ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
 
+set(XXHASH_SRC "${SRCDIR}/contrib/xxHash/xxhash.c")
+
 set(DEDUP_PROJ_SRC "${SRCDIR}/dedup_proj.cpp")
 
-add_executable(dedup_proj ${DEDUP_PROJ_SRC} )
+add_executable(dedup_proj ${DEDUP_PROJ_SRC} ${XXHASH_SRC} )
 
 install(TARGETS dedup_proj DESTINATION bin)

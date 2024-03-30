@@ -11,6 +11,7 @@
 #include <chrono>
 
 #include "contrib/boost/uuid/detail/sha1.hpp"
+#include "contrib/xxHash/xxhash.h"
 
 char get_char_with_echo() {
   return getchar();
@@ -225,9 +226,17 @@ int main(int argc, char* argv[])
   for (auto& chunk : chunks) {
     total_size += chunk.length;
     // make hashes
+    /*
     boost::uuids::detail::sha1 hasher;
     hasher.process_bytes(chunk.data.data(), chunk.data.size());
     chunk.hash = get_sha1_hash(hasher);
+    */
+    XXH3_state_t* state = XXH3_createState();
+    XXH3_64bits_reset(state);
+    XXH3_64bits_update(state, chunk.data.data(), chunk.data.size());
+    XXH64_hash_t result = XXH3_64bits_digest(state);
+    XXH3_freeState(state);
+    chunk.hash = std::to_string(XXH3_64bits_digest(state));
     if (!known_hashes.contains(chunk.hash)) {
       known_hashes.insert(chunk.hash);
       deduped_size += chunk.length;
