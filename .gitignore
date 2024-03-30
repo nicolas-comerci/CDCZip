@@ -1,0 +1,63 @@
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Visual Studio specific files
+*.opensdf
+*.sdf
+*.ncb
+*.suo
+*.user
+*.log
+*.tlog
+*.pdb
+*.lastbuildstate
+*.VC.db
+*.VC.VC.opendb
+.vs
+
+# Visual Studio output directories
+vs2015/Debug
+vs2015/Release
+vs2015/x64
+vs2015/paq8o8pre/Debug
+vs2015/paq8o8pre/Release
+vs2015/paq8o8pre/x64
+vs2015/Precomp/Debug
+vs2015/Precomp/Release
+vs2015/Precomp/x64
+
+# CMAKE
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+.idea/
+cmake-build-debug/
+cmake-build-release/
+CMakeSettings.json
+cmake-build-minsizerel/
+cmake-build-relwithdebinfo/
+7zPlugin/bin/
+7zPlugin/PrecompCodec/x64/
+7zPlugin/PrecompCodec/Debug/
+7zPlugin/PrecompCodec/Release/
+cmake-build-default/
