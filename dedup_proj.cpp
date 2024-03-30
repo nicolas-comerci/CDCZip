@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <set>
 #include <chrono>
+#include <span>
 
 #include "contrib/boost/uuid/detail/sha1.hpp"
 #include "contrib/xxHash/xxhash.h"
@@ -131,7 +132,7 @@ namespace utility {
 
 namespace fastcdc {
   uint32_t cdc_offset(
-    const std::vector<uint8_t>& data,
+    const std::span<uint8_t> data,
     uint32_t min_size,
     uint32_t avg_size,
     uint32_t max_size,
@@ -174,22 +175,26 @@ namespace fastcdc {
 
     uint32_t offset = 0;
     std::vector<utility::CDChunk> chunks{};
-    while (!blob.empty()) {
-      blob_len = blob.size();
+    auto blob_it = blob.begin();
+    while (blob_it != blob.end()) {
+      blob_len = blob.end() - blob_it;
       if (blob_len <= max_size) {
+        blob.erase(blob.begin(), blob_it);
+        blob_it = blob.begin();  // iterators got invalidated
+
         blob.resize(read_size);
         stream.read(reinterpret_cast<char*>(blob.data()) + blob_len, read_size - blob_len);
         blob_len += stream.gcount();
         blob.resize(blob_len);
       }
-      uint32_t cp = cdc_offset(blob, min_size, avg_size, max_size, cs, mask_s, mask_l);
+      uint32_t cp = cdc_offset(std::span(blob_it, blob.end()), min_size, avg_size, max_size, cs, mask_s, mask_l);
       std::vector<uint8_t> raw{};
       if (fat) {
-        raw = std::vector<uint8_t>(blob.begin(), blob.begin() + cp);
+        raw = std::vector(blob_it, blob_it + cp);
       }
       chunks.emplace_back(offset, cp, std::move(raw), std::string());
-      blob.erase(blob.begin(), blob.begin() + cp);
       offset += cp;
+      blob_it += cp;
     }
     return chunks;
   }
