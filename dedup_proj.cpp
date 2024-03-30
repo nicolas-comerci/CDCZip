@@ -7,6 +7,8 @@
 #include <string>
 #include <random>
 #include <cstdio>
+#include <set>
+#include <chrono>
 
 #include "contrib/boost/uuid/detail/sha1.hpp"
 
@@ -28,24 +30,6 @@ std::string get_sha1_hash(boost::uuids::detail::sha1& s) {
 
   return { buf };
 }
-/*
-std::string calculate_sha1(IStreamLike& file1, unsigned int pos1) {
-  std::vector<unsigned char> input_bytes1;
-  input_bytes1.resize(CHUNK);
-  long long size1;
-  boost::uuids::detail::sha1 s;
-
-  file1.seekg(pos1, std::ios_base::beg);
-
-  do {
-    file1.read(reinterpret_cast<char*>(input_bytes1.data()), CHUNK);
-    size1 = file1.gcount();
-    s.process_bytes(input_bytes1.data(), size1);
-  } while (size1 == CHUNK);
-
-  return get_sha1_hash(s);
-}
-*/
 
 namespace constants {
   // Smallest acceptable value for the minimum chunk size.
@@ -232,15 +216,44 @@ int main(int argc, char* argv[])
     return 1;
   }
   uint64_t total_size = 0;
+  uint64_t deduped_size = 0;
+  std::set<std::string> known_hashes{};
+  auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
   auto chunks = fastcdc::chunk_generator(file_stream, min_size, avg_size, max_size, true);
-  for (const auto& chunk : chunks) {
+  auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
+  auto hashing_start_time = std::chrono::high_resolution_clock::now();
+  for (auto& chunk : chunks) {
     total_size += chunk.length;
     // make hashes
+    boost::uuids::detail::sha1 hasher;
+    hasher.process_bytes(chunk.data.data(), chunk.data.size());
+    chunk.hash = get_sha1_hash(hasher);
+    if (!known_hashes.contains(chunk.hash)) {
+      known_hashes.insert(chunk.hash);
+      deduped_size += chunk.length;
+    }
   }
+  auto hashing_end_time = std::chrono::high_resolution_clock::now();
+
+  // Chunk stats
   std::cout << std::string("Chunk Sizes:    min ") + std::to_string(min_size) + " - avg " + std::to_string(avg_size) + " - max " + std::to_string(max_size) + "\n" << std::flush;
   std::cout << "Total chunk count: " + std::to_string(chunks.size()) + "\n" << std::flush;
-  auto total_size_double = total_size / (1024.0 * 1024);
-  std::printf("Chunk data total size:    %.1f MB\n", total_size_double);
+  std::cout << "Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n" << std::flush;
+
+  // Throughput stats
+  auto total_size_mbs = total_size / (1024.0 * 1024);
+  std::printf("Chunk data total size:    %.1f MB\n", total_size_mbs);
+  auto deduped_size_mbs = deduped_size / (1024.0 * 1024);
+  std::printf("Chunk data deduped size:    %.1f MB\n", deduped_size_mbs);
+  auto chunking_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
+  auto chunking_mb_per_nanosecond = total_size_mbs / chunking_elapsed_nanoseconds;
+  std::printf("Chunking Throughput:    %.1f MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
+  auto hashing_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - hashing_start_time).count();
+  auto hashing_mb_per_nanosecond = total_size_mbs / hashing_elapsed_nanoseconds;
+  std::printf("Hashing Throughput:    %.1f MB/s\n", hashing_mb_per_nanosecond * std::pow(10, 9));
+  auto total_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - chunk_generator_start_time).count();
+  auto total_mb_per_nanosecond = total_size_mbs / total_elapsed_nanoseconds;
+  std::printf("Total Throughput:    %.1f MB/s\n", total_mb_per_nanosecond * std::pow(10, 9));
 
   return 0;
 }
