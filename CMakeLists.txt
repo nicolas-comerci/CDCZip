@@ -76,9 +76,26 @@ add_subdirectory(contrib/embeddings.cpp)
 #set(GGML_INCLUDE_DIR "${SRCDIR}/contrib/embeddings.cpp/ggml/include/ggml")
 #include_directories(AFTER ${GGML_INCLUDE_DIR})
 
+# netlib blas
+#add_subdirectory(contrib/BLAS)
+
+# compiled openblas
+#add_library(blas STATIC IMPORTED) # or STATIC instead of SHARED
+#set_target_properties(blas PROPERTIES
+#  IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/contrib/OpenBLAS-0.3.26-x64/lib/libopenblas.lib"
+#  INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/contrib/OpenBLAS-0.3.26-x64/include"
+#)
+#set(BLAS_LIBRARIES "blas")
+#set(NOFORTRAN True)
+#add_subdirectory(contrib/OpenBLAS-0.3.26)
+set(FAISS_ENABLE_PYTHON OFF)
+set(FAISS_ENABLE_GPU OFF)
+set(BUILD_TESTING OFF)
+add_subdirectory(contrib/faiss)
+
 set(DEDUP_PROJ_SRC "${SRCDIR}/dedup_proj.cpp")
 
 add_executable(dedup_proj ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${SSDEEP_SRC} )
-target_link_libraries(dedup_proj bert)
+target_link_libraries(dedup_proj bert faiss)
 
 install(TARGETS dedup_proj DESTINATION bin)

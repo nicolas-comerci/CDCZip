@@ -10,6 +10,7 @@
 #include <set>
 #include <chrono>
 #include <span>
+#include <array>
 
 // Hash libraries
 #include "contrib/boost/uuid/detail/sha1.hpp"
@@ -18,6 +19,9 @@
 
 // Resemblance detection support
 #include "contrib/embeddings.cpp/bert.h"
+#include <faiss/IndexFlat.h>
+#include <faiss/MetricType.h>
+#include <faiss/utils/distances.h>
 
 char get_char_with_echo() {
   return getchar();
@@ -185,12 +189,12 @@ namespace fastcdc {
       blob_len = blob.end() - blob_it;
       if (blob_len <= max_size) {
         blob.erase(blob.begin(), blob_it);
-        blob_it = blob.begin();  // iterators got invalidated
 
         blob.resize(read_size);
         stream.read(reinterpret_cast<char*>(blob.data()) + blob_len, read_size - blob_len);
         blob_len += stream.gcount();
         blob.resize(blob_len);
+        blob_it = blob.begin();  // iterators got invalidated
       }
       uint32_t cp = cdc_offset(std::span(blob_it, blob.end()), min_size, avg_size, max_size, cs, mask_s, mask_l);
       std::vector<uint8_t> raw{};
@@ -228,7 +232,13 @@ int main(int argc, char* argv[])
   const int bert_max_tokens_num = bert_n_max_tokens(bctx);
   std::vector<bert_vocab_id> bert_feature_tokens(bert_max_tokens_num);
   int bert_tokens_num = 0;
-  std::vector<float> bert_embeddings(bert_n_embd(bctx));
+  const auto embeddings_dim = bert_n_embd(bctx);
+  std::vector<float> bert_embeddings(embeddings_dim);
+
+  faiss::IndexFlatIP index(embeddings_dim);
+  std::array<float, 5> search_results{};
+  std::array<faiss::idx_t, 5> search_result_labels{};
+  printf("is_trained = %s\n", index.is_trained ? "true" : "false");
 
   auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
   if (!file_stream.is_open()) {
@@ -239,7 +249,7 @@ int main(int argc, char* argv[])
   uint64_t deduped_size = 0;
   uint64_t delta_compressed_approx_size = 0;
   std::set<std::string> known_hashes{};
-  std::set<std::string> known_delta_hashes{};
+  std::vector<std::string> known_delta_hashes{};
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
   auto chunks = fastcdc::chunk_generator(file_stream, min_size, avg_size, max_size, true);
   auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
@@ -269,10 +279,21 @@ int main(int argc, char* argv[])
     if (!known_hashes.contains(chunk.hash)) {
       bert_tokenize(bctx, chunk.hash.c_str(), bert_feature_tokens.data(), &bert_tokens_num, bert_max_tokens_num);
       bert_forward(bctx, params.n_threads, bert_feature_tokens.data(), bert_tokens_num, bert_embeddings.data());
+      faiss::fvec_renorm_L2(embeddings_dim, 1, bert_embeddings.data());
 
       bool found_similar = false;
       int similarity = 0;
+      if (!known_delta_hashes.empty()) {
+        index.search(1, bert_embeddings.data(), 5, search_results.data(), search_result_labels.data());
+        const faiss::idx_t estimated_most_similar_block_idx = search_result_labels[0];
+        const auto estimated_similarity = search_results[0];
+        similarity = fuzzy_compare(known_delta_hashes[estimated_most_similar_block_idx].c_str(), chunk.hash.c_str());
+        if (similarity >= 70) {
+          found_similar = true;
+        }
+      }
       /*
+      int similarity = 0;
       for (const auto& hash : known_delta_hashes) {
         similarity = fuzzy_compare(hash.c_str(), chunk.hash.c_str());
         if (similarity >= 70) {
@@ -287,7 +308,8 @@ int main(int argc, char* argv[])
       }
       else
       {
-        known_delta_hashes.insert(chunk.hash);
+        index.add(1, bert_embeddings.data());
+        known_delta_hashes.push_back(chunk.hash);
       }
       known_hashes.insert(chunk.hash);
       deduped_size += chunk.length;
