@@ -36,12 +36,14 @@ option(BERT_FMA                    "bert: enable FMA"                           
 
 # 3rd party libs
 option(BERT_ACCELERATE             "bert: enable Accelerate framework"                    ON)
-option(BERT_OPENBLAS               "bert: use OpenBLAS"                                   OFF)
+option(BERT_BLAS_MKL               "bert: use intel MKL BLAS"                             ON)
+option(BERT_OPENBLAS               "bert: use OpenBLAS"                                  OFF)
 
 #
 # Compile flags
 #
 
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 set(CMAKE_CXX_STANDARD_REQUIRED true)
 set(CMAKE_C_STANDARD_REQUIRED true)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
@@ -74,8 +76,21 @@ if (APPLE AND BERT_ACCELERATE)
     else()
         message(WARNING "Accelerate framework not found")
     endif()
-endif()
-if (BERT_OPENBLAS)
+elseif (BERT_BLAS_MKL)
+    if (BERT_STATIC)
+        set(BLA_STATIC ON)
+    endif()
+
+    find_package(MKL)
+    if(MKL_FOUND)
+        message(STATUS "MKL found")
+
+        add_compile_definitions(GGML_BLAS_USE_MKL)
+        add_link_options(${MKL_LIBRARIES})
+    else()
+        message(WARNING "MKL not found")
+    endif()
+elseif (BERT_OPENBLAS)
     if (BERT_STATIC)
         set(BLA_STATIC ON)
     endif()

@@ -146,9 +146,9 @@ namespace fastcdc {
     uint32_t mask_l
   ) {
     uint32_t pattern = 0;
-    uint32_t i = min_size;
     uint32_t size = data.size();
     uint32_t barrier = std::min(center_size, size);
+    uint32_t i = std::min(barrier, min_size);
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
       if (!(pattern & mask_s))
@@ -207,7 +207,7 @@ namespace fastcdc {
 
 int main(int argc, char* argv[])
 {
-  get_char_with_echo();
+  //get_char_with_echo();
   std::string file_path{ argv[1] };
   uint32_t avg_size = 8192;
   uint32_t min_size = avg_size / 4;
@@ -272,6 +272,7 @@ int main(int argc, char* argv[])
 
       bool found_similar = false;
       int similarity = 0;
+      /*
       for (const auto& hash : known_delta_hashes) {
         similarity = fuzzy_compare(hash.c_str(), chunk.hash.c_str());
         if (similarity >= 70) {
@@ -279,6 +280,7 @@ int main(int argc, char* argv[])
           break;
         }
       }
+      */
       if (found_similar) {
         std::cout << "Yuppi! found similar chunk\n" << std::flush;
         delta_compressed_approx_size += chunk.length * (1 - similarity);
@@ -315,6 +317,7 @@ int main(int argc, char* argv[])
   auto total_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - chunk_generator_start_time).count();
   auto total_mb_per_nanosecond = total_size_mbs / total_elapsed_nanoseconds;
   std::printf("Total Throughput:    %.1f MB/s\n", total_mb_per_nanosecond * std::pow(10, 9));
+  std::printf("Total runtime:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(hashing_end_time - chunk_generator_start_time).count());
 
   return 0;
 }
