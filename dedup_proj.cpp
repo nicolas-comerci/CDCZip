@@ -22,6 +22,7 @@
 #include <faiss/IndexFlat.h>
 #include <faiss/MetricType.h>
 #include <faiss/utils/distances.h>
+#include <faiss/IndexLSH.h>
 
 char get_char_with_echo() {
   return getchar();
@@ -235,7 +236,7 @@ int main(int argc, char* argv[])
   const auto embeddings_dim = bert_n_embd(bctx);
   std::vector<float> bert_embeddings(embeddings_dim);
 
-  faiss::IndexFlatIP index(embeddings_dim);
+  faiss::IndexLSH index(max_size / 4, 32, false);
   std::array<float, 5> search_results{};
   std::array<faiss::idx_t, 5> search_result_labels{};
   printf("is_trained = %s\n", index.is_trained ? "true" : "false");
@@ -277,38 +278,26 @@ int main(int argc, char* argv[])
     chunk.hash = ssdeep_hash;
     // free(ssdeep_hash);
     if (!known_hashes.contains(chunk.hash)) {
-      bert_tokenize(bctx, chunk.hash.c_str(), bert_feature_tokens.data(), &bert_tokens_num, bert_max_tokens_num);
-      bert_forward(bctx, params.n_threads, bert_feature_tokens.data(), bert_tokens_num, bert_embeddings.data());
-      faiss::fvec_renorm_L2(embeddings_dim, 1, bert_embeddings.data());
+      //bert_tokenize(bctx, chunk.hash.c_str(), bert_feature_tokens.data(), &bert_tokens_num, bert_max_tokens_num);
+      //bert_forward(bctx, params.n_threads, bert_feature_tokens.data(), bert_tokens_num, bert_embeddings.data());
+      //faiss::fvec_renorm_L2(embeddings_dim, 1, bert_embeddings.data());
+      std::vector<uint8_t> chunk_padded( max_size, 0 );
+      std::copy_n(chunk.data.data(), chunk.data.size(), chunk_padded.data());
 
       bool found_similar = false;
-      int similarity = 0;
       if (!known_delta_hashes.empty()) {
-        index.search(1, bert_embeddings.data(), 5, search_results.data(), search_result_labels.data());
+        index.search(1, reinterpret_cast<float*>(chunk_padded.data()), 5, search_results.data(), search_result_labels.data());
         const faiss::idx_t estimated_most_similar_block_idx = search_result_labels[0];
-        const auto estimated_similarity = search_results[0];
-        similarity = fuzzy_compare(known_delta_hashes[estimated_most_similar_block_idx].c_str(), chunk.hash.c_str());
+        const auto hamming_distance = search_results[0];
+        int similarity = fuzzy_compare(known_delta_hashes[estimated_most_similar_block_idx].c_str(), chunk.hash.c_str());
         if (similarity >= 70) {
           found_similar = true;
+          std::cout << "Yuppi! found similar chunk: ssdeep similarity=" + std::to_string(similarity) + " IndexLSH distance=" + std::to_string(hamming_distance) + "\n" << std::flush;
+          delta_compressed_approx_size += static_cast<uint64_t>(chunk.length * (similarity / 100.0));
         }
       }
-      /*
-      int similarity = 0;
-      for (const auto& hash : known_delta_hashes) {
-        similarity = fuzzy_compare(hash.c_str(), chunk.hash.c_str());
-        if (similarity >= 70) {
-          found_similar = true;
-          break;
-        }
-      }
-      */
-      if (found_similar) {
-        std::cout << "Yuppi! found similar chunk\n" << std::flush;
-        delta_compressed_approx_size += chunk.length * (1 - similarity);
-      }
-      else
-      {
-        index.add(1, bert_embeddings.data());
+      if (!found_similar) {
+        index.add(1, reinterpret_cast<float*>(chunk_padded.data()));
         known_delta_hashes.push_back(chunk.hash);
       }
       known_hashes.insert(chunk.hash);
@@ -321,15 +310,15 @@ int main(int argc, char* argv[])
   std::cout << std::string("Chunk Sizes:    min ") + std::to_string(min_size) + " - avg " + std::to_string(avg_size) + " - max " + std::to_string(max_size) + "\n" << std::flush;
   std::cout << "Total chunk count: " + std::to_string(chunks.size()) + "\n" << std::flush;
   std::cout << "Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n" << std::flush;
-  std::cout << "Total delta compressed chunk count: " + std::to_string(known_delta_hashes.size()) + "\n" << std::flush;
+  std::cout << "Total delta compressed chunk count: " + std::to_string(known_hashes.size() - known_delta_hashes.size()) + "\n" << std::flush;
 
   // Throughput stats
   auto total_size_mbs = total_size / (1024.0 * 1024);
   std::printf("Chunk data total size:    %.1f MB\n", total_size_mbs);
   auto deduped_size_mbs = deduped_size / (1024.0 * 1024);
   std::printf("Chunk data deduped size:    %.1f MB\n", deduped_size_mbs);
-  auto deltad_size_mbs = delta_compressed_approx_size / (1024.0 * 1024);
-  std::printf("Chunk data delta compressed size:    %.1f MB\n", deltad_size_mbs);
+  auto deltaed_size_mbs = delta_compressed_approx_size / (1024.0 * 1024);
+  std::printf("Chunk data delta compressed size:    %.1f MB\n", deltaed_size_mbs);
   auto chunking_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
   auto chunking_mb_per_nanosecond = total_size_mbs / chunking_elapsed_nanoseconds;
   std::printf("Chunking Throughput:    %.1f MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
