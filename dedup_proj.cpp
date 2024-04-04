@@ -24,6 +24,7 @@
 #include <faiss/MetricType.h>
 #include <faiss/utils/distances.h>
 #include <faiss/IndexLSH.h>
+#include <faiss/IndexBinaryHash.h>
 
 char get_char_with_echo() {
   return getchar();
@@ -211,9 +212,64 @@ namespace fastcdc {
   }
 }
 
+std::array<uint8_t, 4> simhash_data(uint8_t* data, int data_len, int chunk_size = 16) {
+  // Initialize SimHash array
+  std::array<uint8_t, 4> simhash = { 0 };
+
+  // Iterate over the data in chunks
+  for (int i = 0; i < data_len; i += chunk_size) {
+    // Calculate hash for current chunk
+    std::hash<std::string> hasher;
+    uint32_t chunk_hash = hasher(reinterpret_cast<const char*>(data + i));
+
+    // Update SimHash with the hash of the chunk
+    for (int j = 0; j < 4; ++j) {
+      // Update each byte of the SimHash with the corresponding byte of the chunk hash
+      simhash[j] += (chunk_hash >> (j * 8)) & 0xFF;
+    }
+  }
+
+  return simhash;
+}
+
+std::array<uint8_t, 8> simhash_data_xxhash(uint8_t* data, int data_len, int chunk_size = 16) {
+  // Initialize SimHash array
+  std::array<uint8_t, 8> simhash = { 0 };
+
+  XXH3_state_t* state = XXH3_createState();
+  XXH3_64bits_reset(state);
+
+  // Iterate over the data in chunks
+  for (int i = 0; i < data_len; i += chunk_size) {
+    // Calculate hash for current chunk
+    XXH3_64bits_update(state, data + i, std::min(chunk_size, data_len - i));
+    XXH64_hash_t chunk_hash = XXH3_64bits_digest(state);
+    XXH3_64bits_reset(state);
+
+    // Update SimHash with the hash of the chunk
+    for (int j = 0; j < 8; ++j) {
+      // Update each byte of the SimHash with the corresponding byte of the chunk hash
+      simhash[j] += (chunk_hash >> (j * 8)) & 0xFF;
+    }
+  }
+
+  XXH3_freeState(state);
+  return simhash;
+}
+
+int hamming_distance(uint8_t byte1, uint8_t byte2) {
+  int dist = 0;
+  unsigned long val = byte1 ^ byte2;
+  while (val != 0) {
+    dist++;
+    val &= val - 1;
+  }
+  return dist;
+}
+
 int main(int argc, char* argv[])
 {
-  //get_char_with_echo();
+  get_char_with_echo();
   std::string file_path{ argv[1] };
   uint32_t avg_size = 8192;
   uint32_t min_size = avg_size / 4;
@@ -237,10 +293,16 @@ int main(int argc, char* argv[])
   const auto embeddings_dim = bert_n_embd(bctx);
   std::vector<float> bert_embeddings(embeddings_dim);
 
+  int batch_size = 100;
+
   faiss::IndexLSH index(max_size / 4, 64, false);
-  std::array<float, 5> search_results{};
-  std::array<faiss::idx_t, 5> search_result_labels{};
-  printf("is_trained = %s\n", index.is_trained ? "true" : "false");
+  std::vector<float> search_results(5 * batch_size, 0);
+  std::vector<faiss::idx_t> search_result_labels(5 * batch_size, -1);
+  //printf("is_trained = %s\n", index.is_trained ? "true" : "false");
+
+  faiss::IndexBinaryHash binary_hash_idx(64, 8);
+  std::vector<int32_t> search_binary_hash_results(5 * batch_size, 0);
+  printf("is_trained = %s\n", binary_hash_idx.is_trained ? "true" : "false");
 
   auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
   if (!file_stream.is_open()) {
@@ -259,6 +321,11 @@ int main(int argc, char* argv[])
   auto hashing_start_time = std::chrono::high_resolution_clock::now();
 
   int chunk_i = 0;
+  int pending_chunks = 0;
+  std::vector<int32_t> pending_chunks_indexes(batch_size, 0);
+  std::vector<uint8_t> pending_chunk_data(batch_size * max_size, 0);
+  std::vector<std::array<uint8_t, 8>> simhashes{};
+
   for (auto& chunk : chunks) {
     if (chunk_i % 1000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(chunk_i) / chunks.size()) * 100) + "\n" << std::flush;
     total_size += chunk.length;
@@ -283,6 +350,78 @@ int main(int argc, char* argv[])
     chunk.hash = ssdeep_hash;
     */
     // free(ssdeep_hash);
+
+    /*
+    if (!known_hashes.contains(chunk.hash)) {
+      faiss_idx_to_chunk_id.push_back(chunk_i);
+      simhashes.emplace_back(simhash_data_xxhash(chunk.data.data(), chunk.data.size()));
+      binary_hash_idx.add(1, simhashes.back().data());
+      binary_hash_idx.search(1, simhashes.back().data(), 5, search_binary_hash_results.data(), search_result_labels.data());
+      auto faiss_dist = search_binary_hash_results[0];
+      if (faiss_idx_to_chunk_id[search_result_labels[0]] == chunk_i) {
+        faiss_dist = search_binary_hash_results[1];
+      }
+
+      //int32_t brute_dist = 0;
+      //for (int i = 0; i < simhashes.size() - 1; ++i) {
+      //  brute_dist = 0;
+      //  const auto& new_simhash = simhashes.back();
+      //  const auto& existing_simhash = simhashes[i];
+      //  for (int byte = 0; byte < 8; ++byte) {
+      //    brute_dist += hamming_distance(new_simhash[byte], existing_simhash[byte]);
+      //  }
+      //  if (brute_dist <= 4) {
+      //    std::cout << "Yuppi! posible similar chunk, distance: " + std::to_string(brute_dist) + "\n" << std::flush;
+      //    const auto& similar_chunk = chunks[faiss_idx_to_chunk_id[i]];
+      //    break;
+      //  }
+      //}
+      //if (faiss_dist <= 4 && faiss_dist != brute_dist) {
+      //  std::cout << "FAISS and brute search disagree about minimum distance! faiss: " + std::to_string(faiss_dist) + " brute: " + std::to_string(brute_dist) + "\n" << std::flush;
+      //}
+
+      known_hashes.insert(chunk.hash);
+    }
+    */
+    if (!known_hashes.contains(chunk.hash)) {
+      std::copy_n(chunk.data.data(), chunk.data.size(), pending_chunk_data.data() + (max_size * pending_chunks));
+      // Faiss IndexLSH requires all chunks to be of the same size so zero pad if needed
+      if (chunk.data.size() < max_size) {
+        std::memset(pending_chunk_data.data() + (max_size * pending_chunks) + chunk.data.size(), 0, max_size - chunk.data.size());
+      }
+      faiss_idx_to_chunk_id.push_back(chunk_i);
+      pending_chunks_indexes[pending_chunks] = chunk_i;
+      pending_chunks++;
+      known_hashes.insert(chunk.hash);
+    }
+    else {
+      deduped_size += chunk.length;
+    }
+
+    if (pending_chunks < batch_size && chunk_i != chunks.size() - 1) {
+      chunk_i++;
+      continue;
+    }
+
+    // We add all the pending chunk hashes, and we will search for the 2nd most similar search result, as the top search result will be the very same hash
+    index.add(pending_chunks, reinterpret_cast<float*>(pending_chunk_data.data()));
+    index.search(pending_chunks, reinterpret_cast<float*>(pending_chunk_data.data()), 5, search_results.data(), search_result_labels.data());
+
+    for (int i = 0; i < pending_chunks; ++i) {
+      faiss::idx_t& estimated_most_similar_block_idx = search_result_labels[0];
+      auto& hamming_distance = search_results[0];
+      // As expected (though not always) the most similar chunk according to FAISS is itself, picking the second most similar one
+      if (faiss_idx_to_chunk_id[estimated_most_similar_block_idx] == pending_chunks_indexes[i]) {
+        estimated_most_similar_block_idx = search_result_labels[1];
+        hamming_distance = search_results[1];
+      }
+      float similarity = 1 - (hamming_distance / 64);
+      if (similarity >= 0.3) {
+        //std::cout << "delta compression candidate, chunk " + std::to_string(pending_chunks_indexes[i]) + ": IndexLSH distance=" + std::to_string(hamming_distance) + "\n" << std::flush;
+        delta_compressed_approx_size += static_cast<uint64_t>(chunk.length * similarity);
+      }
+    }
+    /*
     if (!known_hashes.contains(chunk.hash)) {
       //bert_tokenize(bctx, chunk.hash.c_str(), bert_feature_tokens.data(), &bert_tokens_num, bert_max_tokens_num);
       //bert_forward(bctx, params.n_threads, bert_feature_tokens.data(), bert_tokens_num, bert_embeddings.data());
@@ -326,6 +465,9 @@ int main(int argc, char* argv[])
       known_hashes.insert(chunk.hash);
       deduped_size += chunk.length;
     }
+    */
+
+    pending_chunks = 0;
     chunk_i++;
   }
   auto hashing_end_time = std::chrono::high_resolution_clock::now();
