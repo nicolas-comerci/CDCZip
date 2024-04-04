@@ -19,6 +19,8 @@
 #include "contrib/ssdeep/fuzzy.h"
 
 // Resemblance detection support
+#include <filesystem>
+
 #include "contrib/embeddings.cpp/bert.h"
 #include <faiss/IndexFlat.h>
 #include <faiss/MetricType.h>
@@ -312,6 +314,7 @@ int main(int argc, char* argv[])
   uint64_t total_size = 0;
   uint64_t deduped_size = 0;
   uint64_t delta_compressed_approx_size = 0;
+  uint64_t delta_compressed_chunk_count = 0;
   std::set<std::string> known_hashes{};
   std::vector<int> faiss_idx_to_chunk_id{};
   std::unordered_map<int, std::string> chunk_ssdeep_hashes{};
@@ -408,17 +411,61 @@ int main(int argc, char* argv[])
     index.search(pending_chunks, reinterpret_cast<float*>(pending_chunk_data.data()), 5, search_results.data(), search_result_labels.data());
 
     for (int i = 0; i < pending_chunks; ++i) {
-      faiss::idx_t& estimated_most_similar_block_idx = search_result_labels[0];
-      auto& hamming_distance = search_results[0];
+      const int result_index = i * 5;
+      faiss::idx_t& estimated_most_similar_block_idx = search_result_labels[result_index];
+      auto& hamming_distance = search_results[result_index];
       // As expected (though not always) the most similar chunk according to FAISS is itself, picking the second most similar one
       if (faiss_idx_to_chunk_id[estimated_most_similar_block_idx] == pending_chunks_indexes[i]) {
-        estimated_most_similar_block_idx = search_result_labels[1];
-        hamming_distance = search_results[1];
+        estimated_most_similar_block_idx = search_result_labels[result_index + 1];
+        hamming_distance = search_results[result_index + 1];
       }
       float similarity = 1 - (hamming_distance / 64);
-      if (similarity >= 0.3) {
+      if (similarity >= 0.9) {
         //std::cout << "delta compression candidate, chunk " + std::to_string(pending_chunks_indexes[i]) + ": IndexLSH distance=" + std::to_string(hamming_distance) + "\n" << std::flush;
-        delta_compressed_approx_size += static_cast<uint64_t>(chunk.length * similarity);
+        const auto& pending_chunk = chunks[pending_chunks_indexes[i]];
+        const auto& similar_chunk = chunks[faiss_idx_to_chunk_id[estimated_most_similar_block_idx]];
+
+        // Simulate delta patching, really fucking stupid and slow, start by getting minichunks for the similar chunk
+        auto chunk_tmp_file = std::fstream("tmpfile", std::ios_base::in | std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
+        chunk_tmp_file.write(reinterpret_cast<const char*>(similar_chunk.data.data()), similar_chunk.data.size());
+        chunk_tmp_file.flush();
+        chunk_tmp_file.seekg(0);
+        auto similar_minichunks = fastcdc::chunk_generator(chunk_tmp_file, 16, 32, 64, true);
+        std::set<uint64_t> minichunk_hashes{};
+        for (const auto& minichunk : similar_minichunks) {
+          XXH3_state_t* state2 = XXH3_createState();
+          XXH3_64bits_reset(state2);
+          XXH3_64bits_update(state2, minichunk.data.data(), minichunk.data.size());
+          XXH64_hash_t minichunk_hash = 0;
+          minichunk_hash = XXH3_64bits_digest(state2);
+          XXH3_freeState(state2);
+          minichunk_hashes.insert(minichunk_hash);
+        }
+
+        // Clean the file and get minichunks for pending chunk, count filesize saved by omitting data on the similar chunk
+        uint64_t saved_size = 0;
+        chunk_tmp_file.close();
+        std::filesystem::remove("tmpfile");
+        chunk_tmp_file = std::fstream("tmpfile", std::ios_base::in | std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
+        chunk_tmp_file.write(reinterpret_cast<const char*>(pending_chunk.data.data()), pending_chunk.data.size());
+        chunk_tmp_file.flush();
+        chunk_tmp_file.seekg(0);
+        auto pending_minichunks = fastcdc::chunk_generator(chunk_tmp_file, 16, 32, 64, true);
+        for (const auto& minichunk : pending_minichunks) {
+          XXH3_state_t* state2 = XXH3_createState();
+          XXH3_64bits_reset(state2);
+          XXH3_64bits_update(state2, minichunk.data.data(), minichunk.data.size());
+          XXH64_hash_t minichunk_hash = XXH3_64bits_digest(state2);
+          XXH3_freeState(state2);
+          if (minichunk_hashes.contains(minichunk_hash)) {
+            saved_size += minichunk.data.size();
+          }
+        }
+        chunk_tmp_file.close();
+        std::filesystem::remove("tmpfile");
+
+        delta_compressed_approx_size += saved_size;
+        delta_compressed_chunk_count++;
       }
     }
     /*
@@ -476,7 +523,7 @@ int main(int argc, char* argv[])
   std::cout << std::string("Chunk Sizes:    min ") + std::to_string(min_size) + " - avg " + std::to_string(avg_size) + " - max " + std::to_string(max_size) + "\n" << std::flush;
   std::cout << "Total chunk count: " + std::to_string(chunks.size()) + "\n" << std::flush;
   std::cout << "Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n" << std::flush;
-  std::cout << "Total delta compressed chunk count: " + std::to_string(known_hashes.size() - faiss_idx_to_chunk_id.size()) + "\n" << std::flush;
+  std::cout << "Total delta compressed chunk count: " + std::to_string(delta_compressed_chunk_count) + "\n" << std::flush;
 
   // Throughput stats
   auto total_size_mbs = total_size / (1024.0 * 1024);
@@ -485,6 +532,7 @@ int main(int argc, char* argv[])
   std::printf("Chunk data deduped size:    %.1f MB\n", deduped_size_mbs);
   auto deltaed_size_mbs = delta_compressed_approx_size / (1024.0 * 1024);
   std::printf("Chunk data delta compressed size:    %.1f MB\n", deltaed_size_mbs);
+  std::printf("Final size:    %.1f MB\n", deduped_size_mbs - deltaed_size_mbs);
   auto chunking_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
   auto chunking_mb_per_nanosecond = total_size_mbs / chunking_elapsed_nanoseconds;
   std::printf("Chunking Throughput:    %.1f MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
