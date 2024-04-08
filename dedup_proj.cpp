@@ -428,7 +428,16 @@ int main(int argc, char* argv[])
         simhashes_dict[simhash_base] = chunk_i;
         simhashes.emplace_back(simhash_base);
       }
+      else {
+        const auto& similar_chunk = chunks[simhashes_dict[simhash_base]];
 
+        auto saved_size = simulate_delta_encoding(chunk, similar_chunk);
+
+        delta_compressed_approx_size += saved_size;
+        delta_compressed_chunk_count++;
+      }
+
+      /*
       int32_t brute_dist = 99;
       int best_simhash_index = 0;
       for (int i = 0; i < simhashes.size() - 1; ++i) {
@@ -439,11 +448,11 @@ int main(int argc, char* argv[])
           best_simhash_index = i;
           if (brute_dist == 0) break;
         }
-        /*
-        for (int byte = 0; byte < 8; ++byte) {
-          brute_dist += hamming_distance(new_simhash[byte], existing_simhash[byte]);
-        }
-        */
+
+        //for (int byte = 0; byte < 8; ++byte) {
+        //  brute_dist += hamming_distance(new_simhash[byte], existing_simhash[byte]);
+        //}
+
       }
       if (brute_dist <= 6) {
         std::cout << "Yuppi! posible similar chunk, distance: " + std::to_string(brute_dist) + "\n" << std::flush;
@@ -454,6 +463,7 @@ int main(int argc, char* argv[])
         delta_compressed_approx_size += saved_size;
         delta_compressed_chunk_count++;
       }
+      */
 
       known_hashes.insert(chunk.hash);
     }
