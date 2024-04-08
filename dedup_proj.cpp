@@ -29,6 +29,8 @@
 #include <faiss/IndexLSH.h>
 #include <faiss/IndexBinaryHash.h>
 
+#include "faiss/IndexBinaryHNSW.h"
+
 char get_char_with_echo() {
   return getchar();
 }
@@ -377,6 +379,11 @@ int main(int argc, char* argv[])
   std::vector<faiss::idx_t> search_result_labels(5 * batch_size, -1);
   //printf("is_trained = %s\n", index.is_trained ? "true" : "false");
 
+  faiss::IndexBinaryHNSW indexHNSW(64);
+  std::cout << "efConstruction: " + std::to_string(indexHNSW.hnsw.efConstruction) + "\n";
+  std::cout << "efSearch: " + std::to_string(indexHNSW.hnsw.efSearch) + "\n";
+  std::vector<int32_t> search_results_hnsw(5 * batch_size, 0);
+
   auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
   if (!file_stream.is_open()) {
     std::cout << "Can't read file\n";
@@ -423,32 +430,39 @@ int main(int argc, char* argv[])
     if (!known_hashes.contains(chunk.hash)) {
       auto chunk_simhash = simhash_data_xxhash(chunk.data.data(), chunk.data.size());
       auto simhash_base = hamming_base(chunk_simhash);
+      const uint64_t simhash_base_bytes = chunk_simhash.to_ullong();
+
       if (!simhashes_dict.contains(simhash_base)) {
         faiss_idx_to_chunk_id.push_back(chunk_i);
         simhashes_dict[simhash_base] = chunk_i;
         simhashes.emplace_back(simhash_base);
-      }
 
-      int32_t brute_dist = 99;
-      int best_simhash_index = 0;
-      for (int i = 0; i < simhashes.size() - 1; ++i) {
-        const auto& existing_simhash_base = simhashes[i];
-        const auto new_brute_dist = hamming_distance(simhash_base, existing_simhash_base);
-        if (new_brute_dist < brute_dist) {
-          brute_dist = new_brute_dist;
-          best_simhash_index = i;
-          if (brute_dist == 0) break;
-        }
-        /*
-        for (int byte = 0; byte < 8; ++byte) {
-          brute_dist += hamming_distance(new_simhash[byte], existing_simhash[byte]);
-        }
-        */
-      }
-      if (brute_dist <= 6) {
-        std::cout << "Yuppi! posible similar chunk, distance: " + std::to_string(brute_dist) + "\n" << std::flush;
-        const auto& similar_chunk = chunks[faiss_idx_to_chunk_id[best_simhash_index]];
+        indexHNSW.add(1, reinterpret_cast<const uint8_t*>(&simhash_base_bytes));
+        indexHNSW.search(1, reinterpret_cast<const uint8_t*>(&simhash_base_bytes), 5, search_results_hnsw.data(), search_result_labels.data());
 
+        int32_t brute_dist = 99;
+        int best_simhash_index = 0;
+        for (int i = 0; i < simhashes.size() - 1; ++i) {
+          const auto& existing_simhash_base = simhashes[i];
+          const auto new_brute_dist = hamming_distance(simhash_base, existing_simhash_base);
+          if (new_brute_dist < brute_dist) {
+            brute_dist = new_brute_dist;
+            best_simhash_index = i;
+            if (brute_dist == 0) break;
+          }
+        }
+        if (brute_dist <= 6) {
+          std::cout << "Yuppi! posible similar chunk, distance: " + std::to_string(brute_dist) + "\n" << std::flush;
+          const auto& similar_chunk = chunks[faiss_idx_to_chunk_id[best_simhash_index]];
+
+          auto saved_size = simulate_delta_encoding(chunk, similar_chunk);
+
+          delta_compressed_approx_size += saved_size;
+          delta_compressed_chunk_count++;
+        }
+      }
+      else {
+        const auto& similar_chunk = chunks[simhashes_dict[simhash_base]];
         auto saved_size = simulate_delta_encoding(chunk, similar_chunk);
 
         delta_compressed_approx_size += saved_size;
