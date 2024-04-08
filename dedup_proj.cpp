@@ -380,6 +380,7 @@ int main(int argc, char* argv[])
   //printf("is_trained = %s\n", index.is_trained ? "true" : "false");
 
   faiss::IndexBinaryHNSW indexHNSW(64);
+  indexHNSW.hnsw.efConstruction = 16;
   std::cout << "efConstruction: " + std::to_string(indexHNSW.hnsw.efConstruction) + "\n";
   std::cout << "efSearch: " + std::to_string(indexHNSW.hnsw.efSearch) + "\n";
   std::vector<int32_t> search_results_hnsw(5 * batch_size, 0);
@@ -407,6 +408,7 @@ int main(int argc, char* argv[])
   std::vector<uint8_t> pending_chunk_data(batch_size * max_size, 0);
   std::vector<std::bitset<64>> simhashes{};
   std::unordered_map<std::bitset<64>, int> simhashes_dict{};
+  std::vector<uint8_t> pending_simhashes(batch_size * 8, 0);
 
   for (auto& chunk : chunks) {
     if (chunk_i % 1000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(chunk_i) / chunks.size()) * 100) + "\n" << std::flush;
@@ -427,6 +429,7 @@ int main(int argc, char* argv[])
     XXH3_freeState(state);
     chunk.hash = std::to_string(result);
 
+    /*
     if (!known_hashes.contains(chunk.hash)) {
       auto chunk_simhash = simhash_data_xxhash(chunk.data.data(), chunk.data.size());
       auto simhash_base = hamming_base(chunk_simhash);
@@ -471,31 +474,46 @@ int main(int argc, char* argv[])
 
       known_hashes.insert(chunk.hash);
     }
-    /*
-    if (!known_hashes.contains(chunk.hash)) {
-      std::copy_n(chunk.data.data(), chunk.data.size(), pending_chunk_data.data() + (max_size * pending_chunks));
-      // Faiss IndexLSH requires all chunks to be of the same size so zero pad if needed
-      if (chunk.data.size() < max_size) {
-        std::memset(pending_chunk_data.data() + (max_size * pending_chunks) + chunk.data.size(), 0, max_size - chunk.data.size());
-      }
-      faiss_idx_to_chunk_id.push_back(chunk_i);
-      pending_chunks_indexes[pending_chunks] = chunk_i;
-      pending_chunks++;
-      known_hashes.insert(chunk.hash);
     */
+    if (!known_hashes.contains(chunk.hash)) {
+      auto chunk_simhash = simhash_data_xxhash(chunk.data.data(), chunk.data.size());
+      auto simhash_base = hamming_base(chunk_simhash);
+
+      if (!simhashes_dict.contains(simhash_base)) {
+        faiss_idx_to_chunk_id.push_back(chunk_i);
+        simhashes_dict[simhash_base] = chunk_i;
+        simhashes.emplace_back(simhash_base);
+
+        const uint64_t simhash_base_bytes = chunk_simhash.to_ullong();
+        std::copy_n(&simhash_base_bytes, 1, pending_simhashes.data() + (8 * pending_chunks));
+
+        pending_chunks_indexes[pending_chunks] = chunk_i;
+        pending_chunks++;
+      }
+      else {
+        const auto& similar_chunk = chunks[simhashes_dict[simhash_base]];
+        auto saved_size = simulate_delta_encoding(chunk, similar_chunk);
+
+        delta_compressed_approx_size += saved_size;
+        delta_compressed_chunk_count++;
+      }
+
+      known_hashes.insert(chunk.hash);
+    }
     else {
       deduped_size += chunk.length;
     }
 
-    /*
     if (pending_chunks < batch_size && chunk_i != chunks.size() - 1) {
       chunk_i++;
       continue;
     }
 
     // We add all the pending chunk hashes, and we will search for the 2nd most similar search result, as the top search result will be the very same hash
-    index.add(pending_chunks, reinterpret_cast<float*>(pending_chunk_data.data()));
-    index.search(pending_chunks, reinterpret_cast<float*>(pending_chunk_data.data()), 5, search_results.data(), search_result_labels.data());
+    //index.add(pending_chunks, reinterpret_cast<float*>(pending_chunk_data.data()));
+    //index.search(pending_chunks, reinterpret_cast<float*>(pending_chunk_data.data()), 5, search_results.data(), search_result_labels.data());
+    indexHNSW.add(pending_chunks, pending_simhashes.data());
+    indexHNSW.search(pending_chunks, pending_simhashes.data(), 5, search_results_hnsw.data(), search_result_labels.data());
 
     for (int i = 0; i < pending_chunks; ++i) {
       const int result_index = i * 5;
@@ -555,7 +573,6 @@ int main(int argc, char* argv[])
         delta_compressed_chunk_count++;
       }
     }
-    */
 
     pending_chunks = 0;
     chunk_i++;
