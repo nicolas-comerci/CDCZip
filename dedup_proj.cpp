@@ -29,6 +29,8 @@
 #include <faiss/IndexLSH.h>
 #include <faiss/IndexBinaryHash.h>
 
+#include "contrib/llama.cpp-b2632/common/common.h"
+
 char get_char_with_echo() {
   return getchar();
 }
@@ -360,15 +362,40 @@ int main(int argc, char* argv[])
   avg_size = 512;
   max_size = 1024;
 
-  bert_params params;
-  params.model = R"(C:\Users\Administrator\Desktop\fastcdc_test\paraphrase-MiniLM-L3-v2-GGML-q4_0.bin)";
-  params.n_threads = 20;
-  bert_ctx* bctx = bert_load_from_file(params.model);
-  const int bert_max_tokens_num = bert_n_max_tokens(bctx);
-  std::vector<bert_vocab_id> bert_feature_tokens(bert_max_tokens_num);
-  int bert_tokens_num = 0;
-  const auto embeddings_dim = bert_n_embd(bctx);
-  std::vector<float> bert_embeddings(embeddings_dim);
+  //bert_params params;
+  //params.model = R"(C:\Users\Administrator\Desktop\fastcdc_test\paraphrase-MiniLM-L3-v2-GGML-q4_0.bin)";
+  //params.n_threads = 20;
+  //bert_ctx* bctx = bert_load_from_file(params.model);
+  //const int bert_max_tokens_num = bert_n_max_tokens(bctx);
+  //std::vector<bert_vocab_id> bert_feature_tokens(bert_max_tokens_num);
+  //int bert_tokens_num = 0;
+  //const auto embeddings_dim = bert_n_embd(bctx);
+  //std::vector<float> bert_embeddings(embeddings_dim);
+
+  gpt_params params;
+  params.embedding = true;
+  // For non-causal models, batch size must be equal to ubatch size
+  params.n_ubatch = params.n_batch;
+  params.model = R"(C:\Users\Administrator\Desktop\fastcdc_test\model.safetensors)";
+  llama_backend_init();
+  llama_numa_init(params.numa);
+  llama_model* llama_model;
+  llama_context* llama_ctx;
+  // load the model
+  std::tie(llama_model, llama_ctx) = llama_init_from_gpt_params(params);
+  if (llama_model == nullptr) {
+    fprintf(stderr, "%s: error: unable to load model\n", __func__);
+    return 1;
+  }
+  const int n_ctx_train = llama_n_ctx_train(llama_model);
+  const int n_ctx = llama_n_ctx(llama_ctx);
+  if (n_ctx > n_ctx_train) {
+    fprintf(stderr, "%s: warning: model was trained on only %d context tokens (%d specified)\n",
+      __func__, n_ctx_train, n_ctx);
+  }
+  // max batch size
+  const uint64_t n_batch = params.n_batch;
+  GGML_ASSERT(params.n_batch >= params.n_ctx);
 
   int batch_size = 100;
 

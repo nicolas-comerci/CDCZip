@@ -71,10 +71,12 @@ endif ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
 set(XXHASH_SRC "${SRCDIR}/contrib/xxHash/xxhash.c")
 set(SSDEEP_SRC "${SRCDIR}/contrib/ssdeep/fuzzy.c")
 
-add_subdirectory(contrib/embeddings.cpp)
+#add_subdirectory(contrib/embeddings.cpp)
 #set(BERT_SRC "${SRCDIR}/contrib/embeddings.cpp/bert.cpp")
 #set(GGML_INCLUDE_DIR "${SRCDIR}/contrib/embeddings.cpp/ggml/include/ggml")
 #include_directories(AFTER ${GGML_INCLUDE_DIR})
+add_subdirectory(contrib/llama.cpp-b2632)
+set(LLAMA_EXTRA_SRC "${SRCDIR}/contrib/llama.cpp-b2632/common/common.cpp")
 
 # netlib blas
 #add_subdirectory(contrib/BLAS)
@@ -95,7 +97,8 @@ add_subdirectory(contrib/faiss)
 
 set(DEDUP_PROJ_SRC "${SRCDIR}/dedup_proj.cpp")
 
-add_executable(dedup_proj ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${SSDEEP_SRC} )
-target_link_libraries(dedup_proj bert faiss)
+add_executable(dedup_proj ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${SSDEEP_SRC} ${LLAMA_EXTRA_SRC} )
+#target_link_libraries(dedup_proj bert faiss)
+target_link_libraries(dedup_proj llama build_info faiss)
 
 install(TARGETS dedup_proj DESTINATION bin)
