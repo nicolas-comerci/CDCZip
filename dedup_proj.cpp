@@ -372,10 +372,10 @@ int main(int argc, char* argv[])
 
   int batch_size = 100;
 
-  faiss::IndexLSH index(max_size / 4, 64, false);
-  std::vector<float> search_results(5 * batch_size, 0);
+  faiss::IndexBinaryMultiHash binary_hash_idx(64, 8, 8);
+  std::vector<int32_t> search_binary_hash_results(5 * batch_size, 0);
   std::vector<faiss::idx_t> search_result_labels(5 * batch_size, -1);
-  //printf("is_trained = %s\n", index.is_trained ? "true" : "false");
+  printf("is_trained = %s\n", binary_hash_idx.is_trained ? "true" : "false");
 
   auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
   if (!file_stream.is_open()) {
@@ -399,7 +399,7 @@ int main(int argc, char* argv[])
   int pending_chunks = 0;
   std::vector<int32_t> pending_chunks_indexes(batch_size, 0);
   std::vector<uint8_t> pending_chunk_data(batch_size * max_size, 0);
-  std::vector<std::bitset<64>> simhashes{};
+  std::vector<uint64_t> simhashes{};
   std::unordered_map<std::bitset<64>, int> simhashes_dict{};
 
   for (auto& chunk : chunks) {
@@ -474,7 +474,6 @@ int main(int argc, char* argv[])
       // If SimHash base is not known, set as pending to add to the index later, if known, use it to find a similar chunk
       if (!simhashes_dict.contains(simhash_base)) {
         simhashes_dict[simhash_base] = chunk_i;
-        //simhashes.emplace_back(simhash_base);
 
         std::copy_n(chunk.data.data(), chunk.data.size(), pending_chunk_data.data() + (max_size * pending_chunks));
         // Faiss IndexLSH requires all chunks to be of the same size so zero pad if needed
@@ -484,6 +483,7 @@ int main(int argc, char* argv[])
         faiss_idx_to_chunk_id.push_back(chunk_i);
         pending_chunks_indexes[pending_chunks] = chunk_i;
         pending_chunks++;
+        simhashes.emplace_back(simhash_base.to_ullong());
       }
       else {
         const auto& similar_chunk = chunks[simhashes_dict[simhash_base]];
@@ -511,20 +511,20 @@ int main(int argc, char* argv[])
     }
 
     // We add all the pending chunk hashes, and we will search for the 2nd most similar search result, as the top search result will be the very same hash
-    index.add(pending_chunks, reinterpret_cast<float*>(pending_chunk_data.data()));
-    index.search(pending_chunks, reinterpret_cast<float*>(pending_chunk_data.data()), 5, search_results.data(), search_result_labels.data());
+    binary_hash_idx.add(pending_chunks, reinterpret_cast<uint8_t*>(simhashes.data()));
+    binary_hash_idx.search(pending_chunks, reinterpret_cast<uint8_t*>(simhashes.data()), 5, search_binary_hash_results.data(), search_result_labels.data());
 
     for (int i = 0; i < pending_chunks; ++i) {
       const int result_index = i * 5;
       faiss::idx_t& estimated_most_similar_block_idx = search_result_labels[result_index];
-      auto& hamming_distance = search_results[result_index];
+      auto& hamming_distance = search_binary_hash_results[result_index];
       // As expected (though not always) the most similar chunk according to FAISS is itself, picking the second most similar one
       if (faiss_idx_to_chunk_id[estimated_most_similar_block_idx] == pending_chunks_indexes[i]) {
         estimated_most_similar_block_idx = search_result_labels[result_index + 1];
-        hamming_distance = search_results[result_index + 1];
+        hamming_distance = search_binary_hash_results[result_index + 1];
       }
       float similarity = 1 - (hamming_distance / 64);
-      if (hamming_distance <= 1) {
+      if (hamming_distance <= 13) {
         //std::cout << "delta compression candidate, chunk " + std::to_string(pending_chunks_indexes[i]) + ": IndexLSH distance=" + std::to_string(hamming_distance) + "\n" << std::flush;
         const auto& pending_chunk = chunks[pending_chunks_indexes[i]];
         const auto& similar_chunk = chunks[faiss_idx_to_chunk_id[estimated_most_similar_block_idx]];
@@ -542,6 +542,7 @@ int main(int argc, char* argv[])
     }
 
     pending_chunks = 0;
+    simhashes.clear();
     chunk_i++;
   }
   auto hashing_end_time = std::chrono::high_resolution_clock::now();
