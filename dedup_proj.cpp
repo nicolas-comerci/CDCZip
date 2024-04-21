@@ -116,6 +116,7 @@ namespace utility {
     int length;
     std::vector<uint8_t> data;
     std::string hash;
+    std::bitset<64> lsh;
 
     CDChunk() {}
     CDChunk(unsigned long long _offset, int _length, std::vector<uint8_t>&& _data, std::string _hash)
@@ -360,15 +361,15 @@ int main(int argc, char* argv[])
   avg_size = 512;
   max_size = 1024;
 
-  bert_params params;
-  params.model = R"(C:\Users\Administrator\Desktop\fastcdc_test\paraphrase-MiniLM-L3-v2-GGML-q4_0.bin)";
-  params.n_threads = 20;
-  bert_ctx* bctx = bert_load_from_file(params.model);
-  const int bert_max_tokens_num = bert_n_max_tokens(bctx);
-  std::vector<bert_vocab_id> bert_feature_tokens(bert_max_tokens_num);
+  //bert_params params;
+  //params.model = R"(C:\Users\Administrator\Desktop\fastcdc_test\paraphrase-MiniLM-L3-v2-GGML-q4_0.bin)";
+  //params.n_threads = 20;
+  //bert_ctx* bctx = bert_load_from_file(params.model);
+  //const int bert_max_tokens_num = bert_n_max_tokens(bctx);
+  //std::vector<bert_vocab_id> bert_feature_tokens(bert_max_tokens_num);
   int bert_tokens_num = 0;
-  const auto embeddings_dim = bert_n_embd(bctx);
-  std::vector<float> bert_embeddings(embeddings_dim);
+  //const auto embeddings_dim = bert_n_embd(bctx);
+  //std::vector<float> bert_embeddings(embeddings_dim);
 
   int batch_size = 100;
 
@@ -386,9 +387,13 @@ int main(int argc, char* argv[])
   uint64_t deduped_size = 0;
   uint64_t delta_compressed_approx_size = 0;
   uint64_t delta_compressed_chunk_count = 0;
-  std::set<std::string> known_hashes{};
+  
   std::vector<int> faiss_idx_to_chunk_id{};
   std::unordered_map<int, std::string> chunk_ssdeep_hashes{};
+
+  std::unordered_map<std::string, std::vector<int>> known_hashes{};  // Find chunk pos by hash
+  std::vector<std::string> chunk_hashes{};  // Find hash by chunk pos
+
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
   auto chunks = fastcdc::chunk_generator(file_stream, min_size, avg_size, max_size, true);
   auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
@@ -401,6 +406,7 @@ int main(int argc, char* argv[])
   std::vector<std::bitset<64>> simhashes{};
   std::unordered_map<std::bitset<64>, int> simhashes_dict{};
 
+  std::optional<std::string> similarity_locality_anchor{};
   for (auto& chunk : chunks) {
     if (chunk_i % 1000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(chunk_i) / chunks.size()) * 100) + "\n" << std::flush;
     total_size += chunk.length;
@@ -421,12 +427,43 @@ int main(int argc, char* argv[])
     chunk.hash = std::to_string(result);
 
     if (!known_hashes.contains(chunk.hash)) {
-      auto chunk_simhash = simhash_data_xxhash(chunk.data.data(), chunk.data.size());
-      auto simhash_base = hamming_base(chunk_simhash);
+      chunk.lsh = simhash_data_xxhash(chunk.data.data(), chunk.data.size());
+      auto simhash_base = hamming_base(chunk.lsh);
       if (!simhashes_dict.contains(simhash_base)) {
         faiss_idx_to_chunk_id.push_back(chunk_i);
         simhashes_dict[simhash_base] = chunk_i;
         simhashes.emplace_back(simhash_base);
+
+        // Attempt to find similar block via DARE's DupAdj, checking if the next chunk from the similarity locality anchor is similar to this one
+        std::optional<int> best_candidate_dist{};
+        int best_candidate = 0;
+        if (similarity_locality_anchor.has_value()) {
+          for (const auto& anchor_instance_chunk_i : known_hashes[*similarity_locality_anchor]) {
+            const auto similar_candidate_chunk = anchor_instance_chunk_i + 1;
+            if (similar_candidate_chunk == chunk_i) continue;
+
+            const auto& similar_chunk = chunks[similar_candidate_chunk];
+            const auto new_dist = hamming_distance(chunk.lsh, similar_chunk.lsh);
+            if (new_dist <= 99 && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist)) {
+              best_candidate_dist = new_dist;
+              best_candidate = similar_candidate_chunk;
+            }
+          }
+        }
+        if (best_candidate_dist.has_value()) {
+          const auto& similar_chunk = chunks[best_candidate];
+          auto saved_size = simulate_delta_encoding(chunk, similar_chunk);
+
+          if (saved_size > 0) {
+            std::cout << "WHOOHOO! DupAdj Success!\n" << std::flush;
+            delta_compressed_approx_size += saved_size;
+            delta_compressed_chunk_count++;
+            similarity_locality_anchor = chunk.hash;
+          }
+        }
+        else {
+          similarity_locality_anchor = std::nullopt;
+        }
       }
       else {
         const auto& similar_chunk = chunks[simhashes_dict[simhash_base]];
@@ -435,6 +472,7 @@ int main(int argc, char* argv[])
 
         delta_compressed_approx_size += saved_size;
         delta_compressed_chunk_count++;
+        similarity_locality_anchor = chunk.hash;
       }
 
       /*
@@ -464,8 +502,6 @@ int main(int argc, char* argv[])
         delta_compressed_chunk_count++;
       }
       */
-
-      known_hashes.insert(chunk.hash);
     }
     /*
     if (!known_hashes.contains(chunk.hash)) {
@@ -481,7 +517,10 @@ int main(int argc, char* argv[])
     */
     else {
       deduped_size += chunk.length;
+      similarity_locality_anchor = chunk.hash;
     }
+    known_hashes[chunk.hash].push_back(chunk_i);
+    chunk_hashes.push_back(chunk.hash);
 
     /*
     if (pending_chunks < batch_size && chunk_i != chunks.size() - 1) {
