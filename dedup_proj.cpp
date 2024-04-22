@@ -146,6 +146,54 @@ namespace utility {
   }
 }
 
+class IStreamLike {
+public:
+  virtual ~IStreamLike() = default;
+  virtual void read(void* buf, std::streamsize count) = 0;
+  virtual std::streamsize gcount() = 0;
+};
+
+class IStreamWrapper: public IStreamLike {
+  std::istream* istream;
+public:
+  IStreamWrapper(std::istream* _istream): istream(_istream) {}
+  ~IStreamWrapper() override = default;
+
+  void read(void* buf, std::streamsize count) override {
+    istream->read(static_cast<char*>(buf), count);
+  }
+
+  std::streamsize gcount() override {
+    return istream->gcount();
+  }
+};
+
+class IStreamMem : public IStreamLike {
+  uint8_t* membuf;
+  int len;
+  int pos = 0;
+  std::streamsize _gcount = 0;
+public:
+  IStreamMem(uint8_t* _buf, int _len) : membuf(_buf), len(_len) {}
+  ~IStreamMem() override = default;
+
+  void read(void* buf, std::streamsize count) override {
+    if (pos >= len) {
+      _gcount = 0;
+      return;
+    }
+
+    auto to_read = std::min<std::streamsize>(len - pos, count);
+    std::copy_n(membuf + pos, to_read, static_cast<uint8_t*>(buf));
+    _gcount = to_read;
+    pos += to_read;
+  }
+
+  std::streamsize gcount() override {
+    return _gcount;
+  }
+};
+
 namespace fastcdc {
   uint32_t cdc_offset(
     const std::span<uint8_t> data,
@@ -176,7 +224,7 @@ namespace fastcdc {
     return i;
   }
 
-  std::vector<utility::CDChunk> chunk_generator(std::istream& stream, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool fat) {
+  std::vector<utility::CDChunk> chunk_generator(IStreamLike& stream, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool fat) {
     uint32_t cs = utility::center_size(avg_size, min_size, max_size);
     uint32_t bits = utility::logarithm2(avg_size);
     uint32_t mask_s = utility::mask(bits + 1);
@@ -185,7 +233,7 @@ namespace fastcdc {
 
     std::vector<uint8_t> blob{};
     blob.resize(read_size);
-    stream.read(reinterpret_cast<char*>(blob.data()), read_size);
+    stream.read(blob.data(), read_size);
     uint32_t blob_len = stream.gcount();
     blob.resize(blob_len);
 
@@ -261,6 +309,34 @@ std::bitset<64> simhash_data_xxhash(uint8_t* data, int data_len, int chunk_size 
   return { *reinterpret_cast<uint64_t*>(simhash.data())};
 }
 
+std::bitset<64> simhash_data_xxhash_cdc(uint8_t* data, int data_len, int chunk_size = 16) {
+  // Initialize SimHash array
+  std::array<uint8_t, 8> simhash = { 0 };
+
+  XXH3_state_t* state = XXH3_createState();
+  XXH3_64bits_reset(state);
+
+  auto memstream = IStreamMem(data, data_len);
+  auto cdc_minichunks = fastcdc::chunk_generator(memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);
+
+  // Iterate over the data in chunks
+  for (const auto& chunk : cdc_minichunks) {
+    // Calculate hash for current chunk
+    XXH3_64bits_update(state, chunk.data.data(), chunk.data.size());
+    XXH64_hash_t chunk_hash = XXH3_64bits_digest(state);
+    XXH3_64bits_reset(state);
+
+    // Update SimHash with the hash of the chunk
+    for (int j = 0; j < 8; ++j) {
+      // Update each byte of the SimHash with the corresponding byte of the chunk hash
+      simhash[j] += (chunk_hash >> (j * 8)) & 0xFF;
+    }
+  }
+
+  XXH3_freeState(state);
+  return { *reinterpret_cast<uint64_t*>(simhash.data()) };
+}
+
 template<int bit_size>
 int hamming_distance(std::bitset<bit_size> data1, std::bitset<bit_size> data2) {
   int dist = 0;
@@ -309,7 +385,8 @@ uint64_t simulate_delta_encoding(const utility::CDChunk& chunk, const utility::C
   chunk_tmp_file.write(reinterpret_cast<const char*>(similar_chunk.data.data()), similar_chunk.data.size());
   chunk_tmp_file.flush();
   chunk_tmp_file.seekg(0);
-  auto similar_minichunks = fastcdc::chunk_generator(chunk_tmp_file, 16, 32, 64, true);
+  auto wrapped_file = IStreamWrapper(&chunk_tmp_file);
+  auto similar_minichunks = fastcdc::chunk_generator(wrapped_file, 16, 32, 64, true);
   std::set<uint64_t> minichunk_hashes{};
   for (const auto& minichunk : similar_minichunks) {
     XXH3_state_t* state2 = XXH3_createState();
@@ -329,7 +406,8 @@ uint64_t simulate_delta_encoding(const utility::CDChunk& chunk, const utility::C
   chunk_tmp_file.write(reinterpret_cast<const char*>(chunk.data.data()), chunk.data.size());
   chunk_tmp_file.flush();
   chunk_tmp_file.seekg(0);
-  auto pending_minichunks = fastcdc::chunk_generator(chunk_tmp_file, 16, 32, 64, true);
+  wrapped_file = IStreamWrapper(&chunk_tmp_file);
+  auto pending_minichunks = fastcdc::chunk_generator(wrapped_file, 16, 32, 64, true);
   for (const auto& minichunk : pending_minichunks) {
     XXH3_state_t* state2 = XXH3_createState();
     XXH3_64bits_reset(state2);
@@ -383,6 +461,7 @@ int main(int argc, char* argv[])
     std::cout << "Can't read file\n";
     return 1;
   }
+  auto wrapped_file = IStreamWrapper(&file_stream);
   uint64_t total_size = 0;
   uint64_t deduped_size = 0;
   uint64_t delta_compressed_approx_size = 0;
@@ -395,7 +474,7 @@ int main(int argc, char* argv[])
   std::vector<std::string> chunk_hashes{};  // Find hash by chunk pos
 
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
-  auto chunks = fastcdc::chunk_generator(file_stream, min_size, avg_size, max_size, true);
+  auto chunks = fastcdc::chunk_generator(wrapped_file, min_size, avg_size, max_size, true);
   auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
   auto hashing_start_time = std::chrono::high_resolution_clock::now();
 
