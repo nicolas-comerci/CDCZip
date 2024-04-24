@@ -501,12 +501,30 @@ int main(int argc, char* argv[])
   auto hashing_start_time = std::chrono::high_resolution_clock::now();
 
   int chunk_i = 0;
+  int last_reduced_chunk_i = 0;
   int pending_chunks = 0;
   std::vector<int32_t> pending_chunks_indexes(batch_size, 0);
   std::vector<uint8_t> pending_chunk_data(batch_size * max_size, 0);
   std::vector<std::bitset<64>> simhashes{};
   std::unordered_map<std::bitset<64>, int> simhashes_dict{};
+
   const uint32_t simhash_chunk_size = 16;
+  const uint32_t max_allowed_dist = 32;
+  const bool best_delta = false;
+
+  std::bitset<64> (*simhash_func)(uint8_t* data, int data_len, int chunk_size) = nullptr;
+  uint64_t(*simulate_delta_encoding_func)(const utility::CDChunk & chunk, const utility::CDChunk & similar_chunk, int chunk_size) = nullptr;
+  if (!best_delta) {
+    simhash_func = &simhash_data_xxhash_shingling;
+    simulate_delta_encoding_func = &simulate_delta_encoding_shingling;
+  }
+  else {
+    simhash_func = &simhash_data_xxhash_cdc;
+    simulate_delta_encoding_func = &simulate_delta_encoding_cdc;
+  }
+
+  const bool use_dupadj = true;
+  const bool use_dupadj_backwards = true;
 
   std::optional<std::string> similarity_locality_anchor{};
   for (auto& chunk : chunks) {
@@ -529,8 +547,7 @@ int main(int argc, char* argv[])
     chunk.hash = std::to_string(result);
 
     if (!known_hashes.contains(chunk.hash)) {
-      chunk.lsh = simhash_data_xxhash_shingling(chunk.data.data(), chunk.data.size(), simhash_chunk_size);
-      //chunk.lsh = simhash_data_xxhash_cdc(chunk.data.data(), chunk.data.size(), simhash_chunk_size);
+      chunk.lsh = simhash_func(chunk.data.data(), chunk.data.size(), simhash_chunk_size);
       auto simhash_base = hamming_base(chunk.lsh);
       if (!simhashes_dict.contains(simhash_base)) {
         faiss_idx_to_chunk_id.push_back(chunk_i);
@@ -540,14 +557,14 @@ int main(int argc, char* argv[])
         // Attempt to find similar block via DARE's DupAdj, checking if the next chunk from the similarity locality anchor is similar to this one
         std::optional<int> best_candidate_dist{};
         int best_candidate = 0;
-        if (similarity_locality_anchor.has_value()) {
+        if (use_dupadj && similarity_locality_anchor.has_value()) {
           for (const auto& anchor_instance_chunk_i : known_hashes[*similarity_locality_anchor]) {
             const auto similar_candidate_chunk = anchor_instance_chunk_i + 1;
             if (similar_candidate_chunk == chunk_i) continue;
 
             const auto& similar_chunk = chunks[similar_candidate_chunk];
             const auto new_dist = hamming_distance(chunk.lsh, similar_chunk.lsh);
-            if (new_dist <= 32 && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist)) {
+            if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist)) {
               best_candidate_dist = new_dist;
               best_candidate = similar_candidate_chunk;
             }
@@ -555,8 +572,7 @@ int main(int argc, char* argv[])
         }
         if (best_candidate_dist.has_value()) {
           const auto& similar_chunk = chunks[best_candidate];
-          auto saved_size = simulate_delta_encoding_shingling(chunk, similar_chunk, simhash_chunk_size);
-          //auto saved_size = simulate_delta_encoding_cdc(chunk, similar_chunk, simhash_chunk_size);
+          auto saved_size = simulate_delta_encoding_func(chunk, similar_chunk, simhash_chunk_size);
 
           if (saved_size > 0) {
             delta_compressed_approx_size += saved_size;
@@ -571,8 +587,7 @@ int main(int argc, char* argv[])
       else {
         const auto& similar_chunk = chunks[simhashes_dict[simhash_base]];
 
-        auto saved_size = simulate_delta_encoding_shingling(chunk, similar_chunk, simhash_chunk_size);
-        //auto saved_size = simulate_delta_encoding_cdc(chunk, similar_chunk, simhash_chunk_size);
+        auto saved_size = simulate_delta_encoding_func(chunk, similar_chunk, simhash_chunk_size);
 
         delta_compressed_approx_size += saved_size;
         delta_compressed_chunk_count++;
@@ -625,6 +640,47 @@ int main(int argc, char* argv[])
     }
     known_hashes[chunk.hash].push_back(chunk_i);
     chunk_hashes.push_back(chunk.hash);
+
+    // if similarity_locality_anchor has a value it means we either deduplicated the chunk or delta compressed it
+    if (similarity_locality_anchor.has_value()) {
+      // set new last_reduced_chunk_i, if there are previous chunks that haven't been deduped/delta'd attempt to do so via backwards DupAdj
+      int prev_last_reduced_chunk_i = last_reduced_chunk_i;
+      last_reduced_chunk_i = chunk_i;
+
+      if (use_dupadj_backwards) {
+        std::string backtrack_similarity_anchor = *similarity_locality_anchor;
+        int maximum_backtrack = chunk_i - prev_last_reduced_chunk_i;
+        // for loop starts at 1 because if the last reduce chunk is the previous one maximum_backtrack=1, and we don't enter the for at all
+        for (int i = 1; i < maximum_backtrack; i++) {
+          const auto backtrack_chunk_i = chunk_i - i;
+          const auto& backtrack_chunk = chunks[backtrack_chunk_i];
+
+          std::optional<int> best_candidate_dist{};
+          int best_candidate = 0;
+          for (const auto& anchor_instance_chunk_i : known_hashes[backtrack_similarity_anchor]) {
+            const auto similar_candidate_chunk = anchor_instance_chunk_i - 1;
+            if (similar_candidate_chunk >= backtrack_chunk_i || similar_candidate_chunk < 0) continue;
+
+            const auto& similar_chunk = chunks[similar_candidate_chunk];
+            const auto new_dist = hamming_distance(backtrack_chunk.lsh, similar_chunk.lsh);
+            if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist)) {
+              best_candidate_dist = new_dist;
+              best_candidate = similar_candidate_chunk;
+            }
+          }
+
+          if (!best_candidate_dist.has_value()) break;
+          const auto& similar_chunk = chunks[best_candidate];
+          auto saved_size = simulate_delta_encoding_func(backtrack_chunk, similar_chunk, simhash_chunk_size);
+
+          if (saved_size > 0) {
+            delta_compressed_approx_size += saved_size;
+            delta_compressed_chunk_count++;
+            backtrack_similarity_anchor = similar_chunk.hash;
+          }
+        }
+      }
+    }
 
     /*
     if (pending_chunks < batch_size && chunk_i != chunks.size() - 1) {
