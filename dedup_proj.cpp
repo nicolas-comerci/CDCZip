@@ -618,6 +618,8 @@ int main(int argc, char* argv[])
   const bool attempt_multiple_delta_methods = true;
   // if true and attempt_multiple_delta_methods is true as well, other similar blocks will be tried if one is attempted but the delta encoding failed to save size
   const bool attempt_multiple_blocks_on_failure = true;
+  const bool use_match_extension = true;
+  const bool use_match_extension_backwards = true;
 
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
   auto chunks = fastcdc::chunk_generator(wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
@@ -626,6 +628,7 @@ int main(int argc, char* argv[])
 
   std::optional<std::string> similarity_locality_anchor{};
   for (auto& chunk : chunks) {
+    std::optional<std::string> prev_similarity_locality_anchor = similarity_locality_anchor;
     if (chunk_i % 1000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(chunk_i) / chunks.size()) * 100) + "\n" << std::flush;
     total_size += chunk.length;
     // make hashes
@@ -858,12 +861,13 @@ int main(int argc, char* argv[])
       int prev_last_reduced_chunk_i = last_reduced_chunk_i;
       last_reduced_chunk_i = chunk_i;
 
+      std::string backtrack_similarity_anchor = *similarity_locality_anchor;
+      int maximum_backtrack = chunk_i - prev_last_reduced_chunk_i;
+      // for loop starts at 1 because if the last reduced chunk is the previous one then maximum_backtrack=1, and we don't backtrack at all
+      int current_backtrack = 1;
       if (use_dupadj_backwards) {
-        std::string backtrack_similarity_anchor = *similarity_locality_anchor;
-        int maximum_backtrack = chunk_i - prev_last_reduced_chunk_i;
-        // for loop starts at 1 because if the last reduce chunk is the previous one maximum_backtrack=1, and we don't enter the for at all
-        for (int i = 1; i < maximum_backtrack; i++) {
-          const auto backtrack_chunk_i = chunk_i - i;
+        for (; current_backtrack < maximum_backtrack; current_backtrack++) {
+          const auto backtrack_chunk_i = chunk_i - current_backtrack;
           const auto& backtrack_chunk = chunks[backtrack_chunk_i];
 
           std::optional<int> best_candidate_dist{};
@@ -891,6 +895,51 @@ int main(int argc, char* argv[])
           }
         }
       }
+
+      // If Backwards DupAdj is off or a mismatch caused it to stop while backtracking is still possible, we attempt to extend the last match backwards
+      if (use_match_extension_backwards && current_backtrack < maximum_backtrack) {
+        const auto backtrack_chunk_i = chunk_i - current_backtrack;
+        const auto& backtrack_chunk = chunks[backtrack_chunk_i];
+
+        uint64_t saved_size = 0;
+        for (const auto& anchor_instance_chunk_i : known_hashes[backtrack_similarity_anchor]) {
+          const auto anchor_prev_chunk_i = anchor_instance_chunk_i - 1;
+          if (anchor_prev_chunk_i >= backtrack_chunk_i || anchor_prev_chunk_i < 0) continue;
+          const auto& anchor_prev_chunk = chunks[anchor_prev_chunk_i];
+
+          const auto cmp_size = std::min(anchor_prev_chunk.data.size(), backtrack_chunk.data.size());
+          std::span anchor_prev_chunk_data{ anchor_prev_chunk.data.data(), cmp_size };
+          std::span backtrack_chunk_data{ backtrack_chunk.data.data(), cmp_size };
+          uint64_t current_attempt_saved_size = 0;
+          for (uint64_t i = 0; i < cmp_size; i++) {
+            if (anchor_prev_chunk_data[cmp_size - 1 - i] != backtrack_chunk_data[cmp_size - 1 - i]) break;
+            ++current_attempt_saved_size;
+          }
+          saved_size = std::max(saved_size, current_attempt_saved_size);
+        }
+        deduped_size += saved_size;
+      }
+    }
+    // If the last chunk was deduped or delta'd and this one hasn't, we attempt to "extend the match" as much as possible
+    // This should actually run just before outputting the data/LZ match, there is technically a risk of double counting savings here with backwards DupAdj
+    else if (use_match_extension && last_reduced_chunk_i == (chunk_i - 1)){
+      uint64_t saved_size = 0;
+      for (const auto& anchor_instance_chunk_i : known_hashes[*prev_similarity_locality_anchor]) {
+        const auto anchor_next_chunk_i = anchor_instance_chunk_i + 1;
+        if (anchor_next_chunk_i == chunk_i) continue;
+        const auto& anchor_next_chunk = chunks[anchor_next_chunk_i];
+
+        const auto cmp_size = std::min(anchor_next_chunk.data.size(), chunk.data.size());
+        std::span anchor_next_chunk_data{ anchor_next_chunk.data.data(), cmp_size };
+        std::span chunk_data{ chunk.data.data(), cmp_size };
+        uint64_t current_attempt_saved_size = 0;
+        for (uint64_t i = 0; i < cmp_size; i++) {
+          if (anchor_next_chunk_data[i] != chunk_data[i]) break;
+          ++current_attempt_saved_size;
+        }
+        saved_size = std::max(saved_size, current_attempt_saved_size);
+      }
+      deduped_size += saved_size;
     }
 
     /*
