@@ -21,6 +21,7 @@
 
 // Resemblance detection support
 #include <filesystem>
+#include <unordered_set>
 
 #include "contrib/embeddings.cpp/bert.h"
 #include <faiss/IndexFlat.h>
@@ -107,6 +108,29 @@ namespace constants {
     231222289,  603972436,  783045542,  370384393,  184356284,  709706295,
     1453549767, 591603172,  768512391,  854125182
   };
+
+  // Coeficients (coprime pairs) for N-Transform feature extraction, only have 16 as more than 4SF-4F is unlikely to yield good results
+  static constexpr std::pair<uint16_t, uint16_t> N_Transform_Coefs[16] = {
+    {2, 3},
+    {3, 5},
+    {5, 7},
+    {7, 11},
+    {11, 13},
+    {13, 17},
+    {17, 19},
+    {19, 23},
+    {23, 29},
+    {29, 31},
+    {31, 37},
+    {37, 41},
+    {41, 43},
+    {43, 47},
+    {47, 53},
+    {53, 59},
+  };
+
+  // Sampling mask for Content Defined Sampling with 1/64 frequency and somewhat spread 1bits as used by ODESS paper
+  static constexpr uint32_t CDS_SAMPLING_MASK = 0x40030341;
 }
 
 namespace utility {
@@ -117,6 +141,8 @@ namespace utility {
     std::vector<uint8_t> data;
     std::string hash;
     std::bitset<64> lsh;
+    std::array<uint32_t, 4> super_features{};
+    bool feature_sampling_failure = true;
 
     CDChunk() {}
     CDChunk(unsigned long long _offset, int _length, std::vector<uint8_t>&& _data, std::string _hash)
@@ -208,23 +234,72 @@ namespace fastcdc {
     uint32_t size = data.size();
     uint32_t barrier = std::min(center_size, size);
     uint32_t i = std::min(barrier, min_size);
+
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_s))
-        return i + 1;
+      if (!(pattern & mask_s)) return i + 1;
       i += 1;
     }
     barrier = std::min(max_size, size);
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_l))
-        return i + 1;
+      if (!(pattern & mask_l)) return i + 1;
       i += 1;
     }
     return i;
   }
 
-  std::vector<utility::CDChunk> chunk_generator(IStreamLike& stream, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool fat) {
+  std::pair<uint32_t, std::optional<std::vector<uint32_t>>> cdc_offset_with_features(
+    const std::span<uint8_t> data,
+    uint32_t min_size,
+    uint32_t avg_size,
+    uint32_t max_size,
+    uint32_t center_size,
+    uint32_t mask_s,
+    uint32_t mask_l
+  ) {
+    uint32_t pattern = 0;
+    uint32_t size = data.size();
+    uint32_t barrier = std::min(center_size, size);
+    uint32_t i = std::min(barrier, min_size);
+
+    std::optional<std::vector<uint32_t>> features{};
+
+    while (i < barrier) {
+      pattern = (pattern >> 1) + constants::GEAR[data[i]];
+      if (!(pattern & mask_s)) return { i + 1, features };
+      if (!(pattern & constants::CDS_SAMPLING_MASK)) {
+        if (!features.has_value()) {
+          features = std::vector<uint32_t>();
+          features->resize(16);
+        }
+        for (int feature_i = 0; feature_i < 16; feature_i++) {
+          const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
+          (*features)[feature_i] = std::max<uint32_t>((*features)[feature_i], (mi * pattern + ai) % (1LL << 32));
+        }
+      }
+      i += 1;
+    }
+    barrier = std::min(max_size, size);
+    while (i < barrier) {
+      pattern = (pattern >> 1) + constants::GEAR[data[i]];
+      if (!(pattern & mask_l)) return { i + 1, features };
+      if (!(pattern & constants::CDS_SAMPLING_MASK)) {
+        if (!features.has_value()) {
+          features = std::vector<uint32_t>();
+          features->resize(16);
+        }
+        for (int feature_i = 0; feature_i < 16; feature_i++) {
+          const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
+          (*features)[feature_i] = std::max<uint32_t>((*features)[feature_i], (mi * pattern + ai) % (1LL << 32));
+        }
+      }
+      i += 1;
+    }
+    return { i, features };
+  }
+
+  std::vector<utility::CDChunk> chunk_generator(IStreamLike& stream, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool fat, bool extract_features = false) {
     uint32_t cs = utility::center_size(avg_size, min_size, max_size);
     uint32_t bits = utility::logarithm2(avg_size);
     uint32_t mask_s = utility::mask(bits + 1);
@@ -251,12 +326,27 @@ namespace fastcdc {
         blob.resize(blob_len);
         blob_it = blob.begin();  // iterators got invalidated
       }
-      uint32_t cp = cdc_offset(std::span(blob_it, blob.end()), min_size, avg_size, max_size, cs, mask_s, mask_l);
+      uint32_t cp;
+      std::optional<std::vector<uint32_t>> features{};
+      if (extract_features) {
+        std::tie(cp, features) = cdc_offset_with_features(std::span(blob_it, blob.end()), min_size, avg_size, max_size, cs, mask_s, mask_l);
+      }
+      else {
+        cp = cdc_offset(std::span(blob_it, blob.end()), min_size, avg_size, max_size, cs, mask_s, mask_l);
+      }
       std::vector<uint8_t> raw{};
       if (fat) {
         raw = std::vector(blob_it, blob_it + cp);
       }
       chunks.emplace_back(offset, cp, std::move(raw), std::string());
+      if (features.has_value()) {
+        auto& last_chunk = chunks.back();
+        for (int i = 0; i < 4; i++) {
+          // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
+          last_chunk.super_features[i] = XXH32(features->data() + static_cast<ptrdiff_t>(i * 4), 16, constants::CDS_SAMPLING_MASK);
+        }
+        last_chunk.feature_sampling_failure = false;
+      }
       offset += cp;
       blob_it += cp;
     }
@@ -495,11 +585,6 @@ int main(int argc, char* argv[])
   std::unordered_map<std::string, std::vector<int>> known_hashes{};  // Find chunk pos by hash
   std::vector<std::string> chunk_hashes{};  // Find hash by chunk pos
 
-  auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
-  auto chunks = fastcdc::chunk_generator(wrapped_file, min_size, avg_size, max_size, true);
-  auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
-  auto hashing_start_time = std::chrono::high_resolution_clock::now();
-
   int chunk_i = 0;
   int last_reduced_chunk_i = 0;
   int pending_chunks = 0;
@@ -507,6 +592,9 @@ int main(int argc, char* argv[])
   std::vector<uint8_t> pending_chunk_data(batch_size * max_size, 0);
   std::vector<std::bitset<64>> simhashes{};
   std::unordered_map<std::bitset<64>, int> simhashes_dict{};
+
+  // Find chunk_i that has a given SuperFeature
+  std::unordered_map<uint32_t, std::set<int>> superfeatures_dict{};
 
   const uint32_t simhash_chunk_size = 16;
   const uint32_t max_allowed_dist = 32;
@@ -525,6 +613,16 @@ int main(int argc, char* argv[])
 
   const bool use_dupadj = true;
   const bool use_dupadj_backwards = true;
+  const bool use_feature_extraction = true;
+  // if false, the first similar block found by any method will be used and other methods won't run, if true, all methods will run and the most similar block found will be used
+  const bool attempt_multiple_delta_methods = true;
+  // if true and attempt_multiple_delta_methods is true as well, other similar blocks will be tried if one is attempted but the delta encoding failed to save size
+  const bool attempt_multiple_blocks_on_failure = true;
+
+  auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
+  auto chunks = fastcdc::chunk_generator(wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
+  auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
+  auto hashing_start_time = std::chrono::high_resolution_clock::now();
 
   std::optional<std::string> similarity_locality_anchor{};
   for (auto& chunk : chunks) {
@@ -548,13 +646,105 @@ int main(int argc, char* argv[])
 
     if (!known_hashes.contains(chunk.hash)) {
       chunk.lsh = simhash_func(chunk.data.data(), chunk.data.size(), simhash_chunk_size);
-      auto simhash_base = hamming_base(chunk.lsh);
+      const auto simhash_base = hamming_base(chunk.lsh);
+
+      std::forward_list<std::pair<utility::CDChunk*, int>> similar_chunks{};  // pairs are (similar chunk, hamming dist to chunk)
       if (!simhashes_dict.contains(simhash_base)) {
         faiss_idx_to_chunk_id.push_back(chunk_i);
         simhashes_dict[simhash_base] = chunk_i;
         simhashes.emplace_back(simhash_base);
+      }
+      else {
+        similar_chunks.emplace_front(&chunks[simhashes_dict[simhash_base]], hamming_distance(chunks[simhashes_dict[simhash_base]].lsh, chunk.lsh));
+      }
 
-        // Attempt to find similar block via DARE's DupAdj, checking if the next chunk from the similarity locality anchor is similar to this one
+      // If we couldn't sample the chunk's features we completely skip any attempt to match or register superfeatures, as we could not extract them for this chunk
+      if (use_feature_extraction && !chunk.feature_sampling_failure) {
+        // If we don't have a similar chunk yet, attempt to find one by SuperFeature matching
+        if (similar_chunks.empty() || attempt_multiple_delta_methods) {
+          std::optional<int> best_candidate_dist{};
+          int best_candidate = 0;
+          for (const auto& sf : chunk.super_features) {
+            if (superfeatures_dict.contains(sf)) {
+              for (const auto& candidate_i : superfeatures_dict[sf]) {
+                const auto new_dist = hamming_distance(chunk.lsh, chunks[candidate_i].lsh);
+                if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist)) {
+                  best_candidate = candidate_i;
+                  best_candidate_dist = new_dist;
+                }
+              }
+            }
+          }
+          if (best_candidate_dist.has_value()) {
+            if (!similar_chunks.empty()) {
+              bool inserted = false;
+              auto iter = similar_chunks.begin();
+              auto prev_iter = similar_chunks.before_begin();
+              while (iter != similar_chunks.end()) {
+                const auto& [existing_similar_chunk, existing_similar_chunk_dist] = *iter;
+                if (existing_similar_chunk == &chunks[best_candidate]) {
+                  // candidate already on list, exit
+                  inserted = true;
+                  break;
+                }
+                if (*best_candidate_dist < existing_similar_chunk_dist) {
+                  similar_chunks.emplace_after(prev_iter, &chunks[best_candidate], *best_candidate_dist);
+                  inserted = true;
+                  break;
+                }
+                prev_iter = iter;
+                ++iter;
+              }
+              // If we iterated the whole list and still haven't inserted we insert at the end
+              if (!inserted) similar_chunks.emplace_after(prev_iter, &chunks[best_candidate], *best_candidate_dist);
+            }
+            else {
+              similar_chunks.emplace_front(&chunks[best_candidate], *best_candidate_dist);
+            }
+          }
+
+          // We will rank potential similar chunks by their amount of matching SuperFeatures (so we select the most similar chunk possible)
+          std::unordered_map<int, int> chunk_rank{};
+          for (const auto& sf : chunk.super_features) {
+            if (superfeatures_dict.contains(sf)) {
+              for (const auto& candidate_i : superfeatures_dict[sf]) {
+                chunk_rank[candidate_i] += 1;
+              }
+            }
+          }
+          int best_candidate_i = 0;
+          int matching_sfs = 0;
+          for (const auto& [candidate_i, sf_count] : chunk_rank) {
+            if (sf_count > matching_sfs) {
+              best_candidate_i = candidate_i;
+              matching_sfs = sf_count;
+            }
+            if (matching_sfs == 4) break;
+          }
+          // WARNING: We just use the SuperFeatures to index and find candidates by using the SimHashes, which gives us better results
+          // so actually selecting a similar chunk is disabled here, we just keep all this so we can remove old chunks with the same SuperFeature set
+          /*
+          if (matching_sfs > 0) {
+            similar_chunk = &chunks[best_candidate_i];
+          }
+          */
+          // If all SuperFeatures match, remove the previous chunk from the Index, prevents the index from getting pointlessly large, specially for some pathological cases
+          if (matching_sfs == 4) {
+            for (const auto& sf : chunk.super_features) {
+              superfeatures_dict[sf].erase(best_candidate_i);
+            }
+          }
+
+          // Register this chunk's SuperFeatures so that matches may be found with subsequent chunks
+          for (int i = 0; i < 4; i++) {
+            superfeatures_dict[chunk.super_features[i]].insert(chunk_i);
+          }
+        }
+      }
+
+      // If we don't have a similar chunk yet, attempt to find similar block via DARE's DupAdj,
+      // checking if the next chunk from the similarity locality anchor is similar to this one
+      if (similar_chunks.empty() || attempt_multiple_delta_methods) {
         std::optional<int> best_candidate_dist{};
         int best_candidate = 0;
         if (use_dupadj && similarity_locality_anchor.has_value()) {
@@ -562,8 +752,8 @@ int main(int argc, char* argv[])
             const auto similar_candidate_chunk = anchor_instance_chunk_i + 1;
             if (similar_candidate_chunk == chunk_i) continue;
 
-            const auto& similar_chunk = chunks[similar_candidate_chunk];
-            const auto new_dist = hamming_distance(chunk.lsh, similar_chunk.lsh);
+            const auto& similar_candidate = chunks[similar_candidate_chunk];
+            const auto new_dist = hamming_distance(chunk.lsh, similar_candidate.lsh);
             if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist)) {
               best_candidate_dist = new_dist;
               best_candidate = similar_candidate_chunk;
@@ -571,29 +761,50 @@ int main(int argc, char* argv[])
           }
         }
         if (best_candidate_dist.has_value()) {
-          const auto& similar_chunk = chunks[best_candidate];
-          auto saved_size = simulate_delta_encoding_func(chunk, similar_chunk, simhash_chunk_size);
+          if (!similar_chunks.empty()) {
+            bool inserted = false;
+            auto iter = similar_chunks.begin();
+            auto prev_iter = similar_chunks.before_begin();
+            while (iter != similar_chunks.end()) {
+              const auto& [existing_similar_chunk, existing_similar_chunk_dist] = *iter;
+              if (existing_similar_chunk == &chunks[best_candidate]) {
+                // candidate already on list, exit
+                inserted = true;
+                break;
+              }
+              if (*best_candidate_dist < existing_similar_chunk_dist) {
+                similar_chunks.emplace_after(prev_iter, &chunks[best_candidate], *best_candidate_dist);
+                inserted = true;
+                break;
+              }
+              prev_iter = iter;
+              ++iter;
+            }
+            // If we iterated the whole list and still haven't inserted we insert at the end
+            if (!inserted) similar_chunks.emplace_after(prev_iter, &chunks[best_candidate], *best_candidate_dist);
+          }
+          else {
+            similar_chunks.emplace_front(&chunks[best_candidate], *best_candidate_dist);
+          }
+        }
+      }
+
+      if (!similar_chunks.empty()) {
+        for (const auto& [similar_chunk, similar_chunk_dist] : similar_chunks) {
+          auto saved_size = simulate_delta_encoding_func(chunk, *similar_chunk, simhash_chunk_size);
 
           if (saved_size > 0) {
             delta_compressed_approx_size += saved_size;
             delta_compressed_chunk_count++;
-            similarity_locality_anchor = similar_chunk.hash;
+            similarity_locality_anchor = similar_chunk->hash;
+            break;
           }
-        }
-        else {
-          similarity_locality_anchor = std::nullopt;
+          if (!attempt_multiple_blocks_on_failure) break;
         }
       }
       else {
-        const auto& similar_chunk = chunks[simhashes_dict[simhash_base]];
-
-        auto saved_size = simulate_delta_encoding_func(chunk, similar_chunk, simhash_chunk_size);
-
-        delta_compressed_approx_size += saved_size;
-        delta_compressed_chunk_count++;
-        similarity_locality_anchor = similar_chunk.hash;
+        similarity_locality_anchor = std::nullopt;
       }
-
       /*
       int32_t brute_dist = 99;
       int best_simhash_index = 0;
