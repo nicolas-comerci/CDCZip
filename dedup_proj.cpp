@@ -475,27 +475,50 @@ std::bitset<bit_size> hamming_base(std::bitset<bit_size> data) {
   return data.flip(syndrome);
 }
 
-uint64_t simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, int chunk_size) {
+uint64_t simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, uint32_t chunk_size) {
+  //DDelta style delta encoding, first start by greedily attempting to match data at the start and end on the chunks
+  uint64_t start_matching_data_len = 0;
+  const auto cmp_size = std::min(chunk.data.size(), similar_chunk.data.size());
+  std::span chunk_data_span{ chunk.data.data(), cmp_size };
+  std::span similar_chunk_data_span{ similar_chunk.data.data(), cmp_size };
+  for (uint64_t i = 0; i < cmp_size; i++) {
+    if (chunk_data_span[i] != similar_chunk_data_span[i]) break;
+    ++start_matching_data_len;
+  }
+
+  uint64_t end_matching_data_len = 0;
+  chunk_data_span = std::span{ chunk.data.data() + chunk.data.size() - cmp_size, cmp_size };
+  similar_chunk_data_span = std::span{ similar_chunk.data.data() + similar_chunk.data.size() - cmp_size, cmp_size };
+  for (uint64_t i = 0; i < cmp_size; i++) {
+    if (chunk_data_span[cmp_size - 1 - i] != similar_chunk_data_span[cmp_size - 1 - i]) break;
+    ++end_matching_data_len;
+  }
+
+  uint64_t saved_size = start_matching_data_len + end_matching_data_len;
+
+  // If the chunks are of different size, its possible we have matched the whole chunk inside the other, in that case we save all that size
+  if (start_matching_data_len + end_matching_data_len >= chunk.data.size()) return chunk.data.size();
+
   // Simulate delta patching, really fucking stupid and slow, start by getting minichunks for the similar chunk
   XXH3_state_t* state = XXH3_createState();
   // Iterate over the data in chunks
   std::set<uint64_t> minichunk_hashes{};
   const int similar_chunk_len = similar_chunk.data.size();
-  for (int i = 0; i < similar_chunk_len; i += chunk_size) {
+  for (uint64_t i = 0; i < similar_chunk_len; i += chunk_size) {
     // Calculate hash for current chunk
     XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, similar_chunk.data.data() + i, std::min(chunk_size, similar_chunk_len - i));
+    XXH3_64bits_update(state, similar_chunk.data.data() + i, std::min<uint64_t>(chunk_size, similar_chunk_len - i));
     uint64_t chunk_hash = XXH3_64bits_digest(state);
     minichunk_hashes.insert(chunk_hash);
   }
 
   // Clean the file and get minichunks for pending chunk, count filesize saved by omitting data on the similar chunk
-  uint64_t saved_size = 0;
-  const int chunk_len = chunk.data.size();
-  for (int i = 0; i < chunk_len; i += chunk_size) {
+  const uint64_t chunk_non_matched_len = chunk.data.size() - start_matching_data_len - end_matching_data_len;
+  const uint8_t* chunk_non_matched_data_start = chunk.data.data() + start_matching_data_len;
+  for (uint64_t i = 0; i < chunk_non_matched_len; i += chunk_size) {
     XXH3_64bits_reset(state);
-    const auto to_read = std::min(chunk_size, chunk_len - i);
-    XXH3_64bits_update(state, chunk.data.data() + i, to_read);
+    const auto to_read = std::min<uint64_t>(chunk_size, chunk_non_matched_len - i);
+    XXH3_64bits_update(state, chunk_non_matched_data_start + i, to_read);
     XXH64_hash_t minichunk_hash = XXH3_64bits_digest(state);
     if (minichunk_hashes.contains(minichunk_hash)) {
       saved_size += to_read;
@@ -505,7 +528,30 @@ uint64_t simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const 
   return saved_size;
 }
 
-uint64_t simulate_delta_encoding_cdc(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, int chunk_size) {
+uint64_t simulate_delta_encoding_cdc(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, uint32_t chunk_size) {
+  //DDelta style delta encoding, first start by greedily attempting to match data at the start and end on the chunks
+  uint64_t start_matching_data_len = 0;
+  const auto cmp_size = std::min(chunk.data.size(), similar_chunk.data.size());
+  std::span chunk_data_span{ chunk.data.data(), cmp_size };
+  std::span similar_chunk_data_span{ similar_chunk.data.data(), cmp_size };
+  for (uint64_t i = 0; i < cmp_size; i++) {
+    if (chunk_data_span[i] != similar_chunk_data_span[i]) break;
+    ++start_matching_data_len;
+  }
+
+  uint64_t end_matching_data_len = 0;
+  chunk_data_span = std::span{ chunk.data.data() + chunk.data.size() - cmp_size, cmp_size };
+  similar_chunk_data_span = std::span{ similar_chunk.data.data() + similar_chunk.data.size() - cmp_size, cmp_size };
+  for (uint64_t i = 0; i < cmp_size; i++) {
+    if (chunk_data_span[cmp_size - 1 - i] != similar_chunk_data_span[cmp_size - 1 - i]) break;
+    ++end_matching_data_len;
+  }
+
+  uint64_t saved_size = start_matching_data_len + end_matching_data_len;
+
+  // If the chunks are of different size, its possible we have matched the whole chunk inside the other, in that case we save all that size
+  if (start_matching_data_len + end_matching_data_len >= chunk.data.size()) return chunk.data.size();
+
   // Simulate delta patching, really fucking stupid and slow, start by getting minichunks for the similar chunk
   XXH3_state_t* state = XXH3_createState();
   auto similar_memstream = IStreamMem(similar_chunk.data.data(), similar_chunk.data.size());
@@ -520,8 +566,9 @@ uint64_t simulate_delta_encoding_cdc(const utility::CDChunk& chunk, const utilit
   }
 
   // Clean the file and get minichunks for pending chunk, count filesize saved by omitting data on the similar chunk
-  uint64_t saved_size = 0;
-  auto pending_memstream = IStreamMem(chunk.data.data(), chunk.data.size());
+  const uint64_t chunk_non_matched_len = chunk.data.size() - start_matching_data_len - end_matching_data_len;
+  const uint8_t* chunk_non_matched_data_start = chunk.data.data() + start_matching_data_len;
+  auto pending_memstream = IStreamMem(chunk_non_matched_data_start, chunk_non_matched_len);
   auto pending_minichunks = fastcdc::chunk_generator(pending_memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);
   for (const auto& minichunk : pending_minichunks) {
     XXH3_64bits_reset(state);
@@ -601,7 +648,7 @@ int main(int argc, char* argv[])
   const bool best_delta = false;
 
   std::bitset<64> (*simhash_func)(uint8_t* data, int data_len, int chunk_size) = nullptr;
-  uint64_t(*simulate_delta_encoding_func)(const utility::CDChunk & chunk, const utility::CDChunk & similar_chunk, int chunk_size) = nullptr;
+  uint64_t(*simulate_delta_encoding_func)(const utility::CDChunk & chunk, const utility::CDChunk & similar_chunk, uint32_t chunk_size) = nullptr;
   if (!best_delta) {
     simhash_func = &simhash_data_xxhash_shingling;
     simulate_delta_encoding_func = &simulate_delta_encoding_shingling;
