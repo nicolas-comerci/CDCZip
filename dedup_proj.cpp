@@ -299,58 +299,79 @@ namespace fastcdc {
     return { i, features };
   }
 
-  std::vector<utility::CDChunk> chunk_generator(IStreamLike& stream, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool fat, bool extract_features = false) {
-    uint32_t cs = utility::center_size(avg_size, min_size, max_size);
-    uint32_t bits = utility::logarithm2(avg_size);
-    uint32_t mask_s = utility::mask(bits + 1);
-    uint32_t mask_l = utility::mask(bits - 1);
-    uint32_t read_size = std::max<uint32_t>(1024 * 64, max_size);
+  class ChunkGeneratorContext {
+  public:
+    IStreamLike* stream;
+    uint32_t min_size;
+    uint32_t avg_size;
+    uint32_t max_size;
+    bool fat;
+    bool extract_features;
 
+    uint32_t cs;
+    uint32_t bits;
+    uint32_t mask_s;
+    uint32_t mask_l;
+    uint32_t read_size;
+
+    uintmax_t offset = 0;
     std::vector<uint8_t> blob{};
-    blob.resize(read_size);
-    stream.read(blob.data(), read_size);
-    uint32_t blob_len = stream.gcount();
-    blob.resize(blob_len);
+    uint32_t blob_len = 0;
+    std::vector<unsigned char>::iterator blob_it;
 
-    uint32_t offset = 0;
-    std::vector<utility::CDChunk> chunks{};
-    auto blob_it = blob.begin();
-    while (blob_it != blob.end()) {
-      blob_len = blob.end() - blob_it;
-      if (blob_len <= max_size) {
-        blob.erase(blob.begin(), blob_it);
+    ChunkGeneratorContext(IStreamLike* _stream, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _fat, bool _extract_features = false)
+      : stream(_stream), min_size(_min_size), avg_size(_avg_size), max_size(_max_size), fat(_fat), extract_features(_extract_features) {
+      cs = utility::center_size(avg_size, min_size, max_size);
+      bits = utility::logarithm2(avg_size);
+      mask_s = utility::mask(bits + 1);
+      mask_l = utility::mask(bits - 1);
+      read_size = std::max<uint32_t>(1024 * 64, max_size);
 
-        blob.resize(read_size);
-        stream.read(reinterpret_cast<char*>(blob.data()) + blob_len, read_size - blob_len);
-        blob_len += stream.gcount();
-        blob.resize(blob_len);
-        blob_it = blob.begin();  // iterators got invalidated
-      }
-      uint32_t cp;
-      std::optional<std::vector<uint32_t>> features{};
-      if (extract_features) {
-        std::tie(cp, features) = cdc_offset_with_features(std::span(blob_it, blob.end()), min_size, avg_size, max_size, cs, mask_s, mask_l);
-      }
-      else {
-        cp = cdc_offset(std::span(blob_it, blob.end()), min_size, avg_size, max_size, cs, mask_s, mask_l);
-      }
-      std::vector<uint8_t> raw{};
-      if (fat) {
-        raw = std::vector(blob_it, blob_it + cp);
-      }
-      chunks.emplace_back(offset, cp, std::move(raw), std::string());
-      if (features.has_value()) {
-        auto& last_chunk = chunks.back();
-        for (int i = 0; i < 4; i++) {
-          // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
-          last_chunk.super_features[i] = XXH32(features->data() + static_cast<ptrdiff_t>(i * 4), 16, constants::CDS_SAMPLING_MASK);
-        }
-        last_chunk.feature_sampling_failure = false;
-      }
-      offset += cp;
-      blob_it += cp;
+      blob.resize(read_size);
+      stream->read(blob.data(), read_size);
+      uint32_t blob_len = stream->gcount();
+      blob.resize(blob_len);
+      blob_it = blob.begin();
     }
-    return chunks;
+  };
+
+  std::optional<utility::CDChunk> chunk_generator(ChunkGeneratorContext& context) {
+    std::optional<utility::CDChunk> chunk{};
+    if (context.blob_it == context.blob.end()) return chunk;
+
+    context.blob_len = context.blob.end() - context.blob_it;
+    if (context.blob_len <= context.max_size) {
+      context.blob.erase(context.blob.begin(), context.blob_it);
+
+      context.blob.resize(context.read_size);
+      context.stream->read(reinterpret_cast<char*>(context.blob.data()) + context.blob_len, context.read_size - context.blob_len);
+      context.blob_len += context.stream->gcount();
+      context.blob.resize(context.blob_len);
+      context.blob_it = context.blob.begin();  // iterators got invalidated
+    }
+    uint32_t cp;
+    std::optional<std::vector<uint32_t>> features{};
+    if (context.extract_features) {
+      std::tie(cp, features) = cdc_offset_with_features(std::span(context.blob_it, context.blob.end()), context.min_size, context.avg_size, context.max_size, context.cs, context.mask_s, context.mask_l);
+    }
+    else {
+      cp = cdc_offset(std::span(context.blob_it, context.blob.end()), context.min_size, context.avg_size, context.max_size, context.cs, context.mask_s, context.mask_l);
+    }
+    std::vector<uint8_t> raw{};
+    if (context.fat) {
+      raw = std::vector(context.blob_it, context.blob_it + cp);
+    }
+    chunk.emplace(context.offset, cp, std::move(raw), std::string());
+    if (features.has_value()) {
+      for (int i = 0; i < 4; i++) {
+        // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
+        chunk->super_features[i] = XXH32(features->data() + static_cast<ptrdiff_t>(i * 4), 16, constants::CDS_SAMPLING_MASK);
+      }
+      chunk->feature_sampling_failure = false;
+    }
+    context.offset += cp;
+    context.blob_it += cp;
+    return chunk;
   }
 }
 
@@ -409,10 +430,12 @@ std::bitset<64> simhash_data_xxhash_cdc(uint8_t* data, int data_len, int chunk_s
   XXH3_64bits_reset(state);
 
   auto memstream = IStreamMem(data, data_len);
-  auto cdc_minichunks = fastcdc::chunk_generator(memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);
+  auto ctx = fastcdc::ChunkGeneratorContext(&memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);  
 
   // Iterate over the data in chunks
-  for (const auto& chunk : cdc_minichunks) {
+  auto cdc_minichunk = fastcdc::chunk_generator(ctx);
+  while (cdc_minichunk.has_value()) {
+    const auto& chunk = *cdc_minichunk;
     // Calculate hash for current chunk
     XXH3_64bits_update(state, chunk.data.data(), chunk.data.size());
     std::bitset<64> chunk_hash = XXH3_64bits_digest(state);
@@ -422,6 +445,8 @@ std::bitset<64> simhash_data_xxhash_cdc(uint8_t* data, int data_len, int chunk_s
     for (int bit_i = 0; bit_i < 64; bit_i++) {
       simhash_vector[bit_i] += (chunk_hash.test(bit_i) ? 1 : -1);
     }
+
+    cdc_minichunk = fastcdc::chunk_generator(ctx);
   }
 
   // Truncate simhash_vector into simhash, by keeping values larger than 0 as 1bit and values 0 or less to 0bit
@@ -555,28 +580,38 @@ uint64_t simulate_delta_encoding_cdc(const utility::CDChunk& chunk, const utilit
   // Simulate delta patching, really fucking stupid and slow, start by getting minichunks for the similar chunk
   XXH3_state_t* state = XXH3_createState();
   auto similar_memstream = IStreamMem(similar_chunk.data.data(), similar_chunk.data.size());
-  auto similar_minichunks = fastcdc::chunk_generator(similar_memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);
+  auto ctx = fastcdc::ChunkGeneratorContext(&similar_memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);
   std::set<uint64_t> minichunk_hashes{};
-  for (const auto& minichunk : similar_minichunks) {
+
+  auto similar_minichunk = fastcdc::chunk_generator(ctx);
+  while (similar_minichunk.has_value()) {
+    const auto& minichunk = *similar_minichunk;
     XXH3_64bits_reset(state);
     XXH3_64bits_update(state, minichunk.data.data(), minichunk.data.size());
     XXH64_hash_t minichunk_hash = 0;
     minichunk_hash = XXH3_64bits_digest(state);
     minichunk_hashes.insert(minichunk_hash);
+
+    similar_minichunk = fastcdc::chunk_generator(ctx);
   }
 
   // Clean the file and get minichunks for pending chunk, count filesize saved by omitting data on the similar chunk
   const uint64_t chunk_non_matched_len = chunk.data.size() - start_matching_data_len - end_matching_data_len;
   const uint8_t* chunk_non_matched_data_start = chunk.data.data() + start_matching_data_len;
   auto pending_memstream = IStreamMem(chunk_non_matched_data_start, chunk_non_matched_len);
-  auto pending_minichunks = fastcdc::chunk_generator(pending_memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);
-  for (const auto& minichunk : pending_minichunks) {
+  auto pending_ctx = fastcdc::ChunkGeneratorContext(&pending_memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);
+
+  auto pending_minichunk = fastcdc::chunk_generator(pending_ctx);
+  while (pending_minichunk.has_value()) {
+    const auto& minichunk = *pending_minichunk;
     XXH3_64bits_reset(state);
     XXH3_64bits_update(state, minichunk.data.data(), minichunk.data.size());
     XXH64_hash_t minichunk_hash = XXH3_64bits_digest(state);
     if (minichunk_hashes.contains(minichunk_hash)) {
       saved_size += minichunk.data.size();
     }
+
+    pending_minichunk = fastcdc::chunk_generator(pending_ctx);
   }
   XXH3_freeState(state);
   return saved_size;
@@ -615,6 +650,7 @@ int main(int argc, char* argv[])
   std::vector<faiss::idx_t> search_result_labels(5 * batch_size, -1);
   //printf("is_trained = %s\n", index.is_trained ? "true" : "false");
 
+  auto file_size = std::filesystem::file_size(file_path);
   auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
   if (!file_stream.is_open()) {
     std::cout << "Can't read file\n";
@@ -668,17 +704,28 @@ int main(int argc, char* argv[])
   const bool use_match_extension = true;
   const bool use_match_extension_backwards = true;
 
-  auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
-  auto chunks = fastcdc::chunk_generator(wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
-  auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
-  auto hashing_start_time = std::chrono::high_resolution_clock::now();
+  std::vector<utility::CDChunk> chunks{};
+  uintmax_t chunk_generator_execution_time_ns = 0;
+  uintmax_t hashing_execution_time_ns = 0;
+  uintmax_t simhashing_execution_time_ns = 0;
+  auto total_runtime_start_time = std::chrono::high_resolution_clock::now();  
+  auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
 
   std::optional<std::string> similarity_locality_anchor{};
-  for (auto& chunk : chunks) {
+  auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
+  auto generated_chunk = fastcdc::chunk_generator(generator_ctx);
+  auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
+  chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
+  while (generated_chunk.has_value()) {
+    chunks.emplace_back(std::move(*generated_chunk));
+    auto& chunk = chunks.back();
+
     std::optional<std::string> prev_similarity_locality_anchor = similarity_locality_anchor;
-    if (chunk_i % 1000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(chunk_i) / chunks.size()) * 100) + "\n" << std::flush;
+    if (chunk_i % 1000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(generator_ctx.offset) / file_size) * 100) + "\n" << std::flush;
     total_size += chunk.length;
+
     // make hashes
+    const auto hashing_start_time = std::chrono::high_resolution_clock::now();
     /*
     // SHA1 boost hash
     boost::uuids::detail::sha1 hasher;
@@ -693,10 +740,15 @@ int main(int argc, char* argv[])
     XXH64_hash_t result = XXH3_64bits_digest(state);
     XXH3_freeState(state);
     chunk.hash = std::to_string(result);
+    const auto hashing_end_time = std::chrono::high_resolution_clock::now();
+    hashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - hashing_start_time).count();
 
     if (!known_hashes.contains(chunk.hash)) {
+      const auto simhashing_start_time = std::chrono::high_resolution_clock::now();
       chunk.lsh = simhash_func(chunk.data.data(), chunk.data.size(), simhash_chunk_size);
       const auto simhash_base = hamming_base(chunk.lsh);
+      const auto simhashing_end_time = std::chrono::high_resolution_clock::now();
+      simhashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(simhashing_end_time - simhashing_start_time).count();
 
       std::forward_list<std::pair<utility::CDChunk*, int>> similar_chunks{};  // pairs are (similar chunk, hamming dist to chunk)
       if (!simhashes_dict.contains(simhash_base)) {
@@ -1061,8 +1113,13 @@ int main(int argc, char* argv[])
 
     pending_chunks = 0;
     chunk_i++;
+
+    chunk_generator_start_time = std::chrono::high_resolution_clock::now();
+    generated_chunk = fastcdc::chunk_generator(generator_ctx);
+    chunk_generator_end_time = std::chrono::high_resolution_clock::now();
+    chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
   }
-  auto hashing_end_time = std::chrono::high_resolution_clock::now();
+  auto total_runtime_end_time = std::chrono::high_resolution_clock::now();
 
   // Chunk stats
   std::cout << std::string("Chunk Sizes:    min ") + std::to_string(min_size) + " - avg " + std::to_string(avg_size) + " - max " + std::to_string(max_size) + "\n" << std::flush;
@@ -1070,24 +1127,28 @@ int main(int argc, char* argv[])
   std::cout << "Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n" << std::flush;
   std::cout << "Total delta compressed chunk count: " + std::to_string(delta_compressed_chunk_count) + "\n" << std::flush;
 
-  // Throughput stats
-  auto total_size_mbs = total_size / (1024.0 * 1024);
+  // Results stats
+  const auto total_size_mbs = total_size / (1024.0 * 1024);
   std::printf("Chunk data total size:    %.1f MB\n", total_size_mbs);
-  auto deduped_size_mbs = deduped_size / (1024.0 * 1024);
+  const auto deduped_size_mbs = deduped_size / (1024.0 * 1024);
   std::printf("Chunk data deduped size:    %.1f MB\n", deduped_size_mbs);
-  auto deltaed_size_mbs = delta_compressed_approx_size / (1024.0 * 1024);
+  const auto deltaed_size_mbs = delta_compressed_approx_size / (1024.0 * 1024);
   std::printf("Chunk data delta compressed size:    %.1f MB\n", deltaed_size_mbs);
   std::printf("Final size:    %.1f MB\n", total_size_mbs - deduped_size_mbs - deltaed_size_mbs);
-  auto chunking_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
-  auto chunking_mb_per_nanosecond = total_size_mbs / chunking_elapsed_nanoseconds;
+
+  std::printf("\n");
+
+  // Throughput stats
+  const auto chunking_mb_per_nanosecond = total_size_mbs / chunk_generator_execution_time_ns;
   std::printf("Chunking Throughput:    %.1f MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
-  auto hashing_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - hashing_start_time).count();
-  auto hashing_mb_per_nanosecond = total_size_mbs / hashing_elapsed_nanoseconds;
+  const auto hashing_mb_per_nanosecond = total_size_mbs / hashing_execution_time_ns;
   std::printf("Hashing Throughput:    %.1f MB/s\n", hashing_mb_per_nanosecond * std::pow(10, 9));
-  auto total_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - chunk_generator_start_time).count();
-  auto total_mb_per_nanosecond = total_size_mbs / total_elapsed_nanoseconds;
+  const auto simhashing_mb_per_nanosecond = total_size_mbs / simhashing_execution_time_ns;
+  std::printf("SimHashing Throughput:    %.1f MB/s\n", simhashing_mb_per_nanosecond* std::pow(10, 9));
+  const auto total_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(total_runtime_end_time - total_runtime_start_time).count();
+  const auto total_mb_per_nanosecond = total_size_mbs / total_elapsed_nanoseconds;
   std::printf("Total Throughput:    %.1f MB/s\n", total_mb_per_nanosecond * std::pow(10, 9));
-  std::printf("Total runtime:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(hashing_end_time - chunk_generator_start_time).count());
+  std::printf("Total runtime:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(total_runtime_end_time - total_runtime_start_time).count());
 
   return 0;
 }
