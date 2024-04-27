@@ -699,8 +699,6 @@ int main(int argc, char* argv[])
   const bool use_feature_extraction = true;
   // if false, the first similar block found by any method will be used and other methods won't run, if true, all methods will run and the most similar block found will be used
   const bool attempt_multiple_delta_methods = true;
-  // if true and attempt_multiple_delta_methods is true as well, other similar blocks will be tried if one is attempted but the delta encoding failed to save size
-  const bool attempt_multiple_blocks_on_failure = true;
   const bool use_match_extension = true;
   const bool use_match_extension_backwards = true;
 
@@ -750,14 +748,14 @@ int main(int argc, char* argv[])
       const auto simhashing_end_time = std::chrono::high_resolution_clock::now();
       simhashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(simhashing_end_time - simhashing_start_time).count();
 
-      std::forward_list<std::pair<utility::CDChunk*, int>> similar_chunks{};  // pairs are (similar chunk, hamming dist to chunk)
+      std::vector<int> similar_chunks{};
       if (!simhashes_dict.contains(simhash_base)) {
         faiss_idx_to_chunk_id.push_back(chunk_i);
         simhashes_dict[simhash_base] = chunk_i;
         simhashes.emplace_back(simhash_base);
       }
       else {
-        similar_chunks.emplace_front(&chunks[simhashes_dict[simhash_base]], hamming_distance(chunks[simhashes_dict[simhash_base]].lsh, chunk.lsh));
+        similar_chunks.emplace_back(simhashes_dict[simhash_base]);
       }
 
       // If we couldn't sample the chunk's features we completely skip any attempt to match or register superfeatures, as we could not extract them for this chunk
@@ -778,31 +776,7 @@ int main(int argc, char* argv[])
             }
           }
           if (best_candidate_dist.has_value()) {
-            if (!similar_chunks.empty()) {
-              bool inserted = false;
-              auto iter = similar_chunks.begin();
-              auto prev_iter = similar_chunks.before_begin();
-              while (iter != similar_chunks.end()) {
-                const auto& [existing_similar_chunk, existing_similar_chunk_dist] = *iter;
-                if (existing_similar_chunk == &chunks[best_candidate]) {
-                  // candidate already on list, exit
-                  inserted = true;
-                  break;
-                }
-                if (*best_candidate_dist < existing_similar_chunk_dist) {
-                  similar_chunks.emplace_after(prev_iter, &chunks[best_candidate], *best_candidate_dist);
-                  inserted = true;
-                  break;
-                }
-                prev_iter = iter;
-                ++iter;
-              }
-              // If we iterated the whole list and still haven't inserted we insert at the end
-              if (!inserted) similar_chunks.emplace_after(prev_iter, &chunks[best_candidate], *best_candidate_dist);
-            }
-            else {
-              similar_chunks.emplace_front(&chunks[best_candidate], *best_candidate_dist);
-            }
+            similar_chunks.emplace_back(best_candidate);
           }
 
           // We will rank potential similar chunks by their amount of matching SuperFeatures (so we select the most similar chunk possible)
@@ -863,45 +837,24 @@ int main(int argc, char* argv[])
           }
         }
         if (best_candidate_dist.has_value()) {
-          if (!similar_chunks.empty()) {
-            bool inserted = false;
-            auto iter = similar_chunks.begin();
-            auto prev_iter = similar_chunks.before_begin();
-            while (iter != similar_chunks.end()) {
-              const auto& [existing_similar_chunk, existing_similar_chunk_dist] = *iter;
-              if (existing_similar_chunk == &chunks[best_candidate]) {
-                // candidate already on list, exit
-                inserted = true;
-                break;
-              }
-              if (*best_candidate_dist < existing_similar_chunk_dist) {
-                similar_chunks.emplace_after(prev_iter, &chunks[best_candidate], *best_candidate_dist);
-                inserted = true;
-                break;
-              }
-              prev_iter = iter;
-              ++iter;
-            }
-            // If we iterated the whole list and still haven't inserted we insert at the end
-            if (!inserted) similar_chunks.emplace_after(prev_iter, &chunks[best_candidate], *best_candidate_dist);
-          }
-          else {
-            similar_chunks.emplace_front(&chunks[best_candidate], *best_candidate_dist);
-          }
+          similar_chunks.emplace_back(best_candidate);
         }
       }
 
       if (!similar_chunks.empty()) {
-        for (const auto& [similar_chunk, similar_chunk_dist] : similar_chunks) {
-          auto saved_size = simulate_delta_encoding_func(chunk, *similar_chunk, simhash_chunk_size);
-
-          if (saved_size > 0) {
-            delta_compressed_approx_size += saved_size;
-            delta_compressed_chunk_count++;
-            similarity_locality_anchor = similar_chunk->hash;
-            break;
+        uint64_t best_saved_size = 0;
+        utility::CDChunk* best_candidate = nullptr;
+        for (const auto& similar_chunk_i : similar_chunks) {
+          auto saved_size = simulate_delta_encoding_func(chunk, chunks[similar_chunk_i], simhash_chunk_size);
+          if (saved_size > best_saved_size) {
+            best_saved_size = saved_size;
+            best_candidate = &chunks[similar_chunk_i];
           }
-          if (!attempt_multiple_blocks_on_failure) break;
+        }
+        if (best_saved_size > 0) {
+          delta_compressed_approx_size += best_saved_size;
+          delta_compressed_chunk_count++;
+          similarity_locality_anchor = best_candidate->hash;
         }
       }
       else {
