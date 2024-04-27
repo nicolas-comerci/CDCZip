@@ -249,7 +249,7 @@ namespace fastcdc {
     return i;
   }
 
-  std::pair<uint32_t, std::optional<std::vector<uint32_t>>> cdc_offset_with_features(
+  std::pair<uint32_t, std::vector<uint32_t>> cdc_offset_with_features(
     const std::span<uint8_t> data,
     uint32_t min_size,
     uint32_t avg_size,
@@ -261,21 +261,25 @@ namespace fastcdc {
     uint32_t pattern = 0;
     uint32_t size = data.size();
     uint32_t barrier = std::min(center_size, size);
-    uint32_t i = std::min(barrier, min_size);
 
-    std::optional<std::vector<uint32_t>> features{};
+    std::pair<uint32_t, std::vector<uint32_t>> return_val{};
+    uint32_t& i = std::get<0>(return_val);
+    i = std::min(barrier, min_size);
+    auto& features = std::get<1>(return_val);
 
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_s)) return { i + 1, features };
+      if (!(pattern & mask_s)) {
+        i += 1;
+        return return_val;
+      }
       if (!(pattern & constants::CDS_SAMPLING_MASK)) {
-        if (!features.has_value()) {
-          features = std::vector<uint32_t>();
-          features->resize(16);
+        if (features.empty()) {
+          features.resize(16);
         }
         for (int feature_i = 0; feature_i < 16; feature_i++) {
           const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
-          (*features)[feature_i] = std::max<uint32_t>((*features)[feature_i], (mi * pattern + ai) % (1LL << 32));
+          features[feature_i] = std::max<uint32_t>(features[feature_i], (mi * pattern + ai) % (1LL << 32));
         }
       }
       i += 1;
@@ -283,20 +287,22 @@ namespace fastcdc {
     barrier = std::min(max_size, size);
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_l)) return { i + 1, features };
+      if (!(pattern & mask_l)) {
+        i += 1;
+        return return_val;
+      }
       if (!(pattern & constants::CDS_SAMPLING_MASK)) {
-        if (!features.has_value()) {
-          features = std::vector<uint32_t>();
-          features->resize(16);
+        if (features.empty()) {
+          features.resize(16);
         }
         for (int feature_i = 0; feature_i < 16; feature_i++) {
           const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
-          (*features)[feature_i] = std::max<uint32_t>((*features)[feature_i], (mi * pattern + ai) % (1LL << 32));
+          features[feature_i] = std::max<uint32_t>(features[feature_i], (mi * pattern + ai) % (1LL << 32));
         }
       }
       i += 1;
     }
-    return { i, features };
+    return return_val;
   }
 
   class ChunkGeneratorContext {
@@ -350,7 +356,7 @@ namespace fastcdc {
       context.blob_it = context.blob.begin();  // iterators got invalidated
     }
     uint32_t cp;
-    std::optional<std::vector<uint32_t>> features{};
+    std::vector<uint32_t> features{};
     if (context.extract_features) {
       std::tie(cp, features) = cdc_offset_with_features(std::span(context.blob_it, context.blob.end()), context.min_size, context.avg_size, context.max_size, context.cs, context.mask_s, context.mask_l);
     }
@@ -362,10 +368,10 @@ namespace fastcdc {
       raw = std::vector(context.blob_it, context.blob_it + cp);
     }
     chunk.emplace(context.offset, cp, std::move(raw), std::string());
-    if (features.has_value()) {
+    if (!features.empty()) {
       for (int i = 0; i < 4; i++) {
         // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
-        chunk->super_features[i] = XXH32(features->data() + static_cast<ptrdiff_t>(i * 4), 16, constants::CDS_SAMPLING_MASK);
+        chunk->super_features[i] = XXH32(features.data() + static_cast<ptrdiff_t>(i * 4), 16, constants::CDS_SAMPLING_MASK);
       }
       chunk->feature_sampling_failure = false;
     }
@@ -661,19 +667,13 @@ int main(int argc, char* argv[])
   uint64_t deduped_size = 0;
   uint64_t delta_compressed_approx_size = 0;
   uint64_t delta_compressed_chunk_count = 0;
-  
-  std::vector<int> faiss_idx_to_chunk_id{};
-  std::unordered_map<int, std::string> chunk_ssdeep_hashes{};
 
   std::unordered_map<std::string, std::vector<int>> known_hashes{};  // Find chunk pos by hash
-  std::vector<std::string> chunk_hashes{};  // Find hash by chunk pos
 
   int chunk_i = 0;
   int last_reduced_chunk_i = 0;
-  int pending_chunks = 0;
   std::vector<int32_t> pending_chunks_indexes(batch_size, 0);
   std::vector<uint8_t> pending_chunk_data(batch_size * max_size, 0);
-  std::vector<std::bitset<64>> simhashes{};
   std::unordered_map<std::bitset<64>, int> simhashes_dict{};
 
   // Find chunk_i that has a given SuperFeature
@@ -750,9 +750,7 @@ int main(int argc, char* argv[])
 
       std::vector<int> similar_chunks{};
       if (!simhashes_dict.contains(simhash_base)) {
-        faiss_idx_to_chunk_id.push_back(chunk_i);
         simhashes_dict[simhash_base] = chunk_i;
-        simhashes.emplace_back(simhash_base);
       }
       else {
         similar_chunks.emplace_back(simhashes_dict[simhash_base]);
@@ -797,8 +795,8 @@ int main(int argc, char* argv[])
             }
             if (matching_sfs == 4) break;
           }
-          // WARNING: We just use the SuperFeatures to index and find candidates by using the SimHashes, which gives us better results
-          // so actually selecting a similar chunk is disabled here, we just keep all this so we can remove old chunks with the same SuperFeature set
+          // WARNING: We just use the SuperFeatures to index and find candidates by using the SimHashes and hamming distance, which gives us better results,
+          // so actually selecting a similar chunk is disabled here, we just keep all this just so we can remove old chunks with the same SuperFeature set
           /*
           if (matching_sfs > 0) {
             similar_chunk = &chunks[best_candidate_i];
@@ -860,52 +858,12 @@ int main(int argc, char* argv[])
       else {
         similarity_locality_anchor = std::nullopt;
       }
-      /*
-      int32_t brute_dist = 99;
-      int best_simhash_index = 0;
-      for (int i = 0; i < simhashes.size() - 1; ++i) {
-        const auto& existing_simhash_base = simhashes[i];
-        const auto new_brute_dist = hamming_distance(simhash_base, existing_simhash_base);
-        if (new_brute_dist < brute_dist) {
-          brute_dist = new_brute_dist;
-          best_simhash_index = i;
-          if (brute_dist == 0) break;
-        }
-
-        //for (int byte = 0; byte < 8; ++byte) {
-        //  brute_dist += hamming_distance(new_simhash[byte], existing_simhash[byte]);
-        //}
-
-      }
-      if (brute_dist <= 6) {
-        std::cout << "Yuppi! posible similar chunk, distance: " + std::to_string(brute_dist) + "\n" << std::flush;
-        const auto& similar_chunk = chunks[faiss_idx_to_chunk_id[best_simhash_index]];
-
-        auto saved_size = simulate_delta_encoding_cdc(chunk, similar_chunk);
-
-        delta_compressed_approx_size += saved_size;
-        delta_compressed_chunk_count++;
-      }
-      */
     }
-    /*
-    if (!known_hashes.contains(chunk.hash)) {
-      std::copy_n(chunk.data.data(), chunk.data.size(), pending_chunk_data.data() + (max_size * pending_chunks));
-      // Faiss IndexLSH requires all chunks to be of the same size so zero pad if needed
-      if (chunk.data.size() < max_size) {
-        std::memset(pending_chunk_data.data() + (max_size * pending_chunks) + chunk.data.size(), 0, max_size - chunk.data.size());
-      }
-      faiss_idx_to_chunk_id.push_back(chunk_i);
-      pending_chunks_indexes[pending_chunks] = chunk_i;
-      pending_chunks++;
-      known_hashes.insert(chunk.hash);
-    */
     else {
       deduped_size += chunk.length;
       similarity_locality_anchor = chunk.hash;
     }
     known_hashes[chunk.hash].push_back(chunk_i);
-    chunk_hashes.push_back(chunk.hash);
 
     // if similarity_locality_anchor has a value it means we either deduplicated the chunk or delta compressed it
     if (similarity_locality_anchor.has_value()) {
@@ -994,77 +952,6 @@ int main(int argc, char* argv[])
       deduped_size += saved_size;
     }
 
-    /*
-    if (pending_chunks < batch_size && chunk_i != chunks.size() - 1) {
-      chunk_i++;
-      continue;
-    }
-
-    // We add all the pending chunk hashes, and we will search for the 2nd most similar search result, as the top search result will be the very same hash
-    index.add(pending_chunks, reinterpret_cast<float*>(pending_chunk_data.data()));
-    index.search(pending_chunks, reinterpret_cast<float*>(pending_chunk_data.data()), 5, search_results.data(), search_result_labels.data());
-
-    for (int i = 0; i < pending_chunks; ++i) {
-      const int result_index = i * 5;
-      faiss::idx_t& estimated_most_similar_block_idx = search_result_labels[result_index];
-      auto& hamming_distance = search_results[result_index];
-      // As expected (though not always) the most similar chunk according to FAISS is itself, picking the second most similar one
-      if (faiss_idx_to_chunk_id[estimated_most_similar_block_idx] == pending_chunks_indexes[i]) {
-        estimated_most_similar_block_idx = search_result_labels[result_index + 1];
-        hamming_distance = search_results[result_index + 1];
-      }
-      float similarity = 1 - (hamming_distance / 64);
-      if (hamming_distance <= 1) {
-        //std::cout << "delta compression candidate, chunk " + std::to_string(pending_chunks_indexes[i]) + ": IndexLSH distance=" + std::to_string(hamming_distance) + "\n" << std::flush;
-        const auto& pending_chunk = chunks[pending_chunks_indexes[i]];
-        const auto& similar_chunk = chunks[faiss_idx_to_chunk_id[estimated_most_similar_block_idx]];
-
-        // Simulate delta patching, really fucking stupid and slow, start by getting minichunks for the similar chunk
-        auto chunk_tmp_file = std::fstream("tmpfile", std::ios_base::in | std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
-        chunk_tmp_file.write(reinterpret_cast<const char*>(similar_chunk.data.data()), similar_chunk.data.size());
-        chunk_tmp_file.flush();
-        chunk_tmp_file.seekg(0);
-        auto similar_minichunks = fastcdc::chunk_generator(chunk_tmp_file, 16, 32, 64, true);
-        std::set<uint64_t> minichunk_hashes{};
-        for (const auto& minichunk : similar_minichunks) {
-          XXH3_state_t* state2 = XXH3_createState();
-          XXH3_64bits_reset(state2);
-          XXH3_64bits_update(state2, minichunk.data.data(), minichunk.data.size());
-          XXH64_hash_t minichunk_hash = 0;
-          minichunk_hash = XXH3_64bits_digest(state2);
-          XXH3_freeState(state2);
-          minichunk_hashes.insert(minichunk_hash);
-        }
-
-        // Clean the file and get minichunks for pending chunk, count filesize saved by omitting data on the similar chunk
-        uint64_t saved_size = 0;
-        chunk_tmp_file.close();
-        std::filesystem::remove("tmpfile");
-        chunk_tmp_file = std::fstream("tmpfile", std::ios_base::in | std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
-        chunk_tmp_file.write(reinterpret_cast<const char*>(pending_chunk.data.data()), pending_chunk.data.size());
-        chunk_tmp_file.flush();
-        chunk_tmp_file.seekg(0);
-        auto pending_minichunks = fastcdc::chunk_generator(chunk_tmp_file, 16, 32, 64, true);
-        for (const auto& minichunk : pending_minichunks) {
-          XXH3_state_t* state2 = XXH3_createState();
-          XXH3_64bits_reset(state2);
-          XXH3_64bits_update(state2, minichunk.data.data(), minichunk.data.size());
-          XXH64_hash_t minichunk_hash = XXH3_64bits_digest(state2);
-          XXH3_freeState(state2);
-          if (minichunk_hashes.contains(minichunk_hash)) {
-            saved_size += minichunk.data.size();
-          }
-        }
-        chunk_tmp_file.close();
-        std::filesystem::remove("tmpfile");
-
-        delta_compressed_approx_size += saved_size;
-        delta_compressed_chunk_count++;
-      }
-    }
-    */
-
-    pending_chunks = 0;
     chunk_i++;
 
     chunk_generator_start_time = std::chrono::high_resolution_clock::now();
