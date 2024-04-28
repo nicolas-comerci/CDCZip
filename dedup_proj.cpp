@@ -968,6 +968,7 @@ int main(int argc, char* argv[])
   // Chunk stats
   std::cout << std::string("Chunk Sizes:    min ") + std::to_string(min_size) + " - avg " + std::to_string(avg_size) + " - max " + std::to_string(max_size) + "\n" << std::flush;
   std::cout << "Total chunk count: " + std::to_string(chunks.size()) + "\n" << std::flush;
+  std::cout << "Real AVG chunk size: " + std::to_string(total_size / chunks.size()) + "\n" << std::flush;
   std::cout << "Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n" << std::flush;
   std::cout << "Total delta compressed chunk count: " + std::to_string(delta_compressed_chunk_count) + "\n" << std::flush;
 
