@@ -152,22 +152,8 @@ namespace utility {
     return std::lround(std::log2(value));
   }
 
-  uint32_t ceil_div(uint32_t x, uint32_t y) {
-    return (x + y - 1) / y;
-  }
-
   uint32_t mask(uint32_t bits) {
     return std::pow(2, bits) - 1;
-  }
-
-  uint32_t center_size(uint32_t average, uint32_t minimum, uint32_t source_size) {
-    uint32_t offset = minimum + ceil_div(minimum, 2);
-    if (offset > average)
-      offset = average;
-    uint32_t size = average - offset;
-    if (size > source_size)
-      return source_size;
-    return size;
   }
 }
 
@@ -225,13 +211,12 @@ namespace fastcdc {
     uint32_t min_size,
     uint32_t avg_size,
     uint32_t max_size,
-    uint32_t center_size,
     uint32_t mask_s,
     uint32_t mask_l
   ) {
     uint32_t pattern = 0;
     uint32_t size = data.size();
-    uint32_t barrier = std::min(center_size, size);
+    uint32_t barrier = std::min(avg_size, size);
     uint32_t i = std::min(barrier, min_size);
 
     while (i < barrier) {
@@ -253,13 +238,12 @@ namespace fastcdc {
     uint32_t min_size,
     uint32_t avg_size,
     uint32_t max_size,
-    uint32_t center_size,
     uint32_t mask_s,
     uint32_t mask_l
   ) {
     uint32_t pattern = 0;
     uint32_t size = data.size();
-    uint32_t barrier = std::min(center_size, size);
+    uint32_t barrier = std::min(avg_size, size);
 
     std::pair<uint32_t, std::vector<uint32_t>> return_val{};
     uint32_t& i = std::get<0>(return_val);
@@ -313,7 +297,6 @@ namespace fastcdc {
     bool fat;
     bool extract_features;
 
-    uint32_t cs;
     uint32_t bits;
     uint32_t mask_s;
     uint32_t mask_l;
@@ -326,7 +309,6 @@ namespace fastcdc {
 
     ChunkGeneratorContext(IStreamLike* _stream, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _fat, bool _extract_features = false)
       : stream(_stream), min_size(_min_size), avg_size(_avg_size), max_size(_max_size), fat(_fat), extract_features(_extract_features) {
-      cs = utility::center_size(avg_size, min_size, max_size);
       bits = utility::logarithm2(avg_size);
       mask_s = utility::mask(bits + 1);
       mask_l = utility::mask(bits - 1);
@@ -357,10 +339,10 @@ namespace fastcdc {
     uint32_t cp;
     std::vector<uint32_t> features{};
     if (context.extract_features) {
-      std::tie(cp, features) = cdc_offset_with_features(std::span(context.blob_it, context.blob.end()), context.min_size, context.avg_size, context.max_size, context.cs, context.mask_s, context.mask_l);
+      std::tie(cp, features) = cdc_offset_with_features(std::span(context.blob_it, context.blob.end()), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l);
     }
     else {
-      cp = cdc_offset(std::span(context.blob_it, context.blob.end()), context.min_size, context.avg_size, context.max_size, context.cs, context.mask_s, context.mask_l);
+      cp = cdc_offset(std::span(context.blob_it, context.blob.end()), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l);
     }
     std::vector<uint8_t> raw{};
     if (context.fat) {
