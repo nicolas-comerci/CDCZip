@@ -139,14 +139,13 @@ namespace utility {
     unsigned long long offset;
     int length;
     std::vector<uint8_t> data;
-    std::string hash;
+    std::bitset<64> hash;
     std::bitset<64> lsh;
     std::array<uint32_t, 4> super_features{};
     bool feature_sampling_failure = true;
 
-    CDChunk() {}
-    CDChunk(unsigned long long _offset, int _length, std::vector<uint8_t>&& _data, std::string _hash)
-      : offset(_offset), length(_length), data(std::move(_data)), hash(_hash) {}
+    CDChunk(unsigned long long _offset, int _length, std::vector<uint8_t>&& _data)
+      : offset(_offset), length(_length), data(std::move(_data)) {}
   };
 
   uint32_t logarithm2(uint32_t value) {
@@ -367,7 +366,7 @@ namespace fastcdc {
     if (context.fat) {
       raw = std::vector(context.blob_it, context.blob_it + cp);
     }
-    chunk.emplace(context.offset, cp, std::move(raw), std::string());
+    chunk.emplace(context.offset, cp, std::move(raw));
     if (!features.empty()) {
       for (int i = 0; i < 4; i++) {
         // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
@@ -668,7 +667,7 @@ int main(int argc, char* argv[])
   uint64_t delta_compressed_approx_size = 0;
   uint64_t delta_compressed_chunk_count = 0;
 
-  std::unordered_map<std::string, std::vector<int>> known_hashes{};  // Find chunk pos by hash
+  std::unordered_map<std::bitset<64>, std::vector<int>> known_hashes{};  // Find chunk pos by hash
 
   int chunk_i = 0;
   int last_reduced_chunk_i = 0;
@@ -696,6 +695,7 @@ int main(int argc, char* argv[])
 
   const bool use_dupadj = true;
   const bool use_dupadj_backwards = true;
+  const bool use_generalized_resemblance_detection = true;
   const bool use_feature_extraction = true;
   // if false, the first similar block found by any method will be used and other methods won't run, if true, all methods will run and the most similar block found will be used
   const bool attempt_multiple_delta_methods = true;
@@ -709,7 +709,7 @@ int main(int argc, char* argv[])
   auto total_runtime_start_time = std::chrono::high_resolution_clock::now();  
   auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
 
-  std::optional<std::string> similarity_locality_anchor{};
+  std::optional<std::bitset<64>> similarity_locality_anchor{};
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
   auto generated_chunk = fastcdc::chunk_generator(generator_ctx);
   auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
@@ -718,7 +718,7 @@ int main(int argc, char* argv[])
     chunks.emplace_back(std::move(*generated_chunk));
     auto& chunk = chunks.back();
 
-    std::optional<std::string> prev_similarity_locality_anchor = similarity_locality_anchor;
+    std::optional<std::bitset<64>> prev_similarity_locality_anchor = similarity_locality_anchor;
     if (chunk_i % 1000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(generator_ctx.offset) / file_size) * 100) + "\n" << std::flush;
     total_size += chunk.length;
 
@@ -735,9 +735,8 @@ int main(int argc, char* argv[])
     XXH3_state_t* state = XXH3_createState();
     XXH3_64bits_reset(state);
     XXH3_64bits_update(state, chunk.data.data(), chunk.data.size());
-    XXH64_hash_t result = XXH3_64bits_digest(state);
+    chunk.hash = XXH3_64bits_digest(state);
     XXH3_freeState(state);
-    chunk.hash = std::to_string(result);
     const auto hashing_end_time = std::chrono::high_resolution_clock::now();
     hashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - hashing_start_time).count();
 
@@ -749,11 +748,13 @@ int main(int argc, char* argv[])
       simhashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(simhashing_end_time - simhashing_start_time).count();
 
       std::vector<int> similar_chunks{};
-      if (!simhashes_dict.contains(simhash_base)) {
-        simhashes_dict[simhash_base] = chunk_i;
-      }
-      else {
-        similar_chunks.emplace_back(simhashes_dict[simhash_base]);
+      if (use_generalized_resemblance_detection) {
+        if (!simhashes_dict.contains(simhash_base)) {
+          simhashes_dict[simhash_base] = chunk_i;
+        }
+        else {
+          similar_chunks.emplace_back(simhashes_dict[simhash_base]);
+        }
       }
 
       // If we couldn't sample the chunk's features we completely skip any attempt to match or register superfeatures, as we could not extract them for this chunk
@@ -766,7 +767,8 @@ int main(int argc, char* argv[])
             if (superfeatures_dict.contains(sf)) {
               for (const auto& candidate_i : superfeatures_dict[sf]) {
                 const auto new_dist = hamming_distance(chunk.lsh, chunks[candidate_i].lsh);
-                if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist)) {
+                // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk and data locality suggests it should be a better match
+                if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate))) {
                   best_candidate = candidate_i;
                   best_candidate_dist = new_dist;
                 }
@@ -828,7 +830,8 @@ int main(int argc, char* argv[])
 
             const auto& similar_candidate = chunks[similar_candidate_chunk];
             const auto new_dist = hamming_distance(chunk.lsh, similar_candidate.lsh);
-            if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist)) {
+            // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk and data locality suggests it should be a better match
+            if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk > best_candidate))) {
               best_candidate_dist = new_dist;
               best_candidate = similar_candidate_chunk;
             }
@@ -871,7 +874,7 @@ int main(int argc, char* argv[])
       int prev_last_reduced_chunk_i = last_reduced_chunk_i;
       last_reduced_chunk_i = chunk_i;
 
-      std::string backtrack_similarity_anchor = *similarity_locality_anchor;
+      std::bitset<64> backtrack_similarity_anchor = *similarity_locality_anchor;
       int maximum_backtrack = chunk_i - prev_last_reduced_chunk_i;
       // for loop starts at 1 because if the last reduced chunk is the previous one then maximum_backtrack=1, and we don't backtrack at all
       int current_backtrack = 1;
@@ -888,7 +891,8 @@ int main(int argc, char* argv[])
 
             const auto& similar_chunk = chunks[similar_candidate_chunk];
             const auto new_dist = hamming_distance(backtrack_chunk.lsh, similar_chunk.lsh);
-            if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist)) {
+            // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk and data locality suggests it should be a better match
+            if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk > best_candidate))) {
               best_candidate_dist = new_dist;
               best_candidate = similar_candidate_chunk;
             }
@@ -932,7 +936,7 @@ int main(int argc, char* argv[])
     }
     // If the last chunk was deduped or delta'd and this one hasn't, we attempt to "extend the match" as much as possible
     // This should actually run just before outputting the data/LZ match, there is technically a risk of double counting savings here with backwards DupAdj
-    else if (use_match_extension && last_reduced_chunk_i == (chunk_i - 1)){
+    else if (use_match_extension && last_reduced_chunk_i != 0 && last_reduced_chunk_i == (chunk_i - 1)){
       uint64_t saved_size = 0;
       for (const auto& anchor_instance_chunk_i : known_hashes[*prev_similarity_locality_anchor]) {
         const auto anchor_next_chunk_i = anchor_instance_chunk_i + 1;
