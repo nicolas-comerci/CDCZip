@@ -749,12 +749,12 @@ int main(int argc, char* argv[])
 
       std::vector<int> similar_chunks{};
       if (use_generalized_resemblance_detection) {
-        if (!simhashes_dict.contains(simhash_base)) {
-          simhashes_dict[simhash_base] = chunk_i;
-        }
-        else {
+        if (simhashes_dict.contains(simhash_base)) {
           similar_chunks.emplace_back(simhashes_dict[simhash_base]);
         }
+        // If there is already a match via generalized resemblance detection, we still overwrite the index with this newer chunk.
+        // Because of data locality, a more recent chunk on the data stream is more likely to yield good results
+        simhashes_dict[simhash_base] = chunk_i;
       }
 
       // If we couldn't sample the chunk's features we completely skip any attempt to match or register superfeatures, as we could not extract them for this chunk
