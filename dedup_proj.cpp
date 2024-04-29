@@ -613,12 +613,12 @@ int main(int argc, char* argv[])
   uint32_t max_size = avg_size * 8;
 
   if (constants::MINIMUM_MIN >= min_size || min_size >= constants::MINIMUM_MAX) throw std::runtime_error("Bad minimum size");
-  if (constants::AVERAGE_MIN >= avg_size || avg_size >= constants::AVERAGE_MAX) throw std::runtime_error("Bad avarage size");
+  if (constants::AVERAGE_MIN >= avg_size || avg_size >= constants::AVERAGE_MAX) throw std::runtime_error("Bad average size");
   if (constants::MAXIMUM_MIN >= max_size || max_size >= constants::MAXIMUM_MAX) throw std::runtime_error("Bad maximum size");
 
-  min_size = 256;
-  avg_size = 512;
-  max_size = 1024;
+  min_size = 128;
+  avg_size = 384;
+  max_size = 2048;
 
   //bert_params params;
   //params.model = R"(C:\Users\Administrator\Desktop\fastcdc_test\paraphrase-MiniLM-L3-v2-GGML-q4_0.bin)";
