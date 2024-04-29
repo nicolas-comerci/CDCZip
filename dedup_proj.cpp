@@ -219,18 +219,39 @@ namespace fastcdc {
     uint32_t barrier = std::min(avg_size, size);
     uint32_t i = std::min(barrier, min_size);
 
+    // SuperCDC's even easier "backup mask" and backup result, if mask_l fails to find a cutoff point before the max_size we use the backup result
+    // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
+    // which helps better preserve the content defined nature of chunks and thus increase dedup ratios.
+    std::optional<uint32_t> backup_i{};
+    uint32_t mask_b = mask_l >> 1;
+
+    // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
+    // the content defined nature of the Hashes
+    if (i == min_size) {  // If i is already less than min_size it means we are at the end, and we will quit immediately, so no point in doing anything
+      pattern =
+        (constants::GEAR[data[i - 7]] >> 7) +
+        (constants::GEAR[data[i - 6]] >> 6) +
+        (constants::GEAR[data[i - 5]] >> 5) +
+        (constants::GEAR[data[i - 4]] >> 4) +
+        (constants::GEAR[data[i - 3]] >> 3) +
+        (constants::GEAR[data[i - 2]] >> 2) +
+        (constants::GEAR[data[i - 1]] >> 1) +
+        constants::GEAR[data[i]];
+    }
+
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_s)) return i + 1;
+      if (!(pattern & mask_s)) return i;
       i += 1;
     }
     barrier = std::min(max_size, size);
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_l)) return i + 1;
+      if (!(pattern & mask_l)) return i;
+      if (!backup_i.has_value() && !(pattern & mask_b)) backup_i = i;
       i += 1;
     }
-    return i;
+    return backup_i.has_value() ? *backup_i : i;
   }
 
   std::pair<uint32_t, std::vector<uint32_t>> cdc_offset_with_features(
@@ -250,12 +271,29 @@ namespace fastcdc {
     i = std::min(barrier, min_size);
     auto& features = std::get<1>(return_val);
 
+    // SuperCDC's even easier "backup mask" and backup result, if mask_l fails to find a cutoff point before the max_size we use the backup result
+    // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
+    // which helps better preserve the content defined nature of chunks and thus increase dedup ratios.
+    std::optional<uint32_t> backup_i{};
+    uint32_t mask_b = mask_l >> 1;
+
+    // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
+    // the content defined nature of the Hashes
+    if (i == min_size) {  // If i is already less than min_size it means we are at the end, and we will quit immediately, so no point in doing anything
+      pattern =
+        (constants::GEAR[data[i - 7]] >> 7) +
+        (constants::GEAR[data[i - 6]] >> 6) +
+        (constants::GEAR[data[i - 5]] >> 5) +
+        (constants::GEAR[data[i - 4]] >> 4) +
+        (constants::GEAR[data[i - 3]] >> 3) +
+        (constants::GEAR[data[i - 2]] >> 2) +
+        (constants::GEAR[data[i - 1]] >> 1) +
+        constants::GEAR[data[i]];
+    }
+
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_s)) {
-        i += 1;
-        return return_val;
-      }
+      if (!(pattern & mask_s)) return return_val;
       if (!(pattern & constants::CDS_SAMPLING_MASK)) {
         if (features.empty()) {
           features.resize(16);
@@ -270,10 +308,8 @@ namespace fastcdc {
     barrier = std::min(max_size, size);
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_l)) {
-        i += 1;
-        return return_val;
-      }
+      if (!(pattern & mask_l)) return return_val;
+      if (!backup_i.has_value() && !(pattern & mask_b)) backup_i = i;
       if (!(pattern & constants::CDS_SAMPLING_MASK)) {
         if (features.empty()) {
           features.resize(16);
@@ -284,6 +320,9 @@ namespace fastcdc {
         }
       }
       i += 1;
+    }
+    if (backup_i.has_value()) {
+      return { *backup_i, std::move(std::get<1>(return_val)) };
     }
     return return_val;
   }
@@ -618,7 +657,7 @@ int main(int argc, char* argv[])
 
   min_size = 128;
   avg_size = 384;
-  max_size = 2048;
+  max_size = 1024;
 
   //bert_params params;
   //params.model = R"(C:\Users\Administrator\Desktop\fastcdc_test\paraphrase-MiniLM-L3-v2-GGML-q4_0.bin)";
