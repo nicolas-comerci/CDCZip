@@ -886,6 +886,14 @@ int main(int argc, char* argv[])
     else {
       deduped_size += chunk.length;
       similarity_locality_anchor = chunk.hash;
+      // Important to copy LSH in case this duplicate chunk ends up being candidate for Delta encoding via DupAdj or something
+      chunk.lsh = chunks[known_hashes[chunk.hash][0]].lsh;
+      if (use_generalized_resemblance_detection) {
+        // Overwrite index for generalized resemblance detection with this newer chunk.
+        // Because of data locality, a more recent chunk on the data stream is more likely to yield good results
+        const auto simhash_base = hamming_base(chunk.lsh);
+        simhashes_dict[simhash_base] = chunk_i;
+      }
     }
     known_hashes[chunk.hash].push_back(chunk_i);
 
