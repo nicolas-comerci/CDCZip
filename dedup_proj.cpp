@@ -701,15 +701,22 @@ int main(int argc, char* argv[])
 
   const uint32_t simhash_chunk_size = 16;
   const uint32_t max_allowed_dist = 32;
-  const bool best_delta = false;
+  const uint32_t delta_mode = 1;
 
   std::bitset<64> (*simhash_func)(uint8_t* data, int data_len, int chunk_size) = nullptr;
   uint64_t(*simulate_delta_encoding_func)(const utility::CDChunk & chunk, const utility::CDChunk & similar_chunk, uint32_t chunk_size) = nullptr;
-  if (!best_delta) {
+  if (delta_mode == 0) {
+    // Fastest delta mode, SimHash and delta encoding using Shingling
     simhash_func = &simhash_data_xxhash_shingling;
     simulate_delta_encoding_func = &simulate_delta_encoding_shingling;
   }
+  else if (delta_mode == 1) {
+    // Balanced delta mode, SimHashes with features using CDC but delta encoding using Shingling
+    simhash_func = &simhash_data_xxhash_cdc;
+    simulate_delta_encoding_func = &simulate_delta_encoding_shingling;
+  }
   else {
+    // Best? delta mode, both SimHashes and delta encoding using CDC
     simhash_func = &simhash_data_xxhash_cdc;
     simulate_delta_encoding_func = &simulate_delta_encoding_cdc;
   }
@@ -718,6 +725,9 @@ int main(int argc, char* argv[])
   const bool use_dupadj_backwards = true;
   const bool use_generalized_resemblance_detection = true;
   const bool use_feature_extraction = true;
+  // Because of data locality, chunks close to the current one might be similar to it, we attempt to find the most similar out of the previous ones in this window,
+  // and use it if it's good enough
+  const int resemblance_attempt_window = 100;
   // if false, the first similar block found by any method will be used and other methods won't run, if true, all methods will run and the most similar block found will be used
   const bool attempt_multiple_delta_methods = true;
   const bool use_match_extension = true;
@@ -776,6 +786,25 @@ int main(int argc, char* argv[])
         // If there is already a match via generalized resemblance detection, we still overwrite the index with this newer chunk.
         // Because of data locality, a more recent chunk on the data stream is more likely to yield good results
         simhashes_dict[simhash_base] = chunk_i;
+      }
+
+      if (resemblance_attempt_window > 0 && (similar_chunks.empty() || attempt_multiple_delta_methods)) {
+        std::optional<int> best_candidate_dist{};
+        int best_candidate = 0;
+        for (int i = 1; i <= resemblance_attempt_window; i++) {
+          const auto candidate_i = chunk_i - i;
+          if (candidate_i < 0) break;
+          const auto& similar_candidate = chunks[candidate_i];
+          const auto new_dist = hamming_distance(chunk.lsh, similar_candidate.lsh);
+          // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk and data locality suggests it should be a better match
+          if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate))) {
+            best_candidate = candidate_i;
+            best_candidate_dist = new_dist;
+          }
+        }
+        if (best_candidate_dist.has_value()) {
+          similar_chunks.emplace_back(best_candidate);
+        }
       }
 
       // If we couldn't sample the chunk's features we completely skip any attempt to match or register superfeatures, as we could not extract them for this chunk
