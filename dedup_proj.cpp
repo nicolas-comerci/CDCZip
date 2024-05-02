@@ -135,17 +135,25 @@ namespace constants {
 
 namespace utility {
   class CDChunk {
+    std::vector<uint8_t> _data;
   public:
     unsigned long long offset;
     int length;
-    std::vector<uint8_t> data;
+    std::span<uint8_t> data;
     std::bitset<64> hash;
     std::bitset<64> lsh;
     std::array<uint32_t, 4> super_features{};
     bool feature_sampling_failure = true;
 
     CDChunk(unsigned long long _offset, int _length, std::vector<uint8_t>&& _data)
-      : offset(_offset), length(_length), data(std::move(_data)) {}
+      : _data(std::move(_data)), offset(_offset), length(_length), data(this->_data) {}
+
+    // This is used to set the chunk's data to a span of data owned by another (hopefully duplicate) chunk, so we can save space.
+    // Set a chunk's data to a future chunk's data, as the previous chunks will be deleted first as the context window moves.
+    void setData(CDChunk& otherChunk) {
+      data = std::span(otherChunk._data);
+      _data = std::vector<uint8_t>();
+    }
   };
 
   uint32_t logarithm2(uint32_t value) {
@@ -955,6 +963,11 @@ int main(int argc, char* argv[])
       similarity_locality_anchor = chunk.hash;
       // Important to copy LSH in case this duplicate chunk ends up being candidate for Delta encoding via DupAdj or something
       chunk.lsh = chunks[known_hashes[chunk.hash][0]].lsh;
+      // Get the previous instances of this chunk's data to use the data from this chunk, this way we only store duplicate data in memory once
+      for (auto& dupChunk_i : known_hashes[chunk.hash]) {
+        chunks[dupChunk_i].setData(chunk);
+      }
+
       if (use_generalized_resemblance_detection) {
         // Overwrite index for generalized resemblance detection with this newer chunk.
         // Because of data locality, a more recent chunk on the data stream is more likely to yield good results
@@ -1091,5 +1104,6 @@ int main(int argc, char* argv[])
   std::printf("Total Throughput:    %.1f MB/s\n", total_mb_per_nanosecond * std::pow(10, 9));
   std::printf("Total runtime:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(total_runtime_end_time - total_runtime_start_time).count());
 
+  //get_char_with_echo();
   return 0;
 }
