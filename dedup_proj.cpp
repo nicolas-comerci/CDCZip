@@ -523,7 +523,7 @@ std::bitset<bit_size> hamming_base(std::bitset<bit_size> data) {
   // The first bit doesn't really participate in non-extended hamming codes (and extended ones are not useful to us)
   // So we just collapse to them all to the version with 0 on the first bit, allows us to match some hamming distance 2 data
   base[0] = 0;
-  return data.flip(syndrome);
+  return base;
 }
 
 uint64_t simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, uint32_t chunk_size) {
@@ -549,31 +549,69 @@ uint64_t simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const 
 
   // If the chunks are of different size, its possible we have matched the whole chunk inside the other, in that case we save all that size
   if (start_matching_data_len + end_matching_data_len >= chunk.data.size()) return chunk.data.size();
+  if (start_matching_data_len + end_matching_data_len >= similar_chunk.data.size()) return similar_chunk.data.size();
 
   // Simulate delta patching, really fucking stupid and slow, start by getting minichunks for the similar chunk
   XXH3_state_t* state = XXH3_createState();
   // Iterate over the data in chunks
-  std::set<uint64_t> minichunk_hashes{};
-  const int similar_chunk_len = similar_chunk.data.size();
-  for (uint64_t i = 0; i < similar_chunk_len; i += chunk_size) {
+  std::unordered_map<uint64_t, uint64_t> minichunk_hashes{};
+  const uint64_t similar_chunk_non_matched_len = similar_chunk.data.size() - start_matching_data_len - end_matching_data_len;
+  const uint8_t* similar_chunk_non_matched_data_start = similar_chunk.data.data() + start_matching_data_len;
+  for (uint64_t i = 0; i < similar_chunk_non_matched_len; i += chunk_size) {
     // Calculate hash for current chunk
     XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, similar_chunk.data.data() + i, std::min<uint64_t>(chunk_size, similar_chunk_len - i));
+    XXH3_64bits_update(state, similar_chunk_non_matched_data_start + i, std::min<uint64_t>(chunk_size, similar_chunk_non_matched_len - i));
     uint64_t chunk_hash = XXH3_64bits_digest(state);
-    minichunk_hashes.insert(chunk_hash);
+    minichunk_hashes[chunk_hash] = start_matching_data_len + i;
   }
 
   // Clean the file and get minichunks for pending chunk, count filesize saved by omitting data on the similar chunk
-  const uint64_t chunk_non_matched_len = chunk.data.size() - start_matching_data_len - end_matching_data_len;
-  const uint8_t* chunk_non_matched_data_start = chunk.data.data() + start_matching_data_len;
-  for (uint64_t i = 0; i < chunk_non_matched_len; i += chunk_size) {
+  const uint64_t chunk_non_matched_end = chunk.data.size() - end_matching_data_len;
+  uint64_t i = start_matching_data_len;
+  uint64_t prev_match_i = start_matching_data_len;
+  while (i < chunk_non_matched_end) {
     XXH3_64bits_reset(state);
-    const auto to_read = std::min<uint64_t>(chunk_size, chunk_non_matched_len - i);
-    XXH3_64bits_update(state, chunk_non_matched_data_start + i, to_read);
+    const auto to_read = std::min<uint64_t>(chunk_size, chunk_non_matched_end - i);
+    XXH3_64bits_update(state, chunk.data.data() + i, to_read);
     XXH64_hash_t minichunk_hash = XXH3_64bits_digest(state);
+
+    uint64_t extended_size = 0;
     if (minichunk_hashes.contains(minichunk_hash)) {
       saved_size += to_read;
+
+      // We have a match, attempt to extend it, first backwards
+      auto similar_chunk_pos = minichunk_hashes[minichunk_hash] - 1;
+      auto current_chunk_pos = i - 1;
+
+      uint64_t backwards_extended_size = 0;
+      while (
+        similar_chunk_pos >= (similar_chunk.data.size() + start_matching_data_len) &&
+        current_chunk_pos >= prev_match_i &&
+        similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
+        ) {
+        backwards_extended_size++;
+        similar_chunk_pos--;
+        current_chunk_pos--;
+      }
+
+      // Then extend forwards
+      similar_chunk_pos = minichunk_hashes[minichunk_hash] + to_read;
+      current_chunk_pos = i + to_read;
+      while (
+        similar_chunk_pos < (similar_chunk.data.size() - end_matching_data_len) &&
+        current_chunk_pos < chunk_non_matched_end &&
+        similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
+      ) {
+        extended_size++;
+        similar_chunk_pos++;
+        current_chunk_pos++;
+      }
+      
+      saved_size += backwards_extended_size + extended_size;
+      prev_match_i = i + to_read + extended_size;
     }
+
+    i += to_read + extended_size;
   }
   XXH3_freeState(state);
   return saved_size;
