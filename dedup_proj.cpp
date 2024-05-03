@@ -135,24 +135,33 @@ namespace constants {
 
 namespace utility {
   class CDChunk {
-    std::vector<uint8_t> _data;
+    std::unique_ptr<uint8_t[]> _data;
   public:
-    unsigned long long offset;
-    int length;
-    std::span<uint8_t> data;
+    uintmax_t offset;
+    uint32_t length;
+    // Non owning pointer to the data, the data is owned on _data, and might actually be owned by another chunk, never ever free this.
+    uint8_t* data;
     std::bitset<64> hash;
     std::bitset<64> lsh;
     std::array<uint32_t, 4> super_features{};
     bool feature_sampling_failure = true;
+    // Smaller chunks inside this chunk, used for delta compression
+    std::shared_ptr<uint32_t[]> minichunks{};
+    uint32_t minichunks_len;
 
-    CDChunk(unsigned long long _offset, int _length, std::vector<uint8_t>&& _data)
-      : _data(std::move(_data)), offset(_offset), length(_length), data(this->_data) {}
+    CDChunk(uintmax_t _offset, uint32_t _length) : offset(_offset), length(_length), data(nullptr) {}
+    CDChunk(uintmax_t _offset, uint32_t _length, uint8_t* _data)
+      : _data(std::make_unique_for_overwrite<uint8_t[]>(_length)), offset(_offset), length(_length)
+    {
+      std::copy_n(_data, _length, this->_data.get());
+      data = this->_data.get();
+    }
 
     // This is used to set the chunk's data to a span of data owned by another (hopefully duplicate) chunk, so we can save space.
     // Set a chunk's data to a future chunk's data, as the previous chunks will be deleted first as the context window moves.
     void setData(CDChunk& otherChunk) {
-      data = std::span(otherChunk._data);
-      _data = std::vector<uint8_t>();
+      data = otherChunk.data;
+      _data = std::unique_ptr<uint8_t[]>();
     }
   };
 
@@ -189,11 +198,11 @@ public:
 
 class IStreamMem : public IStreamLike {
   const uint8_t* membuf;
-  int len;
-  int pos = 0;
+  uint32_t len;
+  uint32_t pos = 0;
   std::streamsize _gcount = 0;
 public:
-  IStreamMem(const uint8_t* _buf, int _len) : membuf(_buf), len(_len) {}
+  IStreamMem(const uint8_t* _buf, uint32_t _len) : membuf(_buf), len(_len) {}
   ~IStreamMem() override = default;
 
   void read(void* buf, std::streamsize count) override {
@@ -379,11 +388,12 @@ namespace fastcdc {
     else {
       cp = cdc_offset(std::span(context.blob_it, context.blob.end()), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l);
     }
-    std::vector<uint8_t> raw{};
     if (context.fat) {
-      raw = std::vector(context.blob_it, context.blob_it + cp);
+      chunk.emplace(context.offset, cp, &*context.blob_it);
     }
-    chunk.emplace(context.offset, cp, std::move(raw));
+    else {
+      chunk.emplace(context.offset, cp);
+    }
     if (!features.empty()) {
       for (int i = 0; i < 4; i++) {
         // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
@@ -397,36 +407,23 @@ namespace fastcdc {
   }
 }
 
-std::array<uint8_t, 4> simhash_data(uint8_t* data, int data_len, int chunk_size = 16) {
-  // Initialize SimHash array
-  std::array<uint8_t, 4> simhash = { 0 };
-
-  // Iterate over the data in chunks
-  for (int i = 0; i < data_len; i += chunk_size) {
-    // Calculate hash for current chunk
-    std::hash<std::string> hasher;
-    uint32_t chunk_hash = hasher(reinterpret_cast<const char*>(data + i));
-
-    // Update SimHash with the hash of the chunk
-    for (int j = 0; j < 4; ++j) {
-      // Update each byte of the SimHash with the corresponding byte of the chunk hash
-      simhash[j] += (chunk_hash >> (j * 8)) & 0xFF;
-    }
-  }
-
-  return simhash;
-}
-
-std::bitset<64> simhash_data_xxhash_shingling(uint8_t* data, int data_len, int chunk_size) {
+std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_xxhash_shingling(uint8_t* data, int32_t data_len, int32_t chunk_size) {
   std::array<int, 64> simhash_vector{};
 
   XXH3_state_t* state = XXH3_createState();
   XXH3_64bits_reset(state);
 
+  std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> return_val{};
+  auto& simhash = std::get<0>(return_val);
+  auto& minichunks_ptr = std::get<1>(return_val);
+  auto& minichunks_len = std::get<2>(return_val);
+  std::vector<int32_t> minichunks_vec{};
+
   // Iterate over the data in chunks
   for (int i = 0; i < data_len; i += chunk_size) {
     // Calculate hash for current chunk
-    XXH3_64bits_update(state, data + i, std::min(chunk_size, data_len - i));
+    const auto current_chunk_len = std::min(chunk_size, data_len - i);
+    XXH3_64bits_update(state, data + i, current_chunk_len);
     std::bitset<64> chunk_hash = XXH3_64bits_digest(state);
     XXH3_64bits_reset(state);
 
@@ -434,50 +431,63 @@ std::bitset<64> simhash_data_xxhash_shingling(uint8_t* data, int data_len, int c
     for (int bit_i = 0; bit_i < 64; bit_i++) {
       simhash_vector[bit_i] += (chunk_hash.test(bit_i) ? 1 : -1);
     }
+
+    minichunks_vec.emplace_back(current_chunk_len);
   }
 
   // Truncate simhash_vector into simhash, by keeping values larger than 0 as 1bit and values 0 or less to 0bit
-  std::bitset<64> simhash{};
   for (int bit_i = 0; bit_i < 64; bit_i++) {
     simhash[bit_i] = simhash_vector[bit_i] > 0 ? 1 : 0;
   }
   XXH3_freeState(state);
-  return simhash;
+  minichunks_ptr = std::make_shared_for_overwrite<uint32_t[]>(minichunks_vec.size());
+  std::copy_n(minichunks_vec.data(), minichunks_vec.size(), minichunks_ptr.get());
+  minichunks_len = minichunks_vec.size();
+  return return_val;
 }
 
-std::bitset<64> simhash_data_xxhash_cdc(uint8_t* data, int data_len, int chunk_size) {
+std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_xxhash_cdc(uint8_t* data, int32_t data_len, int32_t chunk_size) {
   std::array<int, 64> simhash_vector{};
 
   XXH3_state_t* state = XXH3_createState();
   XXH3_64bits_reset(state);
 
   auto memstream = IStreamMem(data, data_len);
-  auto ctx = fastcdc::ChunkGeneratorContext(&memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);  
+  auto ctx = fastcdc::ChunkGeneratorContext(&memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);
+
+  std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> return_val{};
+  auto& simhash = std::get<0>(return_val);
+  auto& minichunks_ptr = std::get<1>(return_val);
+  auto& minichunks_len = std::get<2>(return_val);
+  std::vector<int32_t> minichunks_vec{};
 
   // Iterate over the data in chunks
   auto cdc_minichunk = fastcdc::chunk_generator(ctx);
   while (cdc_minichunk.has_value()) {
-    const auto& chunk = *cdc_minichunk;
+    auto& chunk = *cdc_minichunk;
     // Calculate hash for current chunk
-    XXH3_64bits_update(state, chunk.data.data(), chunk.data.size());
-    std::bitset<64> chunk_hash = XXH3_64bits_digest(state);
+    XXH3_64bits_update(state, chunk.data, chunk.length);
+    chunk.hash = XXH3_64bits_digest(state);
     XXH3_64bits_reset(state);
 
     // Update SimHash vector with the hash of the chunk
     for (int bit_i = 0; bit_i < 64; bit_i++) {
-      simhash_vector[bit_i] += (chunk_hash.test(bit_i) ? 1 : -1);
+      simhash_vector[bit_i] += (chunk.hash.test(bit_i) ? 1 : -1);
     }
 
+    minichunks_vec.emplace_back(chunk.length);
     cdc_minichunk = fastcdc::chunk_generator(ctx);
   }
 
   // Truncate simhash_vector into simhash, by keeping values larger than 0 as 1bit and values 0 or less to 0bit
-  std::bitset<64> simhash{};
   for (int bit_i = 0; bit_i < 64; bit_i++) {
     simhash[bit_i] = simhash_vector[bit_i] > 0 ? 1 : 0;
   }
   XXH3_freeState(state);
-  return simhash;
+  minichunks_ptr = std::make_shared_for_overwrite<uint32_t[]>(minichunks_vec.size());
+  std::copy_n(minichunks_vec.data(), minichunks_vec.size(), minichunks_ptr.get());
+  minichunks_len = minichunks_vec.size();
+  return return_val;
 }
 
 template<int bit_size>
@@ -525,17 +535,17 @@ std::bitset<bit_size> hamming_base(std::bitset<bit_size> data) {
 uint64_t simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, uint32_t chunk_size) {
   //DDelta style delta encoding, first start by greedily attempting to match data at the start and end on the chunks
   uint64_t start_matching_data_len = 0;
-  const auto cmp_size = std::min(chunk.data.size(), similar_chunk.data.size());
-  std::span chunk_data_span{ chunk.data.data(), cmp_size };
-  std::span similar_chunk_data_span{ similar_chunk.data.data(), cmp_size };
+  const auto cmp_size = std::min(chunk.length, similar_chunk.length);
+  std::span chunk_data_span{ chunk.data, cmp_size };
+  std::span similar_chunk_data_span{ similar_chunk.data, cmp_size };
   for (uint64_t i = 0; i < cmp_size; i++) {
     if (chunk_data_span[i] != similar_chunk_data_span[i]) break;
     ++start_matching_data_len;
   }
 
   uint64_t end_matching_data_len = 0;
-  chunk_data_span = std::span{ chunk.data.data() + chunk.data.size() - cmp_size, cmp_size };
-  similar_chunk_data_span = std::span{ similar_chunk.data.data() + similar_chunk.data.size() - cmp_size, cmp_size };
+  chunk_data_span = std::span{ chunk.data + chunk.length - cmp_size, cmp_size };
+  similar_chunk_data_span = std::span{ similar_chunk.data + similar_chunk.length - cmp_size, cmp_size };
   for (uint64_t i = 0; i < cmp_size; i++) {
     if (chunk_data_span[cmp_size - 1 - i] != similar_chunk_data_span[cmp_size - 1 - i]) break;
     ++end_matching_data_len;
@@ -544,15 +554,15 @@ uint64_t simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const 
   uint64_t saved_size = start_matching_data_len + end_matching_data_len;
 
   // If the chunks are of different size, its possible we have matched the whole chunk inside the other, in that case we save all that size
-  if (start_matching_data_len + end_matching_data_len >= chunk.data.size()) return chunk.data.size();
-  if (start_matching_data_len + end_matching_data_len >= similar_chunk.data.size()) return similar_chunk.data.size();
+  if (start_matching_data_len + end_matching_data_len >= chunk.length) return chunk.length;
+  if (start_matching_data_len + end_matching_data_len >= similar_chunk.length) return similar_chunk.length;
 
   // Simulate delta patching, really fucking stupid and slow, start by getting minichunks for the similar chunk
   XXH3_state_t* state = XXH3_createState();
   // Iterate over the data in chunks
   std::unordered_map<uint64_t, uint64_t> minichunk_hashes{};
-  const uint64_t similar_chunk_non_matched_len = similar_chunk.data.size() - start_matching_data_len - end_matching_data_len;
-  const uint8_t* similar_chunk_non_matched_data_start = similar_chunk.data.data() + start_matching_data_len;
+  const uint64_t similar_chunk_non_matched_len = similar_chunk.length - start_matching_data_len - end_matching_data_len;
+  const uint8_t* similar_chunk_non_matched_data_start = similar_chunk.data + start_matching_data_len;
   for (uint64_t i = 0; i < similar_chunk_non_matched_len; i += chunk_size) {
     // Calculate hash for current chunk
     XXH3_64bits_reset(state);
@@ -562,13 +572,13 @@ uint64_t simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const 
   }
 
   // Clean the file and get minichunks for pending chunk, count filesize saved by omitting data on the similar chunk
-  const uint64_t chunk_non_matched_end = chunk.data.size() - end_matching_data_len;
+  const uint64_t chunk_non_matched_end = chunk.length - end_matching_data_len;
   uint64_t i = start_matching_data_len;
   uint64_t prev_match_i = start_matching_data_len;
   while (i < chunk_non_matched_end) {
     XXH3_64bits_reset(state);
     const auto to_read = std::min<uint64_t>(chunk_size, chunk_non_matched_end - i);
-    XXH3_64bits_update(state, chunk.data.data() + i, to_read);
+    XXH3_64bits_update(state, chunk.data + i, to_read);
     XXH64_hash_t minichunk_hash = XXH3_64bits_digest(state);
 
     uint64_t extended_size = 0;
@@ -581,7 +591,7 @@ uint64_t simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const 
 
       uint64_t backwards_extended_size = 0;
       while (
-        similar_chunk_pos >= (similar_chunk.data.size() + start_matching_data_len) &&
+        similar_chunk_pos >= (similar_chunk.length + start_matching_data_len) &&
         current_chunk_pos >= prev_match_i &&
         similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
         ) {
@@ -594,7 +604,7 @@ uint64_t simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const 
       similar_chunk_pos = minichunk_hashes[minichunk_hash] + to_read;
       current_chunk_pos = i + to_read;
       while (
-        similar_chunk_pos < (similar_chunk.data.size() - end_matching_data_len) &&
+        similar_chunk_pos < (similar_chunk.length - end_matching_data_len) &&
         current_chunk_pos < chunk_non_matched_end &&
         similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
       ) {
@@ -616,17 +626,17 @@ uint64_t simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const 
 uint64_t simulate_delta_encoding_cdc(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, uint32_t chunk_size) {
   //DDelta style delta encoding, first start by greedily attempting to match data at the start and end on the chunks
   uint64_t start_matching_data_len = 0;
-  const auto cmp_size = std::min(chunk.data.size(), similar_chunk.data.size());
-  std::span chunk_data_span{ chunk.data.data(), cmp_size };
-  std::span similar_chunk_data_span{ similar_chunk.data.data(), cmp_size };
+  const auto cmp_size = std::min(chunk.length, similar_chunk.length);
+  std::span chunk_data_span{ chunk.data, cmp_size };
+  std::span similar_chunk_data_span{ similar_chunk.data, cmp_size };
   for (uint64_t i = 0; i < cmp_size; i++) {
     if (chunk_data_span[i] != similar_chunk_data_span[i]) break;
     ++start_matching_data_len;
   }
 
   uint64_t end_matching_data_len = 0;
-  chunk_data_span = std::span{ chunk.data.data() + chunk.data.size() - cmp_size, cmp_size };
-  similar_chunk_data_span = std::span{ similar_chunk.data.data() + similar_chunk.data.size() - cmp_size, cmp_size };
+  chunk_data_span = std::span{ chunk.data + chunk.length - cmp_size, cmp_size };
+  similar_chunk_data_span = std::span{ similar_chunk.data + similar_chunk.length - cmp_size, cmp_size };
   for (uint64_t i = 0; i < cmp_size; i++) {
     if (chunk_data_span[cmp_size - 1 - i] != similar_chunk_data_span[cmp_size - 1 - i]) break;
     ++end_matching_data_len;
@@ -635,43 +645,92 @@ uint64_t simulate_delta_encoding_cdc(const utility::CDChunk& chunk, const utilit
   uint64_t saved_size = start_matching_data_len + end_matching_data_len;
 
   // If the chunks are of different size, its possible we have matched the whole chunk inside the other, in that case we save all that size
-  if (start_matching_data_len + end_matching_data_len >= chunk.data.size()) return chunk.data.size();
+  if (start_matching_data_len + end_matching_data_len >= chunk.length) return chunk.length;
+  if (start_matching_data_len + end_matching_data_len >= similar_chunk.length) return similar_chunk.length;
 
-  // Simulate delta patching, really fucking stupid and slow, start by getting minichunks for the similar chunk
   XXH3_state_t* state = XXH3_createState();
-  auto similar_memstream = IStreamMem(similar_chunk.data.data(), similar_chunk.data.size());
-  auto ctx = fastcdc::ChunkGeneratorContext(&similar_memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);
-  std::set<uint64_t> minichunk_hashes{};
+  auto similar_memstream = IStreamMem(similar_chunk.data, similar_chunk.length);
+  std::unordered_map<uint64_t, std::vector<uint32_t>> similar_chunk_minichunks_map{};
+  std::vector<std::tuple<uint64_t, uint32_t, uint64_t>> similar_chunk_minichunks{};  // (offset, len, hash)
 
-  auto similar_minichunk = fastcdc::chunk_generator(ctx);
-  while (similar_minichunk.has_value()) {
-    const auto& minichunk = *similar_minichunk;
+  uint32_t minichunk_offset = 0;
+  for (const auto& minichunk_len : std::span(similar_chunk.minichunks.get(), similar_chunk.minichunks_len)) {
     XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, minichunk.data.data(), minichunk.data.size());
+    XXH3_64bits_update(state, similar_chunk.data + minichunk_offset, minichunk_len);
     XXH64_hash_t minichunk_hash = 0;
     minichunk_hash = XXH3_64bits_digest(state);
-    minichunk_hashes.insert(minichunk_hash);
-
-    similar_minichunk = fastcdc::chunk_generator(ctx);
+    similar_chunk_minichunks_map[minichunk_hash].push_back(similar_chunk_minichunks.size());
+    similar_chunk_minichunks.emplace_back(minichunk_offset, minichunk_len, minichunk_hash);
+    minichunk_offset += minichunk_len;
   }
 
-  // Clean the file and get minichunks for pending chunk, count filesize saved by omitting data on the similar chunk
-  const uint64_t chunk_non_matched_len = chunk.data.size() - start_matching_data_len - end_matching_data_len;
-  const uint8_t* chunk_non_matched_data_start = chunk.data.data() + start_matching_data_len;
-  auto pending_memstream = IStreamMem(chunk_non_matched_data_start, chunk_non_matched_len);
-  auto pending_ctx = fastcdc::ChunkGeneratorContext(&pending_memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);
-
-  auto pending_minichunk = fastcdc::chunk_generator(pending_ctx);
-  while (pending_minichunk.has_value()) {
-    const auto& minichunk = *pending_minichunk;
+  uint64_t prev_match_i = start_matching_data_len;
+  minichunk_offset = 0;
+  for (uint32_t minichunk_i = 0; minichunk_i < chunk.minichunks_len; minichunk_i++) {
+    const auto& minichunk_len = chunk.minichunks[minichunk_i];
+    // If we already matched this minichunk (or part of it) by matching the beginning of both chunks, we skip it
+    if (minichunk_offset < prev_match_i) {
+      minichunk_offset += minichunk_len;
+      continue;
+    }
+    // Similarly, if the amount of data matched at the end means that part of this minichunk was already matched there, we quit
+    if (minichunk_offset + minichunk_len >= chunk.length - end_matching_data_len) {
+      break;
+    }
     XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, minichunk.data.data(), minichunk.data.size());
-    XXH64_hash_t minichunk_hash = XXH3_64bits_digest(state);
-    if (minichunk_hashes.contains(minichunk_hash)) {
-      saved_size += minichunk.data.size();
+    XXH3_64bits_update(state, chunk.data + minichunk_offset, minichunk_len);
+    XXH64_hash_t minichunk_hash = 0;
+    minichunk_hash = XXH3_64bits_digest(state);
+
+    uint64_t extended_size = 0;
+    if (similar_chunk_minichunks_map.contains(minichunk_hash)) {
+      saved_size += minichunk_len;
+
+      uint64_t backwards_extended_size = 0;
+      std::unordered_map<uint32_t, uint64_t> minichunk_hash_cache{};
+      // We find the instance of the minichunk on the similar_chunk that can be extended the most
+      for (const auto& similar_chunk_minichunk_i : similar_chunk_minichunks_map[minichunk_hash]) {
+        const auto& candidate_similar_chunk_offset = std::get<0>(similar_chunk_minichunks[similar_chunk_minichunk_i]);
+        // We have a match, attempt to extend it, first backwards
+        auto similar_chunk_pos = candidate_similar_chunk_offset - 1;
+        auto current_chunk_pos = minichunk_offset - 1;
+
+        uint64_t candidate_backwards_extended_size = 0;
+        while (
+          similar_chunk_pos >= (similar_chunk.length + start_matching_data_len) &&
+          current_chunk_pos >= prev_match_i &&
+          similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
+          ) {
+          candidate_backwards_extended_size++;
+          similar_chunk_pos--;
+          current_chunk_pos--;
+        }
+
+        // Then extend forwards
+        uint64_t candidate_extended_size = 0;
+        similar_chunk_pos = candidate_similar_chunk_offset + minichunk_len;
+        current_chunk_pos = minichunk_offset + minichunk_len;
+        while (
+          similar_chunk_pos < (similar_chunk.length - end_matching_data_len) &&
+          current_chunk_pos < (chunk.length - end_matching_data_len) &&
+          similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
+          ) {
+          candidate_extended_size++;
+          similar_chunk_pos++;
+          current_chunk_pos++;
+        }
+
+        if (candidate_backwards_extended_size + candidate_extended_size > backwards_extended_size + extended_size) {
+          extended_size = candidate_extended_size;
+          backwards_extended_size = candidate_backwards_extended_size;
+        }
+      }
+
+      saved_size += backwards_extended_size + extended_size;
+      prev_match_i = minichunk_offset + minichunk_len + extended_size;
     }
 
-    pending_minichunk = fastcdc::chunk_generator(pending_ctx);
+    minichunk_offset += minichunk_len;
   }
   XXH3_freeState(state);
   return saved_size;
@@ -735,10 +794,10 @@ int main(int argc, char* argv[])
 
   const uint32_t simhash_chunk_size = 16;
   const uint32_t max_allowed_dist = 32;
-  const uint32_t delta_mode = 1;
+  const uint32_t delta_mode = 2;
 
-  std::bitset<64> (*simhash_func)(uint8_t* data, int data_len, int chunk_size) = nullptr;
-  uint64_t(*simulate_delta_encoding_func)(const utility::CDChunk & chunk, const utility::CDChunk & similar_chunk, uint32_t chunk_size) = nullptr;
+  std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> (*simhash_func)(uint8_t * data, int32_t data_len, int32_t chunk_size) = nullptr;
+  uint64_t (*simulate_delta_encoding_func)(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, uint32_t chunk_size) = nullptr;
   if (delta_mode == 0) {
     // Fastest delta mode, SimHash and delta encoding using Shingling
     simhash_func = &simhash_data_xxhash_shingling;
@@ -799,7 +858,7 @@ int main(int argc, char* argv[])
     // xxHash
     XXH3_state_t* state = XXH3_createState();
     XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, chunk.data.data(), chunk.data.size());
+    XXH3_64bits_update(state, chunk.data, chunk.length);
     chunk.hash = XXH3_64bits_digest(state);
     XXH3_freeState(state);
     const auto hashing_end_time = std::chrono::high_resolution_clock::now();
@@ -807,15 +866,15 @@ int main(int argc, char* argv[])
 
     if (!known_hashes.contains(chunk.hash)) {
       const auto simhashing_start_time = std::chrono::high_resolution_clock::now();
-      chunk.lsh = simhash_func(chunk.data.data(), chunk.data.size(), simhash_chunk_size);
+      std::tie(chunk.lsh, chunk.minichunks, chunk.minichunks_len) = simhash_func(chunk.data, chunk.length, simhash_chunk_size);
       const auto simhash_base = hamming_base(chunk.lsh);
       const auto simhashing_end_time = std::chrono::high_resolution_clock::now();
       simhashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(simhashing_end_time - simhashing_start_time).count();
 
-      std::vector<int> similar_chunks{};
+      std::unordered_set<int> similar_chunks{};
       if (use_generalized_resemblance_detection) {
         if (simhashes_dict.contains(simhash_base)) {
-          similar_chunks.emplace_back(simhashes_dict[simhash_base]);
+          similar_chunks.emplace(simhashes_dict[simhash_base]);
         }
         // If there is already a match via generalized resemblance detection, we still overwrite the index with this newer chunk.
         // Because of data locality, a more recent chunk on the data stream is more likely to yield good results
@@ -837,7 +896,7 @@ int main(int argc, char* argv[])
           }
         }
         if (best_candidate_dist.has_value()) {
-          similar_chunks.emplace_back(best_candidate);
+          similar_chunks.emplace(best_candidate);
         }
       }
 
@@ -860,7 +919,7 @@ int main(int argc, char* argv[])
             }
           }
           if (best_candidate_dist.has_value()) {
-            similar_chunks.emplace_back(best_candidate);
+            similar_chunks.emplace(best_candidate);
           }
 
           // We will rank potential similar chunks by their amount of matching SuperFeatures (so we select the most similar chunk possible)
@@ -922,7 +981,7 @@ int main(int argc, char* argv[])
           }
         }
         if (best_candidate_dist.has_value()) {
-          similar_chunks.emplace_back(best_candidate);
+          similar_chunks.emplace(best_candidate);
         }
       }
 
@@ -951,6 +1010,9 @@ int main(int argc, char* argv[])
       similarity_locality_anchor = chunk.hash;
       // Important to copy LSH in case this duplicate chunk ends up being candidate for Delta encoding via DupAdj or something
       chunk.lsh = chunks[known_hashes[chunk.hash][0]].lsh;
+      // Get the minichunks from the first instance of the duplicate chunk as well
+      chunk.minichunks = chunks[known_hashes[chunk.hash][0]].minichunks;
+      chunk.minichunks_len = chunks[known_hashes[chunk.hash][0]].minichunks_len;
       // Get the previous instances of this chunk's data to use the data from this chunk, this way we only store duplicate data in memory once
       for (auto& dupChunk_i : known_hashes[chunk.hash]) {
         chunks[dupChunk_i].setData(chunk);
@@ -1018,9 +1080,9 @@ int main(int argc, char* argv[])
           if (anchor_prev_chunk_i >= backtrack_chunk_i || anchor_prev_chunk_i < 0) continue;
           const auto& anchor_prev_chunk = chunks[anchor_prev_chunk_i];
 
-          const auto cmp_size = std::min(anchor_prev_chunk.data.size(), backtrack_chunk.data.size());
-          std::span anchor_prev_chunk_data{ anchor_prev_chunk.data.data(), cmp_size };
-          std::span backtrack_chunk_data{ backtrack_chunk.data.data(), cmp_size };
+          const auto cmp_size = std::min(anchor_prev_chunk.length, backtrack_chunk.length);
+          std::span anchor_prev_chunk_data{ anchor_prev_chunk.data, cmp_size };
+          std::span backtrack_chunk_data{ backtrack_chunk.data, cmp_size };
           uint64_t current_attempt_saved_size = 0;
           for (uint64_t i = 0; i < cmp_size; i++) {
             if (anchor_prev_chunk_data[cmp_size - 1 - i] != backtrack_chunk_data[cmp_size - 1 - i]) break;
@@ -1040,9 +1102,9 @@ int main(int argc, char* argv[])
         if (anchor_next_chunk_i == chunk_i) continue;
         const auto& anchor_next_chunk = chunks[anchor_next_chunk_i];
 
-        const auto cmp_size = std::min(anchor_next_chunk.data.size(), chunk.data.size());
-        std::span anchor_next_chunk_data{ anchor_next_chunk.data.data(), cmp_size };
-        std::span chunk_data{ chunk.data.data(), cmp_size };
+        const auto cmp_size = std::min(anchor_next_chunk.length, chunk.length);
+        std::span anchor_next_chunk_data{ anchor_next_chunk.data, cmp_size };
+        std::span chunk_data{ chunk.data, cmp_size };
         uint64_t current_attempt_saved_size = 0;
         for (uint64_t i = 0; i < cmp_size; i++) {
           if (anchor_next_chunk_data[i] != chunk_data[i]) break;
