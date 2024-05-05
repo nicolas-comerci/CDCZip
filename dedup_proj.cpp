@@ -659,6 +659,7 @@ uint64_t simulate_delta_encoding_cdc(const utility::CDChunk& chunk, const utilit
   auto similar_memstream = IStreamMem(similar_chunk.data, similar_chunk.length);
   std::unordered_map<uint64_t, std::vector<uint32_t>> similar_chunk_minichunks_map{};
   std::vector<std::tuple<uint64_t, uint32_t, uint64_t>> similar_chunk_minichunks{};  // (offset, len, hash)
+  similar_chunk_minichunks.reserve(similar_chunk.minichunks_len);
 
   uint32_t minichunk_offset = 0;
   for (const auto& minichunk_len : std::span(similar_chunk.minichunks.get(), similar_chunk.minichunks_len)) {
