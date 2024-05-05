@@ -360,33 +360,28 @@ namespace fastcdc {
 
       blob.resize(read_size);
       stream->read(blob.data(), read_size);
-      uint32_t blob_len = stream->gcount();
-      blob.resize(blob_len);
+      blob_len = stream->gcount();
       blob_it = blob.begin();
     }
   };
 
   std::optional<utility::CDChunk> chunk_generator(ChunkGeneratorContext& context) {
     std::optional<utility::CDChunk> chunk{};
-    if (context.blob_it == context.blob.end()) return chunk;
+    if (context.blob_len == 0) return chunk;
 
-    context.blob_len = context.blob.end() - context.blob_it;
     if (context.blob_len <= context.max_size) {
-      context.blob.erase(context.blob.begin(), context.blob_it);
-
-      context.blob.resize(context.read_size);
+      std::memmove(context.blob.data(), &*context.blob_it, context.blob_len);
       context.stream->read(reinterpret_cast<char*>(context.blob.data()) + context.blob_len, context.read_size - context.blob_len);
       context.blob_len += context.stream->gcount();
-      context.blob.resize(context.blob_len);
-      context.blob_it = context.blob.begin();  // iterators got invalidated
+      context.blob_it = context.blob.begin();
     }
     uint32_t cp;
     std::vector<uint32_t> features{};
     if (context.extract_features) {
-      std::tie(cp, features) = cdc_offset_with_features(std::span(context.blob_it, context.blob.end()), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l);
+      std::tie(cp, features) = cdc_offset_with_features(std::span(context.blob_it, context.blob_len), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l);
     }
     else {
-      cp = cdc_offset(std::span(context.blob_it, context.blob.end()), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l);
+      cp = cdc_offset(std::span(context.blob_it, context.blob_len), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l);
     }
     if (context.fat) {
       chunk.emplace(context.offset, cp, &*context.blob_it);
@@ -403,6 +398,7 @@ namespace fastcdc {
     }
     context.offset += cp;
     context.blob_it += cp;
+    context.blob_len -= cp;
     return chunk;
   }
 }
