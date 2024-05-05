@@ -334,7 +334,7 @@ namespace fastcdc {
 
   class ChunkGeneratorContext {
   public:
-    IStreamLike* stream;
+    IStreamLike* stream = nullptr;
     uint32_t min_size;
     uint32_t avg_size;
     uint32_t max_size;
@@ -347,9 +347,10 @@ namespace fastcdc {
     uint32_t read_size;
 
     uintmax_t offset = 0;
-    std::vector<uint8_t> blob{};
+    std::vector<uint8_t> _blob{};
+    std::span<uint8_t> blob{};
     uint32_t blob_len = 0;
-    std::vector<unsigned char>::iterator blob_it;
+    std::span<unsigned char>::iterator blob_it;
 
     ChunkGeneratorContext(IStreamLike* _stream, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _fat, bool _extract_features = false)
       : stream(_stream), min_size(_min_size), avg_size(_avg_size), max_size(_max_size), fat(_fat), extract_features(_extract_features) {
@@ -358,9 +359,20 @@ namespace fastcdc {
       mask_l = utility::mask(bits - 1);
       read_size = std::max<uint32_t>(1024 * 64, max_size);
 
-      blob.resize(read_size);
+      _blob.resize(read_size);
+      blob = std::span(_blob.data(), max_size);
       stream->read(blob.data(), read_size);
       blob_len = stream->gcount();
+      blob_it = blob.begin();
+    }
+    ChunkGeneratorContext(std::span<uint8_t> _blob, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _fat, bool _extract_features = false)
+      : min_size(_min_size), avg_size(_avg_size), max_size(_max_size), fat(_fat), extract_features(_extract_features), blob(_blob) {
+      bits = utility::logarithm2(avg_size);
+      mask_s = utility::mask(bits + 1);
+      mask_l = utility::mask(bits - 1);
+      read_size = std::max<uint32_t>(1024 * 64, max_size);
+
+      blob_len = blob.size();
       blob_it = blob.begin();
     }
   };
@@ -369,7 +381,7 @@ namespace fastcdc {
     std::optional<utility::CDChunk> chunk{};
     if (context.blob_len == 0) return chunk;
 
-    if (context.blob_len <= context.max_size) {
+    if (context.blob_len <= context.max_size && context.stream != nullptr) {
       std::memmove(context.blob.data(), &*context.blob_it, context.blob_len);
       context.stream->read(reinterpret_cast<char*>(context.blob.data()) + context.blob_len, context.read_size - context.blob_len);
       context.blob_len += context.stream->gcount();
@@ -448,8 +460,7 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
   XXH3_state_t* state = XXH3_createState();
   XXH3_64bits_reset(state);
 
-  auto memstream = IStreamMem(data, data_len);
-  auto ctx = fastcdc::ChunkGeneratorContext(&memstream, chunk_size / 2, chunk_size, chunk_size * 2, true);
+  auto ctx = fastcdc::ChunkGeneratorContext(std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2, false);
 
   std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> return_val{};
   auto& simhash = std::get<0>(return_val);
@@ -462,7 +473,7 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
   while (cdc_minichunk.has_value()) {
     auto& chunk = *cdc_minichunk;
     // Calculate hash for current chunk
-    XXH3_64bits_update(state, chunk.data, chunk.length);
+    XXH3_64bits_update(state, data + chunk.offset, chunk.length);
     chunk.hash = XXH3_64bits_digest(state);
     XXH3_64bits_reset(state);
 
