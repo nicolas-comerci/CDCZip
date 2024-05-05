@@ -235,16 +235,16 @@ namespace fastcdc {
 
     // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
     // the content defined nature of the Hashes
-    if (i == min_size) {  // If i is already less than min_size it means we are at the end, and we will quit immediately, so no point in doing anything
+    if (i < barrier) {  // Only do it if we are not going to quit immediately
       pattern =
-        (constants::GEAR[data[i - 7]] >> 7) +
-        (constants::GEAR[data[i - 6]] >> 6) +
-        (constants::GEAR[data[i - 5]] >> 5) +
-        (constants::GEAR[data[i - 4]] >> 4) +
-        (constants::GEAR[data[i - 3]] >> 3) +
-        (constants::GEAR[data[i - 2]] >> 2) +
-        (constants::GEAR[data[i - 1]] >> 1) +
-        constants::GEAR[data[i]];
+        (constants::GEAR[data[i - 8]] >> 7) +
+        (constants::GEAR[data[i - 7]] >> 6) +
+        (constants::GEAR[data[i - 6]] >> 5) +
+        (constants::GEAR[data[i - 5]] >> 4) +
+        (constants::GEAR[data[i - 4]] >> 3) +
+        (constants::GEAR[data[i - 3]] >> 2) +
+        (constants::GEAR[data[i - 2]] >> 1) +
+        constants::GEAR[data[i - 1]];
     }
 
     while (i < barrier) {
@@ -287,16 +287,16 @@ namespace fastcdc {
 
     // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
     // the content defined nature of the Hashes
-    if (i == min_size) {  // If i is already less than min_size it means we are at the end, and we will quit immediately, so no point in doing anything
+    if (i < barrier) {  // Only do it if we are not going to quit immediately
       pattern =
-        (constants::GEAR[data[i - 7]] >> 7) +
-        (constants::GEAR[data[i - 6]] >> 6) +
-        (constants::GEAR[data[i - 5]] >> 5) +
-        (constants::GEAR[data[i - 4]] >> 4) +
-        (constants::GEAR[data[i - 3]] >> 3) +
-        (constants::GEAR[data[i - 2]] >> 2) +
-        (constants::GEAR[data[i - 1]] >> 1) +
-        constants::GEAR[data[i]];
+        (constants::GEAR[data[i - 8]] >> 7) +
+        (constants::GEAR[data[i - 7]] >> 6) +
+        (constants::GEAR[data[i - 6]] >> 5) +
+        (constants::GEAR[data[i - 5]] >> 4) +
+        (constants::GEAR[data[i - 4]] >> 3) +
+        (constants::GEAR[data[i - 3]] >> 2) +
+        (constants::GEAR[data[i - 2]] >> 1) +
+        constants::GEAR[data[i - 1]];
     }
 
     while (i < barrier) {
