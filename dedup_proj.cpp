@@ -236,15 +236,9 @@ namespace fastcdc {
     // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
     // the content defined nature of the Hashes
     if (i < barrier) {  // Only do it if we are not going to quit immediately
-      pattern =
-        (constants::GEAR[data[i - 8]] >> 7) +
-        (constants::GEAR[data[i - 7]] >> 6) +
-        (constants::GEAR[data[i - 6]] >> 5) +
-        (constants::GEAR[data[i - 5]] >> 4) +
-        (constants::GEAR[data[i - 4]] >> 3) +
-        (constants::GEAR[data[i - 3]] >> 2) +
-        (constants::GEAR[data[i - 2]] >> 1) +
-        constants::GEAR[data[i - 1]];
+      for (uint32_t idx = 0; idx < std::min<uint32_t>(i, 32); idx++) {
+        pattern += (constants::GEAR[data[i - idx - 1]] >> idx);
+      }
     }
 
     while (i < barrier) {
@@ -288,15 +282,9 @@ namespace fastcdc {
     // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
     // the content defined nature of the Hashes
     if (i < barrier) {  // Only do it if we are not going to quit immediately
-      pattern =
-        (constants::GEAR[data[i - 8]] >> 7) +
-        (constants::GEAR[data[i - 7]] >> 6) +
-        (constants::GEAR[data[i - 6]] >> 5) +
-        (constants::GEAR[data[i - 5]] >> 4) +
-        (constants::GEAR[data[i - 4]] >> 3) +
-        (constants::GEAR[data[i - 3]] >> 2) +
-        (constants::GEAR[data[i - 2]] >> 1) +
-        constants::GEAR[data[i - 1]];
+      for (uint32_t idx = 0; idx < std::min<uint32_t>(i, 32); idx++) {
+        pattern += (constants::GEAR[data[i - idx - 1]] >> idx);
+      }
     }
 
     while (i < barrier) {
