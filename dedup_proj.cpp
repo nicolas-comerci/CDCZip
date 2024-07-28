@@ -360,9 +360,9 @@ namespace fastcdc {
       read_size = std::max<uint32_t>(1024 * 64, max_size);
 
       _blob.resize(read_size);
-      blob = std::span(_blob.data(), max_size);
-      stream->read(blob.data(), read_size);
+      stream->read(_blob.data(), read_size);
       blob_len = stream->gcount();
+      blob = std::span(_blob.data(), blob_len);
       blob_it = blob.begin();
     }
     ChunkGeneratorContext(std::span<uint8_t> _blob, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _fat, bool _extract_features = false)
