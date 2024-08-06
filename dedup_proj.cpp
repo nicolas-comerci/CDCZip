@@ -161,7 +161,7 @@ namespace utility {
     // Set a chunk's data to a future chunk's data, as the previous chunks will be deleted first as the context window moves.
     void setData(CDChunk& otherChunk) {
       data = otherChunk.data;
-      _data = std::unique_ptr<uint8_t[]>();
+      _data.reset();
     }
   };
 
@@ -836,10 +836,134 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
   return result;
 }
 
+enum LZInstructionType {
+  COPY,
+  INSERT,
+  DELTA
+};
+
+struct LZInstruction {
+  LZInstructionType type;
+  uint64_t offset;  // For COPY: previous offset; For INSERT: offset on the original stream; For Delta: previous offset of original data
+  uint64_t size;  // How much data to be copied or inserted, or size of the delta original data
+};
+
+class LZInstructionManager {
+  std::vector<LZInstruction> instructions;
+  uint64_t last_covered_offset = 0;
+
+public:
+  LZInstructionManager() = default;
+
+  void addInstruction(LZInstruction&& instruction, uint64_t current_offset) {
+    if (instructions.empty()) {
+      instructions.insert(instructions.end(), std::move(instruction));
+      return;
+    }
+    // If same type of instruction, and it starts from the offset at the end of the previous instruction we just extend that one
+    auto& prevInstruction = instructions.back();
+    if (
+      prevInstruction.type == instruction.type &&
+      prevInstruction.type == LZInstructionType::INSERT &&
+      prevInstruction.offset + prevInstruction.size == instruction.offset
+    ) {
+      prevInstruction.size += instruction.size;
+    }
+    else if (
+      prevInstruction.type == instruction.type &&
+      prevInstruction.type == LZInstructionType::COPY &&
+      prevInstruction.offset + prevInstruction.size == instruction.offset &&
+      prevInstruction.offset + prevInstruction.size + instruction.size < last_covered_offset
+      ) {
+      prevInstruction.size += instruction.size;
+    }
+    else {
+      last_covered_offset = current_offset + instruction.size;
+      instructions.insert(instructions.end(), std::move(instruction));
+    }
+  }
+
+  uint64_t instructionCount() {
+    return instructions.size();
+  }
+
+  void dump(std::istream& istream, std::ostream& ostream) {
+    std::vector<char> buffer;
+    for (const auto& instruction : instructions) {
+      istream.seekg(instruction.offset);
+      buffer.resize(instruction.size);
+      istream.read(buffer.data(), instruction.size);
+
+      ostream.put(instruction.type);
+      ostream.write(reinterpret_cast<const char*>(&instruction.size), 8);
+      if (instruction.type == LZInstructionType::INSERT) {
+        ostream.write(buffer.data(), instruction.size);
+      }
+      else {
+        ostream.write(reinterpret_cast<const char*>(&instruction.offset), 8);
+      }
+      
+    }
+  }
+};
+
 int main(int argc, char* argv[])
 {
-  //get_char_with_echo();
+  get_char_with_echo();
   std::string file_path{ argv[1] };
+  auto file_size = std::filesystem::file_size(file_path);
+  auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
+  if (!file_stream.is_open()) {
+    std::cout << "Can't read file\n";
+    return 1;
+  }
+  if (argc > 3) {
+    std::cout << "Invalid command line" << std::flush;
+    return 1;
+  }
+  if (argc == 3) {  // decompress
+    std::vector<char> buffer;
+    std::string decomp_file_path{ argv[2] };
+    auto decomp_file_stream = std::fstream(decomp_file_path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+
+    uint64_t size;
+    uint64_t offset;
+    auto instruction = file_stream.get();
+    while (instruction != EOF) {
+      if (
+        decomp_file_stream.eof() || decomp_file_stream.fail() || decomp_file_stream.bad() ||
+        file_stream.eof() || file_stream.fail() || file_stream.bad()
+        ) {
+        std::cout << "Something wrong bad during decompression\n" << std::flush;
+        return 1;
+      }
+
+      file_stream.read(reinterpret_cast<char*>(&size), 8);
+      buffer.resize(size);
+
+      const auto prev_write_pos = decomp_file_stream.tellp();
+      if (instruction == LZInstructionType::INSERT) {
+        file_stream.read(buffer.data(), size);
+        decomp_file_stream.write(buffer.data(), size);
+      }
+      else {  // LZInstructionType::COPY
+        decomp_file_stream.flush();
+        file_stream.read(reinterpret_cast<char*>(&offset), 8);
+
+        decomp_file_stream.seekg(offset);
+        decomp_file_stream.read(buffer.data(), size);
+
+        decomp_file_stream.seekp(prev_write_pos);
+        decomp_file_stream.write(buffer.data(), size);
+      }
+
+      instruction = file_stream.get();
+    }
+
+    std::cout << "Decompression finished!" << std::flush;
+    return 0;
+  }
+
   uint32_t avg_size = 8192;
   uint32_t min_size = avg_size / 4;
   uint32_t max_size = avg_size * 8;
@@ -869,12 +993,6 @@ int main(int argc, char* argv[])
   std::vector<faiss::idx_t> search_result_labels(5 * batch_size, -1);
   //printf("is_trained = %s\n", index.is_trained ? "true" : "false");
 
-  auto file_size = std::filesystem::file_size(file_path);
-  auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
-  if (!file_stream.is_open()) {
-    std::cout << "Can't read file\n";
-    return 1;
-  }
   auto wrapped_file = IStreamWrapper(&file_stream);
   uint64_t total_size = 0;
   uint64_t deduped_size = 0;
@@ -895,6 +1013,8 @@ int main(int argc, char* argv[])
   const uint32_t simhash_chunk_size = 16;
   const uint32_t max_allowed_dist = 32;
   const uint32_t delta_mode = 0;
+  const bool only_try_best_delta_match = false;
+  const bool keep_first_delta_match = false;
 
   std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> (*simhash_func)(uint8_t * data, int32_t data_len, int32_t minichunk_size) = nullptr;
   DeltaEncodingResult(*simulate_delta_encoding_func)(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, uint32_t minichunk_size) = nullptr;
@@ -933,11 +1053,20 @@ int main(int argc, char* argv[])
   auto total_runtime_start_time = std::chrono::high_resolution_clock::now();  
   auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
 
+  LZInstructionManager lz_manager{};
+
   std::optional<std::bitset<64>> similarity_locality_anchor{};
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
   auto generated_chunk = fastcdc::chunk_generator(generator_ctx);
   auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
   chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
+
+  static constexpr auto similar_chunk_tuple_cmp = [](const std::tuple<int, int>& a, const std::tuple<int, int>& b) {
+    // 1st member is hamming dist, less hamming dist, better result, we want those tuple first, so we say they compare as lesser
+    // 2nd member is chunk idx, more means more recent chunks, larger idx, to be prioritized because they are closer (locality principle)
+    if (std::get<0>(a) < std::get<0>(b) || (std::get<0>(a) == std::get<0>(b) && std::get<1>(a) > std::get<1>(b))) return true;
+    return false;
+  };
   while (generated_chunk.has_value()) {
     chunks.emplace_back(std::move(*generated_chunk));
     auto& chunk = chunks.back();
@@ -971,16 +1100,19 @@ int main(int argc, char* argv[])
       const auto simhashing_end_time = std::chrono::high_resolution_clock::now();
       simhashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(simhashing_end_time - simhashing_start_time).count();
 
-      std::unordered_set<int> similar_chunks{};
+      // Attempt resemblance detection and delta compression, first by using generalized resemblance detection
+      std::set<std::tuple<int, int>, decltype(similar_chunk_tuple_cmp)> similar_chunks{};
       if (use_generalized_resemblance_detection) {
         if (simhashes_dict.contains(simhash_base)) {
-          similar_chunks.emplace(simhashes_dict[simhash_base]);
+          similar_chunks.emplace(0, simhashes_dict[simhash_base]);
         }
         // If there is already a match via generalized resemblance detection, we still overwrite the index with this newer chunk.
         // Because of data locality, a more recent chunk on the data stream is more likely to yield good results
         simhashes_dict[simhash_base] = chunk_i;
       }
 
+      // Resemblance detection on the resemblance attempt window, exploiting the principle of data locality, there is a high likelihood data chunks close
+      // to the current chunk are fairly similar, just check distance for all chunks within the window
       if (resemblance_attempt_window > 0 && (similar_chunks.empty() || attempt_multiple_delta_methods)) {
         std::optional<int> best_candidate_dist{};
         int best_candidate = 0;
@@ -996,10 +1128,11 @@ int main(int argc, char* argv[])
           }
         }
         if (best_candidate_dist.has_value()) {
-          similar_chunks.emplace(best_candidate);
+          similar_chunks.emplace(*best_candidate_dist, best_candidate);
         }
       }
 
+      // Resemblance detection via feature extraction and superfeature matching
       // If we couldn't sample the chunk's features we completely skip any attempt to match or register superfeatures, as we could not extract them for this chunk
       if (use_feature_extraction && !chunk.feature_sampling_failure) {
         // If we don't have a similar chunk yet, attempt to find one by SuperFeature matching
@@ -1019,7 +1152,7 @@ int main(int argc, char* argv[])
             }
           }
           if (best_candidate_dist.has_value()) {
-            similar_chunks.emplace(best_candidate);
+            similar_chunks.emplace(*best_candidate_dist, best_candidate);
           }
 
           // We will rank potential similar chunks by their amount of matching SuperFeatures (so we select the most similar chunk possible)
@@ -1063,10 +1196,10 @@ int main(int argc, char* argv[])
 
       // If we don't have a similar chunk yet, attempt to find similar block via DARE's DupAdj,
       // checking if the next chunk from the similarity locality anchor is similar to this one
-      if (similar_chunks.empty() || attempt_multiple_delta_methods) {
+      if (use_dupadj && (similar_chunks.empty() || attempt_multiple_delta_methods)) {
         std::optional<int> best_candidate_dist{};
         int best_candidate = 0;
-        if (use_dupadj && similarity_locality_anchor.has_value()) {
+        if (similarity_locality_anchor.has_value()) {
           for (const auto& anchor_instance_chunk_i : known_hashes[*similarity_locality_anchor]) {
             const auto similar_candidate_chunk = anchor_instance_chunk_i + 1;
             if (similar_candidate_chunk == chunk_i) continue;
@@ -1081,20 +1214,24 @@ int main(int argc, char* argv[])
           }
         }
         if (best_candidate_dist.has_value()) {
-          similar_chunks.emplace(best_candidate);
+          similar_chunks.emplace(*best_candidate_dist, best_candidate);
         }
       }
 
+      // If any of the methods detected chunks that appear to be similar, attempt delta encoding
       if (!similar_chunks.empty()) {
         uint64_t best_saved_size = 0;
         utility::CDChunk* best_candidate = nullptr;
-        for (const auto& similar_chunk_i : similar_chunks) {
+        for (const auto& [similar_chunk_dist, similar_chunk_i] : similar_chunks) {
           const auto encoding_result = simulate_delta_encoding_func(chunk, chunks[similar_chunk_i], simhash_chunk_size);
           const auto& saved_size = encoding_result.estimated_savings;
           if (saved_size > best_saved_size) {
             best_saved_size = saved_size;
             best_candidate = &chunks[similar_chunk_i];
+            if (keep_first_delta_match) break;
           }
+
+          if (only_try_best_delta_match) break;
         }
         if (best_saved_size > 0) {
           delta_compressed_approx_size += best_saved_size;
@@ -1105,15 +1242,19 @@ int main(int argc, char* argv[])
       else {
         similarity_locality_anchor = std::nullopt;
       }
+
+      lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = chunk.offset, .size = chunk.length }, chunk.offset);
     }
     else {
       deduped_size += chunk.length;
       similarity_locality_anchor = chunk.hash;
       // Important to copy LSH in case this duplicate chunk ends up being candidate for Delta encoding via DupAdj or something
-      chunk.lsh = chunks[known_hashes[chunk.hash][0]].lsh;
+      const auto& previous_chunk_i = known_hashes[chunk.hash].back();
+      const auto& previous_chunk_instance = chunks[previous_chunk_i];
+      chunk.lsh = previous_chunk_instance.lsh;
       // Get the minichunks from the first instance of the duplicate chunk as well
-      chunk.minichunks = chunks[known_hashes[chunk.hash][0]].minichunks;
-      chunk.minichunks_len = chunks[known_hashes[chunk.hash][0]].minichunks_len;
+      chunk.minichunks = previous_chunk_instance.minichunks;
+      chunk.minichunks_len = previous_chunk_instance.minichunks_len;
       // Get the previous instances of this chunk's data to use the data from this chunk, this way we only store duplicate data in memory once
       for (auto& dupChunk_i : known_hashes[chunk.hash]) {
         chunks[dupChunk_i].setData(chunk);
@@ -1125,6 +1266,8 @@ int main(int argc, char* argv[])
         const auto simhash_base = hamming_base(chunk.lsh);
         simhashes_dict[simhash_base] = chunk_i;
       }
+
+      lz_manager.addInstruction({ .type = LZInstructionType::COPY, .offset = previous_chunk_instance.offset, .size = chunk.length }, chunk.offset);
     }
     known_hashes[chunk.hash].push_back(chunk_i);
 
@@ -1224,7 +1367,16 @@ int main(int argc, char* argv[])
     chunk_generator_end_time = std::chrono::high_resolution_clock::now();
     chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
   }
-  auto total_runtime_end_time = std::chrono::high_resolution_clock::now();
+
+  auto total_dedup_end_time = std::chrono::high_resolution_clock::now();
+
+  // Dump results
+  auto dump_file = std::fstream(file_path + ".ddp", std::ios::out | std::ios::binary | std::ios::trunc);
+  file_stream.close();
+  file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
+  lz_manager.dump(file_stream, dump_file);
+
+  auto dump_end_time = std::chrono::high_resolution_clock::now();
 
   // Chunk stats
   std::cout << std::string("Chunk Sizes:    min ") + std::to_string(min_size) + " - avg " + std::to_string(avg_size) + " - max " + std::to_string(max_size) + "\n" << std::flush;
@@ -1251,10 +1403,13 @@ int main(int argc, char* argv[])
   std::printf("Hashing Throughput:    %.1f MB/s\n", hashing_mb_per_nanosecond * std::pow(10, 9));
   const auto simhashing_mb_per_nanosecond = total_size_mbs / simhashing_execution_time_ns;
   std::printf("SimHashing Throughput:    %.1f MB/s\n", simhashing_mb_per_nanosecond* std::pow(10, 9));
-  const auto total_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(total_runtime_end_time - total_runtime_start_time).count();
+  const auto total_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(total_dedup_end_time - total_runtime_start_time).count();
   const auto total_mb_per_nanosecond = total_size_mbs / total_elapsed_nanoseconds;
   std::printf("Total Throughput:    %.1f MB/s\n", total_mb_per_nanosecond * std::pow(10, 9));
-  std::printf("Total runtime:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(total_runtime_end_time - total_runtime_start_time).count());
+  std::cout << "Total LZ instructions:    " + std::to_string(lz_manager.instructionCount()) + "\n" << std::flush;
+  std::printf("Total dedup time:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(total_dedup_end_time - total_runtime_start_time).count());
+  std::printf("Dump time:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_dedup_end_time).count());
+  std::printf("Total runtime:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_runtime_start_time).count());
 
   //get_char_with_echo();
   return 0;
