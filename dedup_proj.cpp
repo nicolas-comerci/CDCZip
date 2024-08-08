@@ -23,12 +23,14 @@
 #include <filesystem>
 #include <unordered_set>
 
+#include "contrib/bitstream.h"
+#include "contrib/stream.h"
 #include "contrib/embeddings.cpp/bert.h"
-#include <faiss/IndexFlat.h>
-#include <faiss/MetricType.h>
-#include <faiss/utils/distances.h>
-#include <faiss/IndexLSH.h>
-#include <faiss/IndexBinaryHash.h>
+//#include <faiss/IndexFlat.h>
+//#include <faiss/MetricType.h>
+//#include <faiss/utils/distances.h>
+//#include <faiss/IndexLSH.h>
+//#include <faiss/IndexBinaryHash.h>
 
 char get_char_with_echo() {
   return getchar();
@@ -836,6 +838,33 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
   return result;
 }
 
+class WrappedIStreamInputStream: public InputStream {
+private:
+  std::istream* istream;
+
+public:
+  WrappedIStreamInputStream(std::istream* _istream): istream(_istream) {}
+
+  bool eof() const override { return istream->eof(); }
+  size_t read(unsigned char* buffer, const size_t size) override {
+    istream->read(reinterpret_cast<char*>(buffer), size);
+    return istream->gcount();
+  }
+};
+
+class WrappedOStreamOutputStream: public OutputStream {
+private:
+  std::ostream* ostream;
+
+public:
+  WrappedOStreamOutputStream(std::ostream* _ostream): ostream(_ostream) {}
+
+  size_t write(const unsigned char* buffer, const size_t size) override {
+    ostream->write(reinterpret_cast<const char*>(buffer), size);
+    return size;
+  }
+};
+
 enum LZInstructionType {
   COPY,
   INSERT,
@@ -889,27 +918,28 @@ public:
 
   void dump(std::istream& istream, std::ostream& ostream) {
     std::vector<char> buffer;
-    for (const auto& instruction : instructions) {
-      istream.seekg(instruction.offset);
-      buffer.resize(instruction.size);
-      istream.read(buffer.data(), instruction.size);
+    auto output_stream = WrappedOStreamOutputStream(&ostream);
+    auto bos = BitOutputStream(output_stream);
 
-      ostream.put(instruction.type);
-      ostream.write(reinterpret_cast<const char*>(&instruction.size), 8);
+    for (const auto& instruction : instructions) {
+      bos.put(instruction.type, 8);
+      bos.putVLI(instruction.size);
       if (instruction.type == LZInstructionType::INSERT) {
-        ostream.write(buffer.data(), instruction.size);
+        istream.seekg(instruction.offset);
+        buffer.resize(instruction.size);
+        istream.read(buffer.data(), instruction.size);
+        bos.putBytes(reinterpret_cast<const uint8_t*>(buffer.data()), instruction.size);
       }
       else {
-        ostream.write(reinterpret_cast<const char*>(&instruction.offset), 8);
+        bos.putVLI(instruction.offset);
       }
-      
     }
   }
 };
 
 int main(int argc, char* argv[])
 {
-  get_char_with_echo();
+  //get_char_with_echo();
   std::string file_path{ argv[1] };
   auto file_size = std::filesystem::file_size(file_path);
   auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
@@ -925,30 +955,39 @@ int main(int argc, char* argv[])
     std::vector<char> buffer;
     std::string decomp_file_path{ argv[2] };
     auto decomp_file_stream = std::fstream(decomp_file_path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+    auto wrapped_input_stream = WrappedIStreamInputStream(&file_stream);
+    auto bit_input_stream = BitInputStream(wrapped_input_stream);
 
     uint64_t size;
     uint64_t offset;
-    auto instruction = file_stream.get();
-    while (instruction != EOF) {
-      if (
-        decomp_file_stream.eof() || decomp_file_stream.fail() || decomp_file_stream.bad() ||
-        file_stream.eof() || file_stream.fail() || file_stream.bad()
-        ) {
+    auto instruction = bit_input_stream.get(8);
+    while (!bit_input_stream.eof()) {
+      if (decomp_file_stream.eof() || decomp_file_stream.fail() || decomp_file_stream.bad()) {
         std::cout << "Something wrong bad during decompression\n" << std::flush;
         return 1;
       }
 
-      file_stream.read(reinterpret_cast<char*>(&size), 8);
+      size = bit_input_stream.getVLI();
       buffer.resize(size);
 
       const auto prev_write_pos = decomp_file_stream.tellp();
       if (instruction == LZInstructionType::INSERT) {
-        file_stream.read(buffer.data(), size);
+        for (uint64_t i = 0; i < size; i++) {
+          // pre-peak 64bits (or whatever amount of bits for the bytes left if at the end) so they are buffered and we don't read
+          // byte-by-byte
+          if (i % 8 == 0) {
+            const auto to_peek = std::min<uint64_t>(64, (size - i) * 8);
+            bit_input_stream.peek(static_cast<uint32_t>(to_peek));
+          }
+          const auto read = bit_input_stream.get(8);
+          const char read_char = read & 0xFF;
+          buffer[i] = read_char;
+        }
         decomp_file_stream.write(buffer.data(), size);
       }
       else {  // LZInstructionType::COPY
         decomp_file_stream.flush();
-        file_stream.read(reinterpret_cast<char*>(&offset), 8);
+        offset = bit_input_stream.getVLI();
 
         decomp_file_stream.seekg(offset);
         decomp_file_stream.read(buffer.data(), size);
@@ -957,7 +996,7 @@ int main(int argc, char* argv[])
         decomp_file_stream.write(buffer.data(), size);
       }
 
-      instruction = file_stream.get();
+      instruction = bit_input_stream.get(8);
     }
 
     std::cout << "Decompression finished!" << std::flush;
@@ -988,9 +1027,9 @@ int main(int argc, char* argv[])
 
   int batch_size = 100;
 
-  faiss::IndexLSH index(max_size / 4, 64, false);
+  //faiss::IndexLSH index(max_size / 4, 64, false);
   std::vector<float> search_results(5 * batch_size, 0);
-  std::vector<faiss::idx_t> search_result_labels(5 * batch_size, -1);
+  //std::vector<faiss::idx_t> search_result_labels(5 * batch_size, -1);
   //printf("is_trained = %s\n", index.is_trained ? "true" : "false");
 
   auto wrapped_file = IStreamWrapper(&file_stream);

@@ -69,9 +69,10 @@ if ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
 endif ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
 
 set(XXHASH_SRC "${SRCDIR}/contrib/xxHash/xxhash.c")
-set(SSDEEP_SRC "${SRCDIR}/contrib/ssdeep/fuzzy.c")
+#set(SSDEEP_SRC "${SRCDIR}/contrib/ssdeep/fuzzy.c")
 
-add_subdirectory(contrib/embeddings.cpp)
+# Bert
+#add_subdirectory(contrib/embeddings.cpp)
 #set(BERT_SRC "${SRCDIR}/contrib/embeddings.cpp/bert.cpp")
 #set(GGML_INCLUDE_DIR "${SRCDIR}/contrib/embeddings.cpp/ggml/include/ggml")
 #include_directories(AFTER ${GGML_INCLUDE_DIR})
@@ -88,14 +89,21 @@ add_subdirectory(contrib/embeddings.cpp)
 #set(BLAS_LIBRARIES "blas")
 #set(NOFORTRAN True)
 #add_subdirectory(contrib/OpenBLAS-0.3.26)
-set(FAISS_ENABLE_PYTHON OFF)
-set(FAISS_ENABLE_GPU OFF)
-set(BUILD_TESTING OFF)
-add_subdirectory(contrib/faiss)
+
+#set(FAISS_ENABLE_PYTHON OFF)
+#set(FAISS_ENABLE_GPU OFF)
+#set(BUILD_TESTING OFF)
+#add_subdirectory(contrib/faiss)
+
+set(BITSTREAM_HDR "")
+add_stem2file(BITSTREAM_HDR "${SRCDIR}/contrib/%STEM%.h" "stream;bit_helper;bitstream;")
+set(BITSTREAM_SRC "")
+add_stem2file(BITSTREAM_SRC "${SRCDIR}/contrib/%STEM%.cpp" "bit_helper;bitstream;")
 
 set(DEDUP_PROJ_SRC "${SRCDIR}/dedup_proj.cpp")
 
-add_executable(dedup_proj ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${SSDEEP_SRC} )
-target_link_libraries(dedup_proj bert faiss)
+#add_executable(dedup_proj ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${SSDEEP_SRC} ${BITSTREAM_HDR} ${BITSTREAM_SRC} )
+add_executable(dedup_proj ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${BITSTREAM_HDR} ${BITSTREAM_SRC} )
+#target_link_libraries(dedup_proj bert faiss)
 
 install(TARGETS dedup_proj DESTINATION bin)
