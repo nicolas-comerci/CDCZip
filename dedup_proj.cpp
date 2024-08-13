@@ -631,11 +631,11 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
         // If any of the offsets is 0 then there is no way we can backtrack (similar_chunk_pos and/or current_chunk_pos already overflowed)
         if (candidate_similar_chunk_offset > 0 && minichunk_offset > 0) {
           while (
-            similar_chunk_pos >= (similar_chunk.length + start_matching_data_len) &&
             current_chunk_pos >= unaccounted_data_start_pos &&
             similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
             ) {
             candidate_backwards_extended_size++;
+            if (similar_chunk_pos == 0 || current_chunk_pos == 0) break;
             similar_chunk_pos--;
             current_chunk_pos--;
           }
@@ -646,7 +646,7 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
         similar_chunk_pos = candidate_similar_chunk_offset + minichunk_len;
         current_chunk_pos = minichunk_offset + minichunk_len;
         while (
-          similar_chunk_pos < (similar_chunk.length - end_matching_data_len) &&
+          similar_chunk_pos < similar_chunk.length &&
           current_chunk_pos < (chunk.length - end_matching_data_len) &&
           similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
           ) {
@@ -778,11 +778,11 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
         // If any of the offsets is 0 then there is no way we can backtrack (similar_chunk_pos and/or current_chunk_pos already overflowed)
         if (candidate_similar_chunk_offset > 0 && minichunk_offset > 0) {
           while (
-            similar_chunk_pos >= (similar_chunk.length + start_matching_data_len) &&
             current_chunk_pos >= unaccounted_data_start_pos &&
             similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
             ) {
             candidate_backwards_extended_size++;
+            if (similar_chunk_pos == 0 || current_chunk_pos == 0) break;
             similar_chunk_pos--;
             current_chunk_pos--;
           }
@@ -793,7 +793,7 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
         similar_chunk_pos = candidate_similar_chunk_offset + minichunk_len;
         current_chunk_pos = minichunk_offset + minichunk_len;
         while (
-          similar_chunk_pos < (similar_chunk.length - end_matching_data_len) &&
+          similar_chunk_pos < similar_chunk.length &&
           current_chunk_pos < (chunk.length - end_matching_data_len) &&
           similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
           ) {
