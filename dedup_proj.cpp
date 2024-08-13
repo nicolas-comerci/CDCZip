@@ -541,15 +541,21 @@ std::bitset<bit_size> hamming_base(std::bitset<bit_size> data) {
   return base;
 }
 
-struct DeltaEncodingInstruction {
-  uint8_t type;  // 0 for COPY, 1 for INSERT
-  uint64_t offset;  // For COPY: offset on the reference chunk; for INSERT: offset on the target chunk
-  uint64_t size;  // How much data to be copied or inserted
+enum LZInstructionType {
+  COPY,
+  INSERT,
+  DELTA
+};
+
+struct LZInstruction {
+  LZInstructionType type;
+  uint64_t offset;  // For COPY: previous offset; For INSERT: offset on the original stream; For Delta: previous offset of original data
+  uint64_t size;  // How much data to be copied or inserted, or size of the delta original data
 };
 
 struct DeltaEncodingResult {
   uint64_t estimated_savings;
-  std::vector<DeltaEncodingInstruction> instructions;
+  std::vector<LZInstruction> instructions;
 };
 
 DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, uint32_t minichunk_size) {
@@ -587,7 +593,7 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
   }
 
   if (start_matching_data_len) {
-    result.instructions.emplace_back(0, 0, start_matching_data_len);
+    result.instructions.emplace_back(LZInstructionType::COPY, 0, start_matching_data_len);
   }
 
   uint64_t unaccounted_data_start_pos = start_matching_data_len;
@@ -622,14 +628,17 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
         auto current_chunk_pos = minichunk_offset - 1;
 
         uint64_t candidate_backwards_extended_size = 0;
-        while (
-          similar_chunk_pos >= (similar_chunk.length + start_matching_data_len) &&
-          current_chunk_pos >= unaccounted_data_start_pos &&
-          similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
-          ) {
-          candidate_backwards_extended_size++;
-          similar_chunk_pos--;
-          current_chunk_pos--;
+        // If any of the offsets is 0 then there is no way we can backtrack (similar_chunk_pos and/or current_chunk_pos already overflowed)
+        if (candidate_similar_chunk_offset > 0 && minichunk_offset > 0) {
+          while (
+            similar_chunk_pos >= (similar_chunk.length + start_matching_data_len) &&
+            current_chunk_pos >= unaccounted_data_start_pos &&
+            similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
+            ) {
+            candidate_backwards_extended_size++;
+            similar_chunk_pos--;
+            current_chunk_pos--;
+          }
         }
 
         // Then extend forwards
@@ -646,7 +655,7 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
           current_chunk_pos++;
         }
 
-        if (candidate_backwards_extended_size + candidate_extended_size > backwards_extended_size + extended_size) {
+        if (candidate_backwards_extended_size + candidate_extended_size >= backwards_extended_size + extended_size) {
           extended_size = candidate_extended_size;
           backwards_extended_size = candidate_backwards_extended_size;
           best_similar_chunk_minichunk_offset = candidate_similar_chunk_offset;
@@ -656,13 +665,13 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
       // Any remaining unaccounted data needs to be INSERTed as it couldn't be matched from the similar_chunk
       if (unaccounted_data_start_pos < minichunk_offset - backwards_extended_size) {
         result.instructions.emplace_back(
-          1,  // INSERT
+          LZInstructionType::INSERT,
           unaccounted_data_start_pos,
           minichunk_offset - backwards_extended_size - unaccounted_data_start_pos
         );
       }
       result.instructions.emplace_back(
-        0,  // COPY
+        LZInstructionType::COPY,
         best_similar_chunk_minichunk_offset - backwards_extended_size + minichunk_already_accounted_len,
         backwards_extended_size + minichunk_len - minichunk_already_accounted_len + extended_size
       );
@@ -671,10 +680,11 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
     }
   }
   // After the iteration there could remain some unaccounted data at the end (before the matched data), if so save it as an INSERT
-  const auto end_matched_data_start_pos = chunk.length - end_matching_data_len;
+  const auto end_matched_data_start_pos = std::max<uint64_t>(unaccounted_data_start_pos, chunk.length - end_matching_data_len);
+  end_matching_data_len = chunk.length - end_matched_data_start_pos;
   if (unaccounted_data_start_pos < end_matched_data_start_pos) {
     result.instructions.emplace_back(
-      1,  // INSERT
+      LZInstructionType::INSERT,
       unaccounted_data_start_pos,
       end_matched_data_start_pos - unaccounted_data_start_pos
     );
@@ -682,8 +692,8 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
   // And finally any data matched at the end of the chunks
   if (end_matching_data_len) {
     result.instructions.emplace_back(
-      0,  // COPY
-      end_matched_data_start_pos,
+      LZInstructionType::COPY,
+      similar_chunk.length - end_matching_data_len,
       end_matching_data_len
     );
   }
@@ -728,7 +738,7 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
   }
 
   if (start_matching_data_len) {
-    result.instructions.emplace_back( 0, 0, start_matching_data_len);
+    result.instructions.emplace_back(LZInstructionType::COPY, 0, start_matching_data_len);
   }
 
   uint64_t unaccounted_data_start_pos = start_matching_data_len;
@@ -765,14 +775,17 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
         auto current_chunk_pos = minichunk_offset - 1;
 
         uint64_t candidate_backwards_extended_size = 0;
-        while (
-          similar_chunk_pos >= (similar_chunk.length + start_matching_data_len) &&
-          current_chunk_pos >= unaccounted_data_start_pos &&
-          similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
-          ) {
-          candidate_backwards_extended_size++;
-          similar_chunk_pos--; 
-          current_chunk_pos--;
+        // If any of the offsets is 0 then there is no way we can backtrack (similar_chunk_pos and/or current_chunk_pos already overflowed)
+        if (candidate_similar_chunk_offset > 0 && minichunk_offset > 0) {
+          while (
+            similar_chunk_pos >= (similar_chunk.length + start_matching_data_len) &&
+            current_chunk_pos >= unaccounted_data_start_pos &&
+            similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
+            ) {
+            candidate_backwards_extended_size++;
+            similar_chunk_pos--;
+            current_chunk_pos--;
+          }
         }
 
         // Then extend forwards
@@ -789,7 +802,7 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
           current_chunk_pos++;
         }
 
-        if (candidate_backwards_extended_size + candidate_extended_size > backwards_extended_size + extended_size) {
+        if (candidate_backwards_extended_size + candidate_extended_size >= backwards_extended_size + extended_size) {
           extended_size = candidate_extended_size;
           backwards_extended_size = candidate_backwards_extended_size;
           best_similar_chunk_minichunk_offset = candidate_similar_chunk_offset;
@@ -799,13 +812,13 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
       // Any remaining unaccounted data needs to be INSERTed as it couldn't be matched from the similar_chunk
       if (unaccounted_data_start_pos < minichunk_offset - backwards_extended_size) {
         result.instructions.emplace_back(
-          1,  // INSERT
+          LZInstructionType::INSERT,
           unaccounted_data_start_pos,
           minichunk_offset - backwards_extended_size - unaccounted_data_start_pos
         );
       }
       result.instructions.emplace_back(
-        0,  // COPY
+        LZInstructionType::COPY,
         best_similar_chunk_minichunk_offset - backwards_extended_size + minichunk_already_accounted_len,
         backwards_extended_size + minichunk_len - minichunk_already_accounted_len + extended_size
       );
@@ -816,10 +829,11 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
     minichunk_offset += minichunk_len;
   }
   // After the iteration there could remain some unaccounted data at the end (before the matched data), if so save it as an INSERT
-  const auto end_matched_data_start_pos = chunk.length - end_matching_data_len;
+  const auto end_matched_data_start_pos = std::max<uint64_t>(unaccounted_data_start_pos, chunk.length - end_matching_data_len);
+  end_matching_data_len = chunk.length - end_matched_data_start_pos;
   if (unaccounted_data_start_pos < end_matched_data_start_pos) {
     result.instructions.emplace_back(
-      1,  // INSERT
+      LZInstructionType::INSERT,
       unaccounted_data_start_pos,
       end_matched_data_start_pos - unaccounted_data_start_pos
     );
@@ -827,8 +841,8 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
   // And finally any data matched at the end of the chunks
   if (end_matching_data_len) {
     result.instructions.emplace_back(
-      0,  // COPY
-      end_matched_data_start_pos,
+      LZInstructionType::COPY,
+      similar_chunk.length - end_matching_data_len,
       end_matching_data_len
     );
   }
@@ -865,18 +879,6 @@ public:
   }
 };
 
-enum LZInstructionType {
-  COPY,
-  INSERT,
-  DELTA
-};
-
-struct LZInstruction {
-  LZInstructionType type;
-  uint64_t offset;  // For COPY: previous offset; For INSERT: offset on the original stream; For Delta: previous offset of original data
-  uint64_t size;  // How much data to be copied or inserted, or size of the delta original data
-};
-
 class LZInstructionManager {
   std::vector<LZInstruction> instructions;
   uint64_t last_covered_offset = 0;
@@ -907,7 +909,7 @@ public:
       prevInstruction.size += instruction.size;
     }
     else {
-      last_covered_offset = current_offset + instruction.size;
+      last_covered_offset = current_offset;
       instructions.insert(instructions.end(), std::move(instruction));
     }
   }
@@ -916,11 +918,13 @@ public:
     return instructions.size();
   }
 
-  void dump(std::istream& istream, std::ostream& ostream) {
+  void dump(std::istream& istream, std::ostream& ostream, bool verify_copies = false) {
     std::vector<char> buffer;
+    std::vector<char> verify_buffer;
     auto output_stream = WrappedOStreamOutputStream(&ostream);
     auto bos = BitOutputStream(output_stream);
 
+    uint64_t offset = 0;
     for (const auto& instruction : instructions) {
       bos.put(instruction.type, 8);
       bos.putVLI(instruction.size);
@@ -932,8 +936,25 @@ public:
       }
       else {
         bos.putVLI(instruction.offset);
+        if (verify_copies) {
+          istream.seekg(instruction.offset);
+          buffer.resize(instruction.size);
+          istream.read(buffer.data(), instruction.size);
+
+          istream.seekg(offset);
+          verify_buffer.resize(instruction.size);
+          istream.read(verify_buffer.data(), instruction.size);
+
+          if (std::memcmp(verify_buffer.data(), buffer.data(), instruction.size) != 0) {
+            std::cout << "Error while verifying outputted match\n" << std::flush;
+            exit(1);
+          }
+        }
       }
+      offset += instruction.size;
     }
+    bos.flush();
+    ostream.flush();
   }
 };
 
@@ -952,6 +973,8 @@ int main(int argc, char* argv[])
     return 1;
   }
   if (argc == 3) {  // decompress
+    auto decompress_start_time = std::chrono::high_resolution_clock::now();
+
     std::vector<char> buffer;
     std::string decomp_file_path{ argv[2] };
     auto decomp_file_stream = std::fstream(decomp_file_path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
@@ -960,9 +983,13 @@ int main(int argc, char* argv[])
 
     uint64_t size;
     uint64_t offset;
+    uint64_t instructionCount = 1;
     auto instruction = bit_input_stream.get(8);
     while (!bit_input_stream.eof()) {
-      if (decomp_file_stream.eof() || decomp_file_stream.fail() || decomp_file_stream.bad()) {
+      const auto eof = decomp_file_stream.eof();
+      const auto fail = decomp_file_stream.fail();
+      const auto bad = decomp_file_stream.bad();
+      if (eof || fail || bad) {
         std::cout << "Something wrong bad during decompression\n" << std::flush;
         return 1;
       }
@@ -997,9 +1024,11 @@ int main(int argc, char* argv[])
       }
 
       instruction = bit_input_stream.get(8);
+      instructionCount++;
     }
 
-    std::cout << "Decompression finished!" << std::flush;
+    auto decompress_end_time = std::chrono::high_resolution_clock::now();
+    std::printf("Decompression finished in %lld seconds!\n", std::chrono::duration_cast<std::chrono::seconds>(decompress_end_time - decompress_start_time).count());
     return 0;
   }
 
@@ -1051,9 +1080,11 @@ int main(int argc, char* argv[])
 
   const uint32_t simhash_chunk_size = 16;
   const uint32_t max_allowed_dist = 32;
-  const uint32_t delta_mode = 0;
+  const uint32_t delta_mode = 2;
   const bool only_try_best_delta_match = false;
   const bool keep_first_delta_match = false;
+  // Don't even bother saving chunk as delta chunk if savings are too little and overhead will probably negate them
+  const uint64_t min_delta_saving = std::min(min_size * 2, avg_size);
 
   std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> (*simhash_func)(uint8_t * data, int32_t data_len, int32_t minichunk_size) = nullptr;
   DeltaEncodingResult(*simulate_delta_encoding_func)(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, uint32_t minichunk_size) = nullptr;
@@ -1084,6 +1115,7 @@ int main(int argc, char* argv[])
   const bool attempt_multiple_delta_methods = true;
   const bool use_match_extension = true;
   const bool use_match_extension_backwards = true;
+  const bool verify_delta_coding = false;
 
   std::vector<utility::CDChunk> chunks{};
   uintmax_t chunk_generator_execution_time_ns = 0;
@@ -1100,6 +1132,10 @@ int main(int argc, char* argv[])
   auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
   chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
 
+  auto verify_file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
+  std::vector<uint8_t> verify_buffer{};
+  std::vector<uint8_t> verify_buffer_delta{};
+
   static constexpr auto similar_chunk_tuple_cmp = [](const std::tuple<int, int>& a, const std::tuple<int, int>& b) {
     // 1st member is hamming dist, less hamming dist, better result, we want those tuple first, so we say they compare as lesser
     // 2nd member is chunk idx, more means more recent chunks, larger idx, to be prioritized because they are closer (locality principle)
@@ -1111,6 +1147,7 @@ int main(int argc, char* argv[])
     auto& chunk = chunks.back();
 
     std::optional<std::bitset<64>> prev_similarity_locality_anchor = similarity_locality_anchor;
+    similarity_locality_anchor = std::nullopt;
     if (chunk_i % 1000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(generator_ctx.offset) / file_size) * 100) + "\n" << std::flush;
     total_size += chunk.length;
 
@@ -1238,8 +1275,8 @@ int main(int argc, char* argv[])
       if (use_dupadj && (similar_chunks.empty() || attempt_multiple_delta_methods)) {
         std::optional<int> best_candidate_dist{};
         int best_candidate = 0;
-        if (similarity_locality_anchor.has_value()) {
-          for (const auto& anchor_instance_chunk_i : known_hashes[*similarity_locality_anchor]) {
+        if (prev_similarity_locality_anchor.has_value()) {
+          for (const auto& anchor_instance_chunk_i : known_hashes[*prev_similarity_locality_anchor]) {
             const auto similar_candidate_chunk = anchor_instance_chunk_i + 1;
             if (similar_candidate_chunk == chunk_i) continue;
 
@@ -1258,31 +1295,72 @@ int main(int argc, char* argv[])
       }
 
       // If any of the methods detected chunks that appear to be similar, attempt delta encoding
+      DeltaEncodingResult best_encoding_result;
+      int best_similar_chunk_i;
       if (!similar_chunks.empty()) {
         uint64_t best_saved_size = 0;
         utility::CDChunk* best_candidate = nullptr;
         for (const auto& [similar_chunk_dist, similar_chunk_i] : similar_chunks) {
-          const auto encoding_result = simulate_delta_encoding_func(chunk, chunks[similar_chunk_i], simhash_chunk_size);
+          const DeltaEncodingResult encoding_result = simulate_delta_encoding_func(chunk, chunks[similar_chunk_i], simhash_chunk_size);
           const auto& saved_size = encoding_result.estimated_savings;
           if (saved_size > best_saved_size) {
             best_saved_size = saved_size;
             best_candidate = &chunks[similar_chunk_i];
+            best_encoding_result = encoding_result;
+            best_similar_chunk_i = similar_chunk_i;
             if (keep_first_delta_match) break;
           }
 
           if (only_try_best_delta_match) break;
         }
-        if (best_saved_size > 0) {
+        if (best_saved_size > 0 && best_saved_size > min_delta_saving) {
           delta_compressed_approx_size += best_saved_size;
           delta_compressed_chunk_count++;
           similarity_locality_anchor = best_candidate->hash;
         }
       }
-      else {
-        similarity_locality_anchor = std::nullopt;
-      }
 
-      lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = chunk.offset, .size = chunk.length }, chunk.offset);
+      if (similarity_locality_anchor.has_value()) {
+        auto& similar_chunk = chunks[best_similar_chunk_i];
+        uint64_t chunk_offset_pos = 0;
+
+        if (verify_delta_coding) {
+          verify_buffer.resize(chunk.length);
+          verify_buffer_delta.resize(chunk.length);
+
+          verify_file_stream.seekg(chunk.offset);
+          verify_file_stream.read(reinterpret_cast<char*>(verify_buffer.data()), chunk.length);
+        }
+
+        for (auto& instruction : best_encoding_result.instructions) {
+          const auto offset = chunk.offset + chunk_offset_pos;
+          // On delta instructions the offsets are relative to the reference chunk base offset
+          const auto reference_offset = similar_chunk.offset + instruction.offset;
+          if (instruction.type == LZInstructionType::INSERT) {
+            lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = offset, .size = instruction.size }, offset);
+          }
+          else {
+            lz_manager.addInstruction({ .type = LZInstructionType::COPY, .offset = reference_offset, .size = instruction.size }, offset);
+          }
+          if (verify_delta_coding) {
+            verify_file_stream.seekg(instruction.type == LZInstructionType::INSERT ? offset : reference_offset);
+            verify_file_stream.read(reinterpret_cast<char*>(verify_buffer_delta.data()) + chunk_offset_pos, instruction.size);
+
+            if (std::memcmp(verify_buffer_delta.data() + chunk_offset_pos, verify_buffer.data() + chunk_offset_pos, instruction.size) != 0) {
+              std::cout << "Delta coding data verification mismatch!\n" << std::flush;
+              exit(1);
+            }
+          }
+          chunk_offset_pos += instruction.size;
+        }
+        if (chunk_offset_pos != chunk.length) {
+          std::cout << "Delta coding size mismatch: chunk_size/delta size " + std::to_string(chunk.length) + "/" + std::to_string(chunk_offset_pos) + "\n" << std::flush;
+          exit(1);
+        }
+      }
+      else {
+        lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = chunk.offset, .size = chunk.length }, chunk.offset);
+      }
     }
     else {
       deduped_size += chunk.length;
@@ -1345,7 +1423,7 @@ int main(int argc, char* argv[])
           const auto encoding_result = simulate_delta_encoding_func(backtrack_chunk, similar_chunk, simhash_chunk_size);
           const auto& saved_size = encoding_result.estimated_savings;
 
-          if (saved_size > 0) {
+          if (saved_size > 0 && saved_size > min_delta_saving) {
             delta_compressed_approx_size += saved_size;
             delta_compressed_chunk_count++;
             backtrack_similarity_anchor = similar_chunk.hash;
