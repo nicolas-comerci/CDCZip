@@ -21,6 +21,7 @@
 
 // Resemblance detection support
 #include <filesystem>
+#include <ranges>
 #include <unordered_set>
 
 #include "contrib/bitstream.h"
@@ -139,7 +140,7 @@ namespace utility {
   class CDChunk {
     std::unique_ptr<uint8_t[]> _data;
   public:
-    uintmax_t offset;
+    uint64_t offset;
     uint32_t length;
     // Non owning pointer to the data, the data is owned on _data, and might actually be owned by another chunk, never ever free this.
     uint8_t* data;
@@ -151,8 +152,8 @@ namespace utility {
     std::shared_ptr<uint32_t[]> minichunks{};
     uint32_t minichunks_len;
 
-    CDChunk(uintmax_t _offset, uint32_t _length) : offset(_offset), length(_length), data(nullptr) {}
-    CDChunk(uintmax_t _offset, uint32_t _length, uint8_t* _data)
+    CDChunk(uint64_t _offset, uint32_t _length) : offset(_offset), length(_length), data(nullptr) {}
+    CDChunk(uint64_t _offset, uint32_t _length, uint8_t* _data)
       : _data(std::make_unique_for_overwrite<uint8_t[]>(_length)), offset(_offset), length(_length)
     {
       std::copy_n(_data, _length, this->_data.get());
@@ -348,7 +349,7 @@ namespace fastcdc {
     uint32_t mask_l;
     uint32_t read_size;
 
-    uintmax_t offset = 0;
+    uint64_t offset = 0;
     std::vector<uint8_t> _blob{};
     std::span<uint8_t> blob{};
     uint32_t blob_len = 0;
@@ -868,12 +869,19 @@ public:
 
 class LZInstructionManager {
   std::vector<LZInstruction> instructions;
-  uint64_t last_covered_offset = 0;
 
 public:
+  uint64_t last_covered_offset = 0;
+
   LZInstructionManager() = default;
 
   void addInstruction(LZInstruction&& instruction, uint64_t current_offset) {
+#ifndef NDEBUG
+    if (instruction.type == LZInstructionType::INSERT && instruction.offset != current_offset) {
+      std::cout << "INSERT LZInstruction added is not at current offset!" << std::flush;
+      exit(1);
+    }
+#endif
     if (instructions.empty()) {
       instructions.insert(instructions.end(), std::move(instruction));
       return;
@@ -905,15 +913,11 @@ public:
     return instructions.size();
   }
 
-  uint64_t lastCoveredOffset() const {
-    return last_covered_offset;
-  }
-
   LZInstruction& lastInstruction() {
     return instructions.back();
   }
 
-  void dump(std::istream& istream, std::ostream& ostream, bool verify_copies = false) const {
+  void dump(std::istream& istream, std::ostream& ostream, bool verify_copies = true) const {
     std::vector<char> buffer;
     std::vector<char> verify_buffer;
     auto output_stream = WrappedOStreamOutputStream(&ostream);
@@ -1113,9 +1117,9 @@ int main(int argc, char* argv[])
   const bool verify_delta_coding = false;
 
   std::vector<utility::CDChunk> chunks{};
-  uintmax_t chunk_generator_execution_time_ns = 0;
-  uintmax_t hashing_execution_time_ns = 0;
-  uintmax_t simhashing_execution_time_ns = 0;
+  uint64_t chunk_generator_execution_time_ns = 0;
+  uint64_t hashing_execution_time_ns = 0;
+  uint64_t simhashing_execution_time_ns = 0;
   auto total_runtime_start_time = std::chrono::high_resolution_clock::now();  
   auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
 
@@ -1131,7 +1135,7 @@ int main(int argc, char* argv[])
   std::vector<uint8_t> verify_buffer{};
   std::vector<uint8_t> verify_buffer_delta{};
 
-  static constexpr auto similar_chunk_tuple_cmp = [](const std::tuple<int, int>& a, const std::tuple<int, int>& b) {
+  static constexpr auto similar_chunk_tuple_cmp = [](const std::tuple<uint64_t, uint64_t>& a, const std::tuple<uint64_t, uint64_t>& b) {
     // 1st member is hamming dist, less hamming dist, better result, we want those tuple first, so we say they compare as lesser
     // 2nd member is chunk idx, more means more recent chunks, larger idx, to be prioritized because they are closer (locality principle)
     if (std::get<0>(a) < std::get<0>(b) || (std::get<0>(a) == std::get<0>(b) && std::get<1>(a) > std::get<1>(b))) return true;
@@ -1143,7 +1147,7 @@ int main(int argc, char* argv[])
 
     std::optional<uint64_t> prev_similarity_locality_anchor_i = similarity_locality_anchor_i;
     similarity_locality_anchor_i = std::nullopt;
-    if (chunk_i % 1000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(generator_ctx.offset) / file_size) * 100) + "\n" << std::flush;
+    if (chunk_i % 50000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(generator_ctx.offset) / file_size) * 100) + "\n" << std::flush;
     total_size += chunk.length;
 
     // make hashes
@@ -1164,6 +1168,7 @@ int main(int argc, char* argv[])
     const auto hashing_end_time = std::chrono::high_resolution_clock::now();
     hashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - hashing_start_time).count();
 
+    std::vector<LZInstruction> new_instructions;
     if (!known_hashes.contains(chunk.hash)) {
       const auto simhashing_start_time = std::chrono::high_resolution_clock::now();
       std::tie(chunk.lsh, chunk.minichunks, chunk.minichunks_len) = simhash_func(chunk.data, chunk.length, simhash_chunk_size);
@@ -1172,7 +1177,7 @@ int main(int argc, char* argv[])
       simhashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(simhashing_end_time - simhashing_start_time).count();
 
       // Attempt resemblance detection and delta compression, first by using generalized resemblance detection
-      std::set<std::tuple<int, int>, decltype(similar_chunk_tuple_cmp)> similar_chunks{};
+      std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> similar_chunks{};
       if (use_generalized_resemblance_detection) {
         if (simhashes_dict.contains(simhash_base)) {
           similar_chunks.emplace(0, simhashes_dict[simhash_base]);
@@ -1207,26 +1212,26 @@ int main(int argc, char* argv[])
       if (use_feature_extraction && !chunk.feature_sampling_failure) {
         // If we don't have a similar chunk yet, attempt to find one by SuperFeature matching
         if (similar_chunks.empty() || attempt_multiple_delta_methods) {
-          std::optional<int> best_candidate_dist{};
-          int best_candidate = 0;
+          std::optional<uint64_t> best_candidate_dist{};
+          uint64_t best_candidate_i = 0;
           for (const auto& sf : chunk.super_features) {
             if (superfeatures_dict.contains(sf)) {
               for (const auto& candidate_i : superfeatures_dict[sf]) {
                 const auto new_dist = hamming_distance(chunk.lsh, chunks[candidate_i].lsh);
                 // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk and data locality suggests it should be a better match
-                if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate))) {
-                  best_candidate = candidate_i;
+                if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate_i))) {
+                  best_candidate_i = candidate_i;
                   best_candidate_dist = new_dist;
                 }
               }
             }
           }
           if (best_candidate_dist.has_value()) {
-            similar_chunks.emplace(*best_candidate_dist, best_candidate);
+            similar_chunks.emplace(*best_candidate_dist, best_candidate_i);
           }
 
           // We will rank potential similar chunks by their amount of matching SuperFeatures (so we select the most similar chunk possible)
-          std::unordered_map<int, int> chunk_rank{};
+          std::unordered_map<uint64_t, uint64_t> chunk_rank{};
           for (const auto& sf : chunk.super_features) {
             if (superfeatures_dict.contains(sf)) {
               for (const auto& candidate_i : superfeatures_dict[sf]) {
@@ -1234,8 +1239,8 @@ int main(int argc, char* argv[])
               }
             }
           }
-          int best_candidate_i = 0;
-          int matching_sfs = 0;
+          best_candidate_i = 0;
+          uint64_t matching_sfs = 0;
           for (const auto& [candidate_i, sf_count] : chunk_rank) {
             if (sf_count > matching_sfs) {
               best_candidate_i = candidate_i;
@@ -1329,10 +1334,10 @@ int main(int argc, char* argv[])
           // On delta instructions the offsets are relative to the reference chunk base offset
           const auto reference_offset = similar_chunk.offset + instruction.offset;
           if (instruction.type == LZInstructionType::INSERT) {
-            lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = offset, .size = instruction.size }, offset);
+            new_instructions.emplace_back(LZInstructionType::INSERT, offset, instruction.size);
           }
           else {
-            lz_manager.addInstruction({ .type = LZInstructionType::COPY, .offset = reference_offset, .size = instruction.size }, offset);
+            new_instructions.emplace_back(LZInstructionType::COPY, reference_offset, instruction.size);
           }
           if (verify_delta_coding) {
             verify_file_stream.seekg(instruction.type == LZInstructionType::INSERT ? offset : reference_offset);
@@ -1373,7 +1378,7 @@ int main(int argc, char* argv[])
         simhashes_dict[simhash_base] = chunk_i;
       }
 
-      lz_manager.addInstruction({ .type = LZInstructionType::COPY, .offset = previous_chunk_instance.offset, .size = chunk.length }, chunk.offset);
+      new_instructions.emplace_back(LZInstructionType::COPY, previous_chunk_instance.offset, chunk.length);
     }
     known_hashes[chunk.hash].push_back(chunk_i);
 
@@ -1383,65 +1388,133 @@ int main(int argc, char* argv[])
       uint64_t prev_last_reduced_chunk_i = last_reduced_chunk_i;
       last_reduced_chunk_i = chunk_i;
 
-      uint64_t backtrack_similarity_anchor_i = *similarity_locality_anchor_i;
-      uint64_t maximum_backtrack = chunk_i - prev_last_reduced_chunk_i;
-      // for loop starts at 1 because if the last reduced chunk is the previous one then maximum_backtrack=1, and we don't backtrack at all
-      uint64_t current_backtrack = 1;
-      if (use_dupadj_backwards) {
-        for (; current_backtrack < maximum_backtrack; current_backtrack++) {
-          const auto backtrack_chunk_i = chunk_i - current_backtrack;
-          const auto& backtrack_chunk = chunks[backtrack_chunk_i];
+      // For us to be able to backtrack the previously last reduced chunk needs to not be the previous one but at least 2 before,
+      // else we would be backtracking to that already reduced chunk TODO: maybe we could actually still backtrack in case we find a better delta match?
+      if (chunk_i - prev_last_reduced_chunk_i >= 2) {
+        auto& prevInstruction = lz_manager.lastInstruction();
+        const auto prevInstructionOriginalSize = prevInstruction.size;
 
-          std::optional<uint64_t> best_candidate_dist{};
-          uint64_t best_candidate_i = 0;
-          for (const auto& anchor_instance_chunk_i : known_hashes[chunks[backtrack_similarity_anchor_i].hash]) {
-            const auto similar_candidate_chunk = anchor_instance_chunk_i - 1;
-            if (similar_candidate_chunk >= backtrack_chunk_i || similar_candidate_chunk < 0) continue;
+        // The prevInstruction can already be a COPY in rare cases when the previous match was extended such that the whole of the unmatched chunks
+        // are covered that way, this can happen in pathological cases because CDC cutoffs are disturbed by min/max chunk sizes
+        if (prevInstruction.type == LZInstructionType::INSERT) {
+          uint64_t backtrack_similarity_anchor_i = *similarity_locality_anchor_i;
+          auto backtrack_chunk_i = chunk_i - 1;
 
-            const auto& similar_chunk = chunks[similar_candidate_chunk];
-            const auto new_dist = hamming_distance(backtrack_chunk.lsh, similar_chunk.lsh);
-            // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk and data locality suggests it should be a better match
-            if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk > best_candidate_i))) {
-              best_candidate_dist = new_dist;
-              best_candidate_i = similar_candidate_chunk;
+          if (use_dupadj_backwards) {
+            std::vector<DeltaEncodingResult> dupadj_results{};
+
+            for (; backtrack_chunk_i > prev_last_reduced_chunk_i; backtrack_chunk_i--) {
+              const auto& backtrack_chunk = chunks[backtrack_chunk_i];
+
+              std::optional<uint64_t> best_candidate_dist{};
+              uint64_t best_candidate_i = 0;
+              for (const auto& anchor_instance_chunk_i : known_hashes[chunks[backtrack_similarity_anchor_i].hash]) {
+                const auto similar_candidate_chunk = anchor_instance_chunk_i - 1;
+                if (similar_candidate_chunk >= backtrack_chunk_i || similar_candidate_chunk < 0) continue;
+
+                const auto& similar_chunk = chunks[similar_candidate_chunk];
+                const auto new_dist = hamming_distance(backtrack_chunk.lsh, similar_chunk.lsh);
+                // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk and data locality suggests it should be a better match
+                if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk > best_candidate_i))) {
+                  best_candidate_dist = new_dist;
+                  best_candidate_i = similar_candidate_chunk;
+                }
+              }
+
+              if (!best_candidate_dist.has_value()) break;
+              const auto& similar_chunk = chunks[best_candidate_i];
+              auto encoding_result = simulate_delta_encoding_func(backtrack_chunk, similar_chunk, simhash_chunk_size);
+              const auto& saved_size = encoding_result.estimated_savings;
+
+              if (saved_size > 0 && saved_size > min_delta_saving) {
+                delta_compressed_approx_size += saved_size;
+                delta_compressed_chunk_count++;
+                backtrack_similarity_anchor_i = best_candidate_i;
+
+                uint64_t instruction_count = 0;
+                for (auto& instruction : std::ranges::reverse_view(encoding_result.instructions)) {
+                  // A previous match could have been extended which could make it impossible to shrink the insert to the start of the backtrack_chunk
+                  if (prevInstruction.size < instruction.size) {
+                    /*
+                    if (instruction.type == LZInstructionType::COPY) {
+                      instruction.offset += similar_chunk.offset;
+                      const auto size_diff = instruction.size - prevInstruction.size;
+                      instruction.offset += size_diff;
+                      instruction.size -= size_diff;
+
+                      prevInstruction.type = LZInstructionType::COPY;
+                      prevInstruction.offset = instruction.offset;
+                      prevInstruction.size = instruction.size;
+                    }
+                    */
+                    break;
+                  }
+                  instruction_count++;
+
+                  // Have to adjust the offsets, encoding results have INSERT offsets based on the reference chunk and COPY offsets based on the similar chunk
+                  if (instruction.type == LZInstructionType::INSERT) {
+                    instruction.offset += backtrack_chunk.offset;
+                  }
+                  else {
+                    instruction.offset += similar_chunk.offset;
+                  }
+                  prevInstruction.size -= instruction.size;
+                }
+                const auto current_instruction_size = encoding_result.instructions.size();
+                if (instruction_count != current_instruction_size) {
+                  const auto instructions_to_delete = current_instruction_size - instruction_count;
+                  encoding_result.instructions.erase(encoding_result.instructions.begin(), encoding_result.instructions.begin() + instructions_to_delete);
+                }
+                dupadj_results.emplace_back(std::move(encoding_result));
+                // If we already couldn't fit all instructions for this backtrack chunk then we can't backtrack anymore
+                if (instruction_count != current_instruction_size) {
+                  break;
+                }
+              }
+              else {
+                break;
+              }
+            }
+
+            // Iterating in reverse as the results are ordered from latest to earliest chunk and they need to be added from earliest to latest
+            auto offset = chunk.offset - prevInstructionOriginalSize + prevInstruction.size;
+            lz_manager.last_covered_offset = offset;
+            for (auto& delta_result : std::ranges::reverse_view(dupadj_results)) {
+              for (auto& instruction : delta_result.instructions) {
+                const auto instruction_size = instruction.size;
+                lz_manager.addInstruction(std::move(instruction), offset);
+                offset += instruction_size;
+              }
             }
           }
 
-          if (!best_candidate_dist.has_value()) break;
-          const auto& similar_chunk = chunks[best_candidate_i];
-          const auto encoding_result = simulate_delta_encoding_func(backtrack_chunk, similar_chunk, simhash_chunk_size);
-          const auto& saved_size = encoding_result.estimated_savings;
+          // If Backwards DupAdj is off or a mismatch caused it to stop while backtracking is still possible, we attempt to extend the last match backwards
+          if (use_match_extension_backwards && backtrack_chunk_i > prev_last_reduced_chunk_i && backtrack_similarity_anchor_i > 0) {
+            const auto& backtrack_chunk = chunks[backtrack_chunk_i];
 
-          if (saved_size > 0 && saved_size > min_delta_saving) {
-            delta_compressed_approx_size += saved_size;
-            delta_compressed_chunk_count++;
-            backtrack_similarity_anchor_i = best_candidate_i;
+            const auto anchor_prev_chunk_i = backtrack_similarity_anchor_i - 1;
+            if (anchor_prev_chunk_i < backtrack_chunk_i) {
+              const auto& anchor_prev_chunk = chunks[anchor_prev_chunk_i];
+
+              const auto cmp_size = std::min(anchor_prev_chunk.length, backtrack_chunk.length);
+              std::span anchor_prev_chunk_data{ anchor_prev_chunk.data, cmp_size };
+              std::span backtrack_chunk_data{ backtrack_chunk.data, cmp_size };
+              uint64_t saved_size = 0;
+              for (uint64_t i = 0; i < cmp_size; i++) {
+                if (anchor_prev_chunk_data[cmp_size - 1 - i] != backtrack_chunk_data[cmp_size - 1 - i]) break;
+                ++saved_size;
+              }
+              deduped_size += saved_size;
+            }
           }
         }
       }
 
-      // If Backwards DupAdj is off or a mismatch caused it to stop while backtracking is still possible, we attempt to extend the last match backwards
-      if (use_match_extension_backwards && current_backtrack < maximum_backtrack) {
-        const auto backtrack_chunk_i = chunk_i - current_backtrack;
-        const auto& backtrack_chunk = chunks[backtrack_chunk_i];
-
-        uint64_t saved_size = 0;
-        for (const auto& anchor_instance_chunk_i : known_hashes[chunks[backtrack_similarity_anchor_i].hash]) {
-          const auto anchor_prev_chunk_i = anchor_instance_chunk_i - 1;
-          if (anchor_prev_chunk_i >= backtrack_chunk_i || anchor_prev_chunk_i < 0) continue;
-          const auto& anchor_prev_chunk = chunks[anchor_prev_chunk_i];
-
-          const auto cmp_size = std::min(anchor_prev_chunk.length, backtrack_chunk.length);
-          std::span anchor_prev_chunk_data{ anchor_prev_chunk.data, cmp_size };
-          std::span backtrack_chunk_data{ backtrack_chunk.data, cmp_size };
-          uint64_t current_attempt_saved_size = 0;
-          for (uint64_t i = 0; i < cmp_size; i++) {
-            if (anchor_prev_chunk_data[cmp_size - 1 - i] != backtrack_chunk_data[cmp_size - 1 - i]) break;
-            ++current_attempt_saved_size;
-          }
-          saved_size = std::max(saved_size, current_attempt_saved_size);
-        }
-        deduped_size += saved_size;
+      auto lz_offset = chunk.offset;
+      for (auto& instruction : new_instructions) {
+        const auto old_lz_offset = lz_offset;
+        lz_offset += instruction.size;
+        lz_manager.addInstruction(std::move(instruction), old_lz_offset);
       }
     }
     else {
@@ -1490,7 +1563,7 @@ int main(int argc, char* argv[])
           }
         }
         if (saved_size > 0) {
-          const auto last_covered_offset = lz_manager.lastCoveredOffset();
+          const auto last_covered_offset = lz_manager.last_covered_offset;
           // Prevent overlapping COPY
           if (prev_instruction_last_pos + saved_size > last_covered_offset) {
             saved_size = last_covered_offset - prev_instruction_last_pos;
