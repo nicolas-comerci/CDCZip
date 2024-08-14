@@ -941,7 +941,7 @@ public:
           istream.read(verify_buffer.data(), instruction.size);
 
           if (std::memcmp(verify_buffer.data(), buffer.data(), instruction.size) != 0) {
-            std::cout << "Error while verifying outputted match\n" << std::flush;
+            std::cout << "Error while verifying outputted match at offset " + std::to_string(offset) + "\n" << std::flush;
             exit(1);
           }
         }
@@ -1452,27 +1452,48 @@ int main(int argc, char* argv[])
         const auto& anchor_chunk = chunks[anchor_chunk_i];
         auto& prevInstruction = lz_manager.lastInstruction();
 
-        // TODO: attempt to extend COPYs that do not end at the end of the anchor chunk
+        const auto prev_instruction_last_pos = prevInstruction.offset + prevInstruction.size;
         if (
           prevInstruction.type == LZInstructionType::COPY &&
-          prevInstruction.offset + prevInstruction.size == anchor_chunk.offset + anchor_chunk.length
+          prev_instruction_last_pos >= anchor_chunk.offset
         ) {
-          const auto anchor_next_chunk_i = *prev_similarity_locality_anchor_i + 1;
-          const auto& anchor_next_chunk = chunks[anchor_next_chunk_i];
+          bool abort = false;
+          uint32_t chunk_data_pos = 0;
+          // First we attempt extending the match within the anchor chunk if possible
+          if (prev_instruction_last_pos < anchor_chunk.offset + anchor_chunk.length) {
+            const uint64_t anchor_chunk_remaining_size = anchor_chunk.offset + anchor_chunk.length - prev_instruction_last_pos;
+            const uint32_t cmp_size = chunk.length < anchor_chunk_remaining_size ? chunk.length : anchor_chunk_remaining_size;
+            const std::span anchor_chunk_data{ anchor_chunk.data + anchor_chunk.length - anchor_chunk_remaining_size, cmp_size };
+            const std::span chunk_data{ chunk.data, cmp_size };
 
-          const auto cmp_size = std::min(anchor_next_chunk.length, chunk.length);
-          std::span anchor_next_chunk_data{ anchor_next_chunk.data, cmp_size };
-          std::span chunk_data{ chunk.data, cmp_size };
+            for (; chunk_data_pos < cmp_size; chunk_data_pos++) {
+              if (anchor_chunk_data[chunk_data_pos] != chunk_data[chunk_data_pos]) break;
+              ++saved_size;
+            }
+            if (saved_size != cmp_size) abort = true;
+          }
 
-          for (uint64_t i = 0; i < cmp_size; i++) {
-            if (anchor_next_chunk_data[i] != chunk_data[i]) break;
-            ++saved_size;
+          // If we didn't already mismatch while trying to match within the anchor chunk, now we attempt to match with the
+          // chunk next to the anchor
+          if (!abort && chunk_data_pos < chunk.length) {
+            const auto anchor_next_chunk_i = *prev_similarity_locality_anchor_i + 1;
+            const auto& anchor_next_chunk = chunks[anchor_next_chunk_i];
+
+            const auto cmp_size = std::min(anchor_next_chunk.length, chunk.length - chunk_data_pos);
+            const std::span anchor_next_chunk_data{ anchor_next_chunk.data, cmp_size };
+            const std::span chunk_data{ chunk.data + chunk_data_pos, cmp_size };
+
+            for (uint32_t i = 0; i < cmp_size; i++) {
+              if (anchor_next_chunk_data[i] != chunk_data[i]) break;
+              ++saved_size;
+            }
           }
         }
         if (saved_size > 0) {
           const auto last_covered_offset = lz_manager.lastCoveredOffset();
-          if (prevInstruction.offset + prevInstruction.size + saved_size > last_covered_offset) {
-            saved_size = last_covered_offset - (prevInstruction.offset + prevInstruction.size);
+          // Prevent overlapping COPY
+          if (prev_instruction_last_pos + saved_size > last_covered_offset) {
+            saved_size = last_covered_offset - prev_instruction_last_pos;
           }
           // The saved size should pretty much never equal or exceed this chunk's length, but in pathological cases it might happen,
           // likely when previous chunk matched with a distant chunk and max/min cutoffs caused layout shifting such that this chunk
@@ -1485,7 +1506,8 @@ int main(int argc, char* argv[])
 
       const auto insert_chunk_size = chunk.length - saved_size;
       if (insert_chunk_size != 0) {
-        lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = chunk.offset + saved_size, .size = insert_chunk_size }, chunk.offset);
+        const auto insert_chunk_offset = chunk.offset + saved_size;
+        lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = insert_chunk_offset, .size = insert_chunk_size }, insert_chunk_offset);
       }
     }
 
