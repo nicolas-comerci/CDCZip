@@ -868,12 +868,16 @@ public:
 };
 
 class LZInstructionManager {
+  std::vector<utility::CDChunk>* chunks;
   std::vector<LZInstruction> instructions;
+
+  const bool use_match_extension_backwards;
 
 public:
   uint64_t last_covered_offset = 0;
 
-  LZInstructionManager() = default;
+  LZInstructionManager(std::vector<utility::CDChunk>* _chunks, bool _use_match_extension_backwards)
+    : chunks(_chunks), use_match_extension_backwards(use_match_extension_backwards) {}
 
   void addInstruction(LZInstruction&& instruction, uint64_t current_offset) {
 #ifndef NDEBUG
@@ -904,6 +908,103 @@ public:
       prevInstruction.size += instruction.size;
     }
     else {
+      // TODO: attempt to match backwards even through prior COPY instructions in hope of consuming all of it and end up with less instructions?
+      if (use_match_extension_backwards && instruction.type == LZInstructionType::COPY && prevInstruction.type == LZInstructionType::INSERT) {
+        static constexpr auto compare_offset = [](const utility::CDChunk& x, const utility::CDChunk& y) { return x.offset < y.offset; };
+
+        const auto copy_search_chunk = utility::CDChunk(instruction.offset, instruction.size);
+        auto chunk_iter = std::ranges::lower_bound(std::as_const(*chunks), copy_search_chunk, compare_offset);
+        uint64_t copy_chunk_i = chunk_iter - chunks->cbegin();
+        if ((*chunks)[copy_chunk_i].offset > instruction.offset) copy_chunk_i--;
+        utility::CDChunk* copy_chunk = &(*chunks)[copy_chunk_i];
+        uint64_t copy_chunk_pos = instruction.offset - copy_chunk->offset;
+        if (copy_chunk_pos == 0) {
+          copy_chunk_i--;
+          copy_chunk = &(*chunks)[copy_chunk_i];
+          copy_chunk_pos = copy_chunk->length - 1;
+        }
+        else {
+          copy_chunk_pos--;
+        }
+
+        while (prevInstruction.type == LZInstructionType::INSERT) {
+          // TODO: figure out why this happens, most likely some match extension is not properly cleaning up INSERTs that are shrinked into nothingness
+          if (prevInstruction.size == 0) {
+            instructions.pop_back();
+            if (instructions.empty()) {
+              break;
+            }
+            prevInstruction = instructions.back();
+            continue;
+          }
+
+          uint64_t insert_chunk_offset = prevInstruction.offset + prevInstruction.size;
+          const auto insert_search_chunk = utility::CDChunk(insert_chunk_offset, prevInstruction.size);
+          auto insert_chunk_iter = std::ranges::lower_bound(std::as_const(*chunks), insert_search_chunk, compare_offset);
+          uint64_t insert_chunk_i = insert_chunk_iter != chunks->cend() ? insert_chunk_iter - chunks->cbegin() : chunks->size() - 1;
+          if ((*chunks)[insert_chunk_i].offset > insert_chunk_offset) insert_chunk_i--;
+          utility::CDChunk* insert_chunk = &(*chunks)[insert_chunk_i];
+          uint64_t insert_chunk_pos = insert_chunk_offset - insert_chunk->offset;
+          if (insert_chunk_pos == 0) {
+            insert_chunk_i--;
+            insert_chunk = &(*chunks)[insert_chunk_i];
+            insert_chunk_pos = insert_chunk->length - 1;
+          }
+          else {
+            insert_chunk_pos--;
+          }
+
+          bool stop_matching = false;
+          while (true) {
+            if (*(copy_chunk->data + copy_chunk_pos) != *(insert_chunk->data + insert_chunk_pos)) {
+              stop_matching = true;
+              break;
+            }
+
+            prevInstruction.size--;
+            instruction.offset--;
+            instruction.size++;
+            if (prevInstruction.size == 0) {
+              instructions.pop_back();
+              if (instructions.empty()) {
+                stop_matching = true;
+                break;
+              }
+              prevInstruction = instructions.back();
+              if (prevInstruction.type != LZInstructionType::INSERT) stop_matching = true;
+              break;
+            }
+
+            if (copy_chunk_pos != 0) {
+              copy_chunk_pos--;
+            }
+            else if (copy_chunk_i == 0) {
+              stop_matching = true;
+              break;
+            }
+            else {
+              copy_chunk_i--;
+              copy_chunk = &(*chunks)[copy_chunk_i];
+              copy_chunk_pos = copy_chunk->length - 1;
+            }
+
+            if (insert_chunk_pos != 0) {
+              insert_chunk_pos--;
+            }
+            else if (insert_chunk_i == 0) {
+              stop_matching = true;
+              break;
+            }
+            else {
+              insert_chunk_i--;
+              insert_chunk = &(*chunks)[insert_chunk_i];
+              insert_chunk_pos = insert_chunk->length - 1;
+            }
+          }
+          if (stop_matching) break;
+        }
+      }
+
       last_covered_offset = current_offset;
       instructions.insert(instructions.end(), std::move(instruction));
     }
@@ -994,10 +1095,11 @@ int main(int argc, char* argv[])
       }
 
       size = bit_input_stream.getVLI();
-      buffer.resize(size);
 
       const auto prev_write_pos = decomp_file_stream.tellp();
       if (instruction == LZInstructionType::INSERT) {
+        buffer.resize(size);
+
         for (uint64_t i = 0; i < size; i++) {
           // pre-peak 64bits (or whatever amount of bits for the bytes left if at the end) so they are buffered and we don't read
           // byte-by-byte
@@ -1015,11 +1117,22 @@ int main(int argc, char* argv[])
         decomp_file_stream.flush();
         offset = bit_input_stream.getVLI();
 
+        // A COPY instruction might be overlapping with itself, which means we need to keep copying data already copied within the
+        // same COPY instruction (usually because of repeating patterns in data)
+        // In this case we have to only read again the non overlapping data
+        const auto actual_read_size = std::min(size, static_cast<uint64_t>(prev_write_pos) - offset);
+        buffer.resize(actual_read_size);
+
         decomp_file_stream.seekg(offset);
-        decomp_file_stream.read(buffer.data(), size);
+        decomp_file_stream.read(buffer.data(), actual_read_size);
 
         decomp_file_stream.seekp(prev_write_pos);
-        decomp_file_stream.write(buffer.data(), size);
+        auto remaining_size = size;
+        while (remaining_size > 0) {
+          const auto write_size = std::min(remaining_size, actual_read_size);
+          decomp_file_stream.write(buffer.data(), write_size);
+          remaining_size -= write_size;
+        }
       }
 
       instruction = bit_input_stream.get(8);
@@ -1123,7 +1236,7 @@ int main(int argc, char* argv[])
   auto total_runtime_start_time = std::chrono::high_resolution_clock::now();  
   auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
 
-  LZInstructionManager lz_manager{};
+  LZInstructionManager lz_manager { &chunks, use_match_extension_backwards };
 
   std::optional<uint64_t> similarity_locality_anchor_i{};
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
