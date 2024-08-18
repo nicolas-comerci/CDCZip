@@ -1241,6 +1241,7 @@ int main(int argc, char* argv[])
   const uint32_t max_allowed_dist = 32;
   const uint32_t delta_mode = 2;
   const bool only_try_best_delta_match = false;
+  const bool only_try_min_dist_delta_matches = false;
   const bool keep_first_delta_match = false;
   // Don't even bother saving chunk as delta chunk if savings are too little and overhead will probably negate them
   const uint64_t min_delta_saving = std::min(min_size * 2, avg_size);
@@ -1272,6 +1273,7 @@ int main(int argc, char* argv[])
   const int resemblance_attempt_window = 100;
   // if false, the first similar block found by any method will be used and other methods won't run, if true, all methods will run and the most similar block found will be used
   const bool attempt_multiple_delta_methods = true;
+  const bool exhausive_delta_search = false;  // All delta matches with the best hamming distance will be tried
   const bool use_match_extension = true;
   const bool use_match_extension_backwards = true;
   const bool verify_delta_coding = false;
@@ -1350,20 +1352,30 @@ int main(int argc, char* argv[])
       // Resemblance detection on the resemblance attempt window, exploiting the principle of data locality, there is a high likelihood data chunks close
       // to the current chunk are fairly similar, just check distance for all chunks within the window
       if (resemblance_attempt_window > 0 && (similar_chunks.empty() || attempt_multiple_delta_methods)) {
+        std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> resemblance_attempt_window_similar_chunks{};
+
         std::optional<uint64_t> best_candidate_dist{};
         uint64_t best_candidate_i = 0;
         for (uint64_t i = 1; i <= resemblance_attempt_window && i <= chunk_i; i++) {
           const auto candidate_i = chunk_i - i;
           const auto& similar_candidate = chunks[candidate_i];
           const auto new_dist = hamming_distance(chunk.lsh, similar_candidate.lsh);
-          // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk and data locality suggests it should be a better match
-          if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate_i))) {
+          if (
+            new_dist <= max_allowed_dist &&
+            // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk
+            // and data locality suggests it should be a better match
+            (exhausive_delta_search || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate_i)))
+          ) {
+            if (!exhausive_delta_search || new_dist < *best_candidate_dist)  {
+              resemblance_attempt_window_similar_chunks.clear();
+            }
             best_candidate_i = candidate_i;
             best_candidate_dist = new_dist;
+            resemblance_attempt_window_similar_chunks.emplace(new_dist, candidate_i);
           }
         }
-        if (best_candidate_dist.has_value()) {
-          similar_chunks.emplace(*best_candidate_dist, best_candidate_i);
+        if (!resemblance_attempt_window_similar_chunks.empty()) {
+          similar_chunks.insert(resemblance_attempt_window_similar_chunks.begin(), resemblance_attempt_window_similar_chunks.end());
         }
       }
 
@@ -1372,53 +1384,45 @@ int main(int argc, char* argv[])
       if (use_feature_extraction && !chunk.feature_sampling_failure) {
         // If we don't have a similar chunk yet, attempt to find one by SuperFeature matching
         if (similar_chunks.empty() || attempt_multiple_delta_methods) {
+          std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> feature_extraction_similar_chunks{};
+
           std::optional<uint64_t> best_candidate_dist{};
           uint64_t best_candidate_i = 0;
-          for (const auto& sf : chunk.super_features) {
-            if (superfeatures_dict.contains(sf)) {
-              for (const auto& candidate_i : superfeatures_dict[sf]) {
-                const auto new_dist = hamming_distance(chunk.lsh, chunks[candidate_i].lsh);
-                // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk and data locality suggests it should be a better match
-                if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate_i))) {
-                  best_candidate_i = candidate_i;
-                  best_candidate_dist = new_dist;
-                }
-              }
-            }
-          }
-          if (best_candidate_dist.has_value()) {
-            similar_chunks.emplace(*best_candidate_dist, best_candidate_i);
-          }
-
           // We will rank potential similar chunks by their amount of matching SuperFeatures (so we select the most similar chunk possible)
           std::unordered_map<uint64_t, uint64_t> chunk_rank{};
+
           for (const auto& sf : chunk.super_features) {
             if (superfeatures_dict.contains(sf)) {
               for (const auto& candidate_i : superfeatures_dict[sf]) {
                 chunk_rank[candidate_i] += 1;
+
+                const auto new_dist = hamming_distance(chunk.lsh, chunks[candidate_i].lsh);
+                if (
+                  new_dist <= max_allowed_dist &&
+                  // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk
+                  // and data locality suggests it should be a better match
+                  (exhausive_delta_search || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate_i)))
+                ) {
+                  if (!exhausive_delta_search || new_dist < *best_candidate_dist) {
+                    feature_extraction_similar_chunks.clear();
+                  }
+                  best_candidate_i = candidate_i;
+                  best_candidate_dist = new_dist;
+                  feature_extraction_similar_chunks.emplace(new_dist, candidate_i);
+                }
               }
             }
           }
-          best_candidate_i = 0;
-          uint64_t matching_sfs = 0;
-          for (const auto& [candidate_i, sf_count] : chunk_rank) {
-            if (sf_count > matching_sfs) {
-              best_candidate_i = candidate_i;
-              matching_sfs = sf_count;
-            }
-            if (matching_sfs == 4) break;
+          if (!feature_extraction_similar_chunks.empty()) {
+            similar_chunks.insert(feature_extraction_similar_chunks.begin(), feature_extraction_similar_chunks.end());
           }
-          // WARNING: We just use the SuperFeatures to index and find candidates by using the SimHashes and hamming distance, which gives us better results,
-          // so actually selecting a similar chunk is disabled here, we just keep all this just so we can remove old chunks with the same SuperFeature set
-          /*
-          if (matching_sfs > 0) {
-            similar_chunk = &chunks[best_candidate_i];
-          }
-          */
+
           // If all SuperFeatures match, remove the previous chunk from the Index, prevents the index from getting pointlessly large, specially for some pathological cases
-          if (matching_sfs == 4) {
-            for (const auto& sf : chunk.super_features) {
-              superfeatures_dict[sf].erase(best_candidate_i);
+          for (const auto& [candidate_i, sf_count] : chunk_rank) {
+            if (sf_count == 4) {
+              for (const auto& sf : chunk.super_features) {
+                superfeatures_dict[sf].erase(candidate_i);
+              }
             }
           }
 
@@ -1432,6 +1436,8 @@ int main(int argc, char* argv[])
       // If we don't have a similar chunk yet, attempt to find similar block via DARE's DupAdj,
       // checking if the next chunk from the similarity locality anchor is similar to this one
       if (use_dupadj && (similar_chunks.empty() || attempt_multiple_delta_methods)) {
+        std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> dupadj_similar_chunks{};
+
         std::optional<uint64_t> best_candidate_dist{};
         uint64_t best_candidate_i = 0;
         if (prev_similarity_locality_anchor_i.has_value()) {
@@ -1441,15 +1447,23 @@ int main(int argc, char* argv[])
 
             const auto& similar_candidate = chunks[similar_candidate_chunk_i];
             const auto new_dist = hamming_distance(chunk.lsh, similar_candidate.lsh);
-            // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk and data locality suggests it should be a better match
-            if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk_i > best_candidate_i))) {
-              best_candidate_dist = new_dist;
+            if (
+              new_dist <= max_allowed_dist &&
+              // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk
+              // and data locality suggests it should be a better match
+              (exhausive_delta_search || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk_i > best_candidate_i)))
+            ) {
+              if (!exhausive_delta_search || new_dist < *best_candidate_dist) {
+                dupadj_similar_chunks.clear();
+              }
               best_candidate_i = similar_candidate_chunk_i;
+              best_candidate_dist = new_dist;
+              dupadj_similar_chunks.emplace(new_dist, similar_candidate_chunk_i);
             }
           }
         }
-        if (best_candidate_dist.has_value()) {
-          similar_chunks.emplace(*best_candidate_dist, best_candidate_i);
+        if (!dupadj_similar_chunks.empty()) {
+          similar_chunks.insert(dupadj_similar_chunks.begin(), dupadj_similar_chunks.end());
         }
       }
 
@@ -1458,13 +1472,17 @@ int main(int argc, char* argv[])
       if (!similar_chunks.empty()) {
         uint64_t best_saved_size = 0;
         uint64_t best_similar_chunk_i;
+        uint64_t best_similar_chunk_dist = 99;
         for (const auto& [similar_chunk_dist, similar_chunk_i] : similar_chunks) {
+          if (only_try_min_dist_delta_matches && best_similar_chunk_dist < similar_chunk_dist) continue;
+
           const DeltaEncodingResult encoding_result = simulate_delta_encoding_func(chunk, chunks[similar_chunk_i], simhash_chunk_size);
           const auto& saved_size = encoding_result.estimated_savings;
           if (saved_size > best_saved_size) {
             best_saved_size = saved_size;
             best_encoding_result = encoding_result;
             best_similar_chunk_i = similar_chunk_i;
+            best_similar_chunk_dist = similar_chunk_dist;
             if (keep_first_delta_match) break;
           }
 
