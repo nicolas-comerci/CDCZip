@@ -1158,7 +1158,7 @@ public:
         bos.putBytes(reinterpret_cast<const uint8_t*>(buffer.data()), instruction.size);
       }
       else {
-        bos.putVLI(instruction.offset);
+        bos.putVLI(offset - instruction.offset);
         if (verify_copies) {
           istream.seekg(instruction.offset);
           buffer.resize(instruction.size);
@@ -1204,9 +1204,7 @@ int main(int argc, char* argv[])
     auto wrapped_input_stream = WrappedIStreamInputStream(&file_stream);
     auto bit_input_stream = BitInputStream(wrapped_input_stream);
 
-    uint64_t size;
-    uint64_t offset;
-    uint64_t instructionCount = 1;
+    uint64_t current_offset = 0;
     auto instruction = bit_input_stream.get(8);
     while (!bit_input_stream.eof()) {
       const auto eof = decomp_file_stream.eof();
@@ -1217,7 +1215,7 @@ int main(int argc, char* argv[])
         return 1;
       }
 
-      size = bit_input_stream.getVLI();
+      uint64_t size = bit_input_stream.getVLI();
 
       const auto prev_write_pos = decomp_file_stream.tellp();
       if (instruction == LZInstructionType::INSERT) {
@@ -1238,7 +1236,8 @@ int main(int argc, char* argv[])
       }
       else {  // LZInstructionType::COPY
         decomp_file_stream.flush();
-        offset = bit_input_stream.getVLI();
+        uint64_t relative_offset = bit_input_stream.getVLI();
+        uint64_t offset = current_offset - relative_offset;
 
         // A COPY instruction might be overlapping with itself, which means we need to keep copying data already copied within the
         // same COPY instruction (usually because of repeating patterns in data)
@@ -1258,8 +1257,8 @@ int main(int argc, char* argv[])
         }
       }
 
+      current_offset += size;
       instruction = bit_input_stream.get(8);
-      instructionCount++;
     }
 
     auto decompress_end_time = std::chrono::high_resolution_clock::now();
