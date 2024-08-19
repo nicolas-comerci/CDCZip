@@ -1539,7 +1539,7 @@ int main(int argc, char* argv[])
       if (!similar_chunks.empty()) {
         uint64_t best_saved_size = 0;
         uint64_t best_similar_chunk_i;
-        uint64_t best_similar_chunk_dist = 99;
+        uint64_t best_similar_chunk_dist = 999;
         for (const auto& [similar_chunk_dist, similar_chunk_i] : similar_chunks) {
           if (only_try_min_dist_delta_matches && best_similar_chunk_dist < similar_chunk_dist) continue;
 
@@ -1645,28 +1645,65 @@ int main(int argc, char* argv[])
         for (; backtrack_chunk_i > prev_last_reduced_chunk_i; backtrack_chunk_i--) {
           const auto& backtrack_chunk = chunks[backtrack_chunk_i];
 
+          std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> backwards_dupadj_similar_chunks{};
+
           std::optional<uint64_t> best_candidate_dist{};
           uint64_t best_candidate_i = 0;
           for (const auto& anchor_instance_chunk_i : known_hashes[chunks[backtrack_similarity_anchor_i].hash]) {
-            const auto similar_candidate_chunk = anchor_instance_chunk_i - 1;
-            if (similar_candidate_chunk >= backtrack_chunk_i || similar_candidate_chunk < 0) continue;
+            const auto similar_candidate_chunk_i = anchor_instance_chunk_i - 1;
+            if (similar_candidate_chunk_i >= backtrack_chunk_i || anchor_instance_chunk_i == 0) continue;
 
-            const auto& similar_chunk = chunks[similar_candidate_chunk];
+            const auto& similar_chunk = chunks[similar_candidate_chunk_i];
             const auto new_dist = hamming_distance(backtrack_chunk.lsh, similar_chunk.lsh);
-            // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk and data locality suggests it should be a better match
-            if (new_dist <= max_allowed_dist && (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk > best_candidate_i))) {
+            if (
+              new_dist <= max_allowed_dist &&
+              // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk
+              // and data locality suggests it should be a better match
+              (exhausive_delta_search || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk_i > best_candidate_i)))
+            ) {
+              if (!exhausive_delta_search || new_dist < *best_candidate_dist) {
+                backwards_dupadj_similar_chunks.clear();
+              }
+              best_candidate_i = similar_candidate_chunk_i;
               best_candidate_dist = new_dist;
-              best_candidate_i = similar_candidate_chunk;
+              backwards_dupadj_similar_chunks.emplace(new_dist, similar_candidate_chunk_i);
             }
           }
 
-          if (!best_candidate_dist.has_value()) break;
-          const auto& similar_chunk = chunks[best_candidate_i];
-          auto encoding_result = simulate_delta_encoding_func(backtrack_chunk, similar_chunk, simhash_chunk_size);
-          const auto& saved_size = encoding_result.estimated_savings;
+          if (backwards_dupadj_similar_chunks.empty()) break;
 
-          if (saved_size > 0 && saved_size > min_delta_saving) {
-            for (auto& instruction : encoding_result.instructions) {
+          uint64_t best_saved_size = 0;
+          uint64_t best_similar_chunk_i;
+          uint64_t best_similar_chunk_dist = 999;
+          DeltaEncodingResult best_encoding_result;
+          for (const auto& [similar_chunk_dist, similar_chunk_i] : backwards_dupadj_similar_chunks) {
+            if (only_try_min_dist_delta_matches && best_similar_chunk_dist < similar_chunk_dist) continue;
+
+            const DeltaEncodingResult encoding_result = simulate_delta_encoding_func(backtrack_chunk, chunks[similar_chunk_i], simhash_chunk_size);
+            const auto& saved_size = encoding_result.estimated_savings;
+            if (saved_size > best_saved_size) {
+              best_saved_size = saved_size;
+              best_encoding_result = encoding_result;
+              best_similar_chunk_i = similar_chunk_i;
+              best_similar_chunk_dist = similar_chunk_dist;
+              if (keep_first_delta_match) break;
+            }
+
+            if (only_try_best_delta_match) break;
+          }
+          if (best_saved_size > 0 && best_saved_size > min_delta_saving) {
+            delta_compressed_approx_size += best_saved_size;
+            delta_compressed_chunk_count++;
+          }
+
+          //const auto& similar_chunk = chunks[best_candidate_i];
+          //auto encoding_result = simulate_delta_encoding_func(backtrack_chunk, similar_chunk, simhash_chunk_size);
+          //const auto& saved_size = encoding_result.estimated_savings;
+
+          const auto& similar_chunk = chunks[best_similar_chunk_i];
+
+          if (best_saved_size > 0 && best_saved_size > min_delta_saving) {
+            for (auto& instruction : best_encoding_result.instructions) {
               if (instruction.type == LZInstructionType::INSERT) {
                 instruction.offset += backtrack_chunk.offset;
               }
@@ -1675,11 +1712,11 @@ int main(int argc, char* argv[])
               }
             }
 
-            delta_compressed_approx_size += saved_size;
+            delta_compressed_approx_size += best_saved_size;
             delta_compressed_chunk_count++;
             backtrack_similarity_anchor_i = best_candidate_i;
 
-            dupadj_results.emplace_back(std::move(encoding_result));
+            dupadj_results.emplace_back(std::move(best_encoding_result));
           }
           else {
             break;
