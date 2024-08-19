@@ -911,9 +911,19 @@ class LZInstructionManager {
   const bool use_match_extension_backwards;
   const bool use_match_extension;
 
+  uint64_t estimated_savings = 0;
+
 public:
   LZInstructionManager(std::vector<utility::CDChunk>* _chunks, bool _use_match_extension_backwards, bool _use_match_extension)
     : chunks(_chunks), use_match_extension_backwards(_use_match_extension_backwards), use_match_extension(_use_match_extension) {}
+
+  uint64_t instructionCount() const {
+    return instructions.size();
+  }
+
+  uint64_t estimatedSavings() const {
+    return estimated_savings;
+  }
 
   void addInstruction(LZInstruction&& instruction, uint64_t current_offset, bool verify = false) {
 #ifndef NDEBUG
@@ -934,6 +944,9 @@ public:
       prevInstruction->offset + prevInstruction->size == instruction.offset
     ) {
       prevInstruction->size += instruction.size;
+      if (prevInstruction->type == LZInstructionType::COPY) {
+        estimated_savings += instruction.size;
+      }
     }
     else {
       std::vector<uint8_t> verify_buffer_orig_data{};
@@ -1008,6 +1021,8 @@ public:
             prevInstruction->size--;
             instruction.offset--;
             instruction.size++;
+            // Otherwise I would end up double counting savings when adding the instruction at the end
+            if (prevInstruction->type == LZInstructionType::COPY) estimated_savings--;
 
             if (instruction_chunk_pos != 0) {
               instruction_chunk_pos--;
@@ -1063,6 +1078,7 @@ public:
           prevInstruction->size++;
           instruction.offset++;
           instruction.size--;
+          if (instruction.type == LZInstructionType::INSERT) estimated_savings++;
 
           prevInstruction_chunk_pos++;
           if (prevInstruction_chunk_pos == prevInstruction_chunk->length) {
@@ -1118,27 +1134,27 @@ public:
       // If it's still so small that the overhead of outputting the extra instruction is larger than the deduplication we would get
       // we just extend this insert so that we save that overhead
       if (instruction.type == LZInstructionType::INSERT && prevInstruction->type == LZInstructionType::COPY && prevInstruction->size < 128) {
+        estimated_savings -= prevInstruction->size;
         prevInstruction->type = LZInstructionType::INSERT;
         prevInstruction->offset = instruction.offset - prevInstruction->size;
         prevInstruction->size = instruction.size + prevInstruction->size;
         return;
       }
+      if (instruction.type == LZInstructionType::COPY) estimated_savings += instruction.size;
       instructions.insert(instructions.end(), std::move(instruction));
     }
-  }
-
-  uint64_t instructionCount() const {
-    return instructions.size();
   }
 
   void revertInstructionSize(uint64_t size) {
     LZInstruction* prevInstruction = &instructions.back();
     while (prevInstruction->size <= size) {
+      if (prevInstruction->type == LZInstructionType::COPY) estimated_savings -= size;
       size -= prevInstruction->size;
       instructions.pop_back();
       prevInstruction = &instructions.back();
     }
     prevInstruction->size -= size;
+    if (prevInstruction->type == LZInstructionType::COPY) estimated_savings -= size;
   }
 
   void dump(std::istream& istream, std::ostream& ostream, bool verify_copies = false) const {
@@ -1682,7 +1698,7 @@ int main(int argc, char* argv[])
           if (backwards_dupadj_similar_chunks.empty()) break;
 
           uint64_t best_saved_size = 0;
-          uint64_t best_similar_chunk_i;
+          std::optional<uint64_t> best_similar_chunk_i;
           uint64_t best_similar_chunk_dist = 999;
           DeltaEncodingResult best_encoding_result;
           for (const auto& [similar_chunk_dist, similar_chunk_i] : backwards_dupadj_similar_chunks) {
@@ -1700,25 +1716,13 @@ int main(int argc, char* argv[])
 
             if (only_try_best_delta_match) break;
           }
-          if (best_saved_size > 0 && best_saved_size > min_delta_saving) {
-            delta_compressed_approx_size += best_saved_size;
-            delta_compressed_chunk_count++;
-          }
 
-          //const auto& similar_chunk = chunks[best_candidate_i];
-          //auto encoding_result = simulate_delta_encoding_func(backtrack_chunk, similar_chunk, simhash_chunk_size);
-          //const auto& saved_size = encoding_result.estimated_savings;
-
-          const auto& similar_chunk = chunks[best_similar_chunk_i];
+          if (!best_similar_chunk_i.has_value()) break;
+          const auto& similar_chunk = chunks[*best_similar_chunk_i];
 
           if (best_saved_size > 0 && best_saved_size > min_delta_saving) {
             for (auto& instruction : best_encoding_result.instructions) {
-              if (instruction.type == LZInstructionType::INSERT) {
-                instruction.offset += backtrack_chunk.offset;
-              }
-              else {
-                instruction.offset += similar_chunk.offset;
-              }
+              instruction.offset += instruction.type == LZInstructionType::INSERT ? backtrack_chunk.offset : similar_chunk.offset;
             }
 
             delta_compressed_approx_size += best_saved_size;
@@ -1789,14 +1793,20 @@ int main(int argc, char* argv[])
   std::cout << "Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n" << std::flush;
   std::cout << "Total delta compressed chunk count: " + std::to_string(delta_compressed_chunk_count) + "\n" << std::flush;
 
+  const auto total_estimated_savings = lz_manager.estimatedSavings();
+  const auto match_extension_saved_size = total_estimated_savings - deduped_size - delta_compressed_approx_size;
   // Results stats
   const auto total_size_mbs = total_size / (1024.0 * 1024);
   std::printf("Chunk data total size:    %.1f MB\n", total_size_mbs);
   const auto deduped_size_mbs = deduped_size / (1024.0 * 1024);
   std::printf("Chunk data deduped size:    %.1f MB\n", deduped_size_mbs);
+  const auto total_estimated_savings_mbs = total_estimated_savings / (1024.0 * 1024);
+  std::printf("Total estimated reduced size:    %.1f MB\n", total_estimated_savings_mbs);
   const auto deltaed_size_mbs = delta_compressed_approx_size / (1024.0 * 1024);
   std::printf("Chunk data delta compressed size:    %.1f MB\n", deltaed_size_mbs);
-  std::printf("Final size:    %.1f MB\n", total_size_mbs - deduped_size_mbs - deltaed_size_mbs);
+  const auto extension_size_mbs = match_extension_saved_size / (1024.0 * 1024);
+  std::printf("Match extended size:    %.1f MB\n", extension_size_mbs);
+  std::printf("Final size:    %.1f MB\n", total_size_mbs - total_estimated_savings_mbs);
 
   std::printf("\n");
 
