@@ -1084,8 +1084,8 @@ public:
         }
       }
 
+      prevInstruction = &instructions.back();
       if (verify) {
-        prevInstruction = &instructions.back();
         std::fstream verify_file{};
         verify_file.open("C:\\Users\\Administrator\\Desktop\\fastcdc_test\\motherload.tar.pcf", std::ios_base::in | std::ios_base::binary);
         const auto data_count = prevInstruction->size + instruction.size;
@@ -1112,6 +1112,15 @@ public:
 
       // If the whole instruction is consumed by extending the previous COPY, then just quit, there is no instruction to add anymore
       if (instruction.size == 0) {
+        return;
+      }
+      // If we are adding an INSERT, then the previous COPY was already extended backwards and/or forwards as much as it could.
+      // If it's still so small that the overhead of outputting the extra instruction is larger than the deduplication we would get
+      // we just extend this insert so that we save that overhead
+      if (instruction.type == LZInstructionType::INSERT && prevInstruction->type == LZInstructionType::COPY && prevInstruction->size < 128) {
+        prevInstruction->type = LZInstructionType::INSERT;
+        prevInstruction->offset = instruction.offset - prevInstruction->size;
+        prevInstruction->size = instruction.size + prevInstruction->size;
         return;
       }
       instructions.insert(instructions.end(), std::move(instruction));
@@ -1623,6 +1632,7 @@ int main(int argc, char* argv[])
         simhashes_dict[simhash_base] = chunk_i;
       }
       // TODO: DO THE SAME FOR SUPERFEATURES
+      // TODO: OR DON'T? ATTEMPTED IT AND IT HURT COMPRESSION A LOT
 
       new_instructions.emplace_back(LZInstructionType::COPY, previous_chunk_instance.offset, chunk.length);
     }
