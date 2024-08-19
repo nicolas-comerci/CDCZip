@@ -915,7 +915,7 @@ public:
   LZInstructionManager(std::vector<utility::CDChunk>* _chunks, bool _use_match_extension_backwards, bool _use_match_extension)
     : chunks(_chunks), use_match_extension_backwards(_use_match_extension_backwards), use_match_extension(_use_match_extension) {}
 
-  void addInstruction(LZInstruction&& instruction, uint64_t current_offset) {
+  void addInstruction(LZInstruction&& instruction, uint64_t current_offset, bool verify = false) {
 #ifndef NDEBUG
     if (instruction.type == LZInstructionType::INSERT && instruction.offset != current_offset) {
       std::cout << "INSERT LZInstruction added is not at current offset!" << std::flush;
@@ -926,133 +926,194 @@ public:
       instructions.insert(instructions.end(), std::move(instruction));
       return;
     }
+
     // If same type of instruction, and it starts from the offset at the end of the previous instruction we just extend that one
-    auto& prevInstruction = instructions.back();
+    LZInstruction* prevInstruction = &instructions.back();
     if (
-      prevInstruction.type == instruction.type &&
-      prevInstruction.type == LZInstructionType::INSERT &&
-      prevInstruction.offset + prevInstruction.size == instruction.offset
+      prevInstruction->type == instruction.type &&
+      prevInstruction->offset + prevInstruction->size == instruction.offset
     ) {
-      prevInstruction.size += instruction.size;
-    }
-    else if (
-      prevInstruction.type == instruction.type &&
-      prevInstruction.type == LZInstructionType::COPY &&
-      prevInstruction.offset + prevInstruction.size == instruction.offset
-      ) {
-      prevInstruction.size += instruction.size;
+      prevInstruction->size += instruction.size;
     }
     else {
-      // TODO: attempt to match backwards even through prior COPY instructions in hope of consuming all of it and end up with less instructions?
-      if (use_match_extension_backwards && instruction.type == LZInstructionType::COPY && prevInstruction.type == LZInstructionType::INSERT) {
-        auto [copy_chunk_i, copy_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset - 1);
-        utility::CDChunk* copy_chunk = &(*chunks)[copy_chunk_i];
+      std::vector<uint8_t> verify_buffer_orig_data{};
+      std::vector<uint8_t> verify_buffer_instruction_data{};
+      uint64_t verify_end_offset = current_offset + instruction.size;
+      if (verify) {
+        verify_buffer_orig_data.resize(prevInstruction->size + instruction.size);
+        verify_buffer_instruction_data.resize(prevInstruction->size + instruction.size);
 
-        while (prevInstruction.type == LZInstructionType::INSERT) {
+        std::fstream verify_file{};
+        verify_file.open("C:\\Users\\Administrator\\Desktop\\fastcdc_test\\motherload.tar.pcf", std::ios_base::in | std::ios_base::binary);
+        const auto data_count = prevInstruction->size + instruction.size;
+        // Read original data
+        verify_file.seekg(current_offset - prevInstruction->size);
+        verify_file.read(reinterpret_cast<char*>(verify_buffer_orig_data.data()), data_count);
+        // Read data according to the instructions
+        verify_file.seekg(prevInstruction->offset);
+        verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()), prevInstruction->size);
+        verify_file.seekg(instruction.offset);
+        verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()) + prevInstruction->size, instruction.size);
+        // Ensure data matches
+        if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), data_count) != 0) {
+          std::cout << "Error while verifying addInstruction at offset " + std::to_string(current_offset) + "\n" << std::flush;
+          exit(1);
+        }
+      }
+
+      if (use_match_extension_backwards && instruction.type == LZInstructionType::COPY) {
+        auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset - 1);
+        utility::CDChunk* instruction_chunk = &(*chunks)[instruction_chunk_i];
+#ifndef NDEBUG
+        if (instruction_chunk->offset + instruction_chunk_pos != instruction.offset - 1) {
+          std::cout << "BACKWARD MATCH EXTENSION NEW INSTRUCTION OFFSET MISMATCH" << std::flush;
+          exit(1);
+        }
+#endif
+
+        uint64_t prevInstruction_offset = current_offset;
+
+        while (!instructions.empty()) {
+          prevInstruction = &instructions.back();
           // TODO: figure out why this happens, most likely some match extension is not properly cleaning up INSERTs that are shrunk into nothingness
-          if (prevInstruction.size == 0) {
+          if (prevInstruction->size == 0) {
             instructions.pop_back();
             if (instructions.empty()) {
               break;
             }
-            prevInstruction = instructions.back();
             continue;
           }
 
-          uint64_t insert_chunk_offset = prevInstruction.offset + prevInstruction.size;
-          auto [insert_chunk_i, insert_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, insert_chunk_offset - 1);
-          utility::CDChunk* insert_chunk = &(*chunks)[insert_chunk_i];
+          auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_offset - 1);
+          utility::CDChunk* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
+#ifndef NDEBUG
+          if (prevInstruction_chunk->offset + prevInstruction_chunk_pos != prevInstruction_offset - 1) {
+            std::cout << "BACKWARD MATCH EXTENSION PREVIOUS INSTRUCTION OFFSET MISMATCH" << std::flush;
+            exit(1);
+          }
+#endif
 
           bool stop_matching = false;
           while (true) {
-            if (*(copy_chunk->data + copy_chunk_pos) != *(insert_chunk->data + insert_chunk_pos)) {
+            const auto instruction_chunk_char = *(instruction_chunk->data + instruction_chunk_pos);
+            const auto prevInstruction_chunk_char = *(prevInstruction_chunk->data + prevInstruction_chunk_pos);
+
+            const auto instruction_chunk_offset = instruction_chunk->offset + instruction_chunk_pos;
+            if (instruction_chunk_char != prevInstruction_chunk_char) {
               stop_matching = true;
               break;
             }
 
-            prevInstruction.size--;
+            prevInstruction_offset--;
+            prevInstruction->size--;
             instruction.offset--;
             instruction.size++;
 
-            if (copy_chunk_pos != 0) {
-              copy_chunk_pos--;
+            if (instruction_chunk_pos != 0) {
+              instruction_chunk_pos--;
             }
-            else if (copy_chunk_i == 0) {
+            else if (instruction_chunk_i == 0) {
               stop_matching = true;
               break;
             }
             else {
-              copy_chunk_i--;
-              copy_chunk = &(*chunks)[copy_chunk_i];
-              copy_chunk_pos = copy_chunk->length - 1;
+              instruction_chunk_i--;
+              instruction_chunk = &(*chunks)[instruction_chunk_i];
+              instruction_chunk_pos = instruction_chunk->length - 1;
             }
 
-            if (prevInstruction.size == 0) {
+            if (prevInstruction->size == 0) {
               instructions.pop_back();
               if (instructions.empty()) {
                 stop_matching = true;
                 break;
               }
-              prevInstruction = instructions.back();
-              if (prevInstruction.type != LZInstructionType::INSERT) stop_matching = true;
               break;
             }
 
-            if (insert_chunk_pos != 0) {
-              insert_chunk_pos--;
+            if (prevInstruction_chunk_pos != 0) {
+              prevInstruction_chunk_pos--;
             }
-            else if (insert_chunk_i == 0) {
+            else if (prevInstruction_chunk_i == 0) {
               stop_matching = true;
               break;
             }
             else {
-              insert_chunk_i--;
-              insert_chunk = &(*chunks)[insert_chunk_i];
-              insert_chunk_pos = insert_chunk->length - 1;
+              prevInstruction_chunk_i--;
+              prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
+              prevInstruction_chunk_pos = prevInstruction_chunk->length - 1;
             }
           }
           if (stop_matching) break;
         }
       }
-      // TODO: attempt to forward extend previous COPY in case we can consume current instrucion?
-      else if (use_match_extension && instruction.type == LZInstructionType::INSERT && prevInstruction.type == LZInstructionType::COPY) {
-        uint64_t copy_chunk_offset = prevInstruction.offset + prevInstruction.size;
-        auto [copy_chunk_i, copy_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, copy_chunk_offset);
-        utility::CDChunk* copy_chunk = &(*chunks)[copy_chunk_i];
+      else if (use_match_extension && prevInstruction->type == LZInstructionType::COPY) {
+        uint64_t prevInstruction_chunk_offset = prevInstruction->offset + prevInstruction->size;
+        auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_chunk_offset);
+        utility::CDChunk* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
 
-        auto [insert_chunk_i, insert_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
-        utility::CDChunk* insert_chunk = &(*chunks)[insert_chunk_i];
+        auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
+        utility::CDChunk* instruction_chunk = &(*chunks)[instruction_chunk_i];
 
         while (instruction.size > 0) {
-          if (*(copy_chunk->data + copy_chunk_pos) != *(insert_chunk->data + insert_chunk_pos)) {
+          if (*(prevInstruction_chunk->data + prevInstruction_chunk_pos) != *(instruction_chunk->data + instruction_chunk_pos)) {
             break;
           }
 
-          prevInstruction.size++;
+          prevInstruction->size++;
           instruction.offset++;
           instruction.size--;
 
-          copy_chunk_pos++;
-          if (copy_chunk_pos == copy_chunk->length) {
-            copy_chunk_i++;
-            copy_chunk = &(*chunks)[copy_chunk_i];
-            copy_chunk_pos = 0;
+          prevInstruction_chunk_pos++;
+          if (prevInstruction_chunk_pos == prevInstruction_chunk->length) {
+            prevInstruction_chunk_i++;
+            prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
+            prevInstruction_chunk_pos = 0;
           }
 
-          // If the whole instruction is consumed by extending the previous COPY, then just quit, there is no instruction to add anymore
           if (instruction.size == 0) {
-            return;
+            break;
           }
 
-          insert_chunk_pos++;
-          if (insert_chunk_pos == insert_chunk->length) {
-            insert_chunk_i++;
-            insert_chunk = &(*chunks)[insert_chunk_i];
-            insert_chunk_pos = 0;
+          instruction_chunk_pos++;
+          if (instruction_chunk_pos == instruction_chunk->length) {
+            instruction_chunk_i++;
+            instruction_chunk = &(*chunks)[instruction_chunk_i];
+            instruction_chunk_pos = 0;
           }
         }
       }
 
+      if (verify) {
+        prevInstruction = &instructions.back();
+        std::fstream verify_file{};
+        verify_file.open("C:\\Users\\Administrator\\Desktop\\fastcdc_test\\motherload.tar.pcf", std::ios_base::in | std::ios_base::binary);
+        const auto data_count = prevInstruction->size + instruction.size;
+
+        verify_buffer_orig_data.resize(data_count);
+        verify_buffer_instruction_data.resize(data_count);
+
+        uint64_t orig_data_start = verify_end_offset - data_count;
+
+        // Read original data
+        verify_file.seekg(orig_data_start);
+        verify_file.read(reinterpret_cast<char*>(verify_buffer_orig_data.data()), data_count);
+        // Read data according to the instructions
+        verify_file.seekg(prevInstruction->offset);
+        verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()), prevInstruction->size);
+        verify_file.seekg(instruction.offset);
+        verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()) + prevInstruction->size, instruction.size);
+        // Ensure data matches
+        if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), data_count) != 0) {
+          std::cout << "Error while verifying addInstruction at offset " + std::to_string(current_offset) + "\n" << std::flush;
+          exit(1);
+        }
+      }
+
+      // If the whole instruction is consumed by extending the previous COPY, then just quit, there is no instruction to add anymore
+      if (instruction.size == 0) {
+        return;
+      }
       instructions.insert(instructions.end(), std::move(instruction));
     }
   }
@@ -1065,7 +1126,7 @@ public:
     return instructions.back();
   }
 
-  void dump(std::istream& istream, std::ostream& ostream, bool verify_copies = true) const {
+  void dump(std::istream& istream, std::ostream& ostream, bool verify_copies = false) const {
     std::vector<char> buffer;
     std::vector<char> verify_buffer;
     auto output_stream = WrappedOStreamOutputStream(&ostream);
