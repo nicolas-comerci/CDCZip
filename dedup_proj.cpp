@@ -1190,9 +1190,18 @@ public:
       bos.put(instruction.type, 8);
       bos.putVLI(instruction.size);
       if (instruction.type == LZInstructionType::INSERT) {
-        istream.seekg(instruction.offset);
+        auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
         buffer.resize(instruction.size);
-        istream.read(buffer.data(), instruction.size);
+        uint64_t written = 0;
+        while (written < instruction.size) {
+          auto& instruction_chunk = (*chunks)[instruction_chunk_i];
+          uint64_t to_read_from_chunk = std::min(instruction.size - written, instruction_chunk.length - instruction_chunk_pos);
+          std::copy_n(instruction_chunk.data + instruction_chunk_pos, to_read_from_chunk, buffer.data() + written);
+          written += to_read_from_chunk;
+
+          instruction_chunk_i++;
+          instruction_chunk_pos = 0;
+        }
         bos.putBytes(reinterpret_cast<const uint8_t*>(buffer.data()), instruction.size);
       }
       else {
