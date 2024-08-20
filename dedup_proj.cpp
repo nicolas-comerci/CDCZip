@@ -618,11 +618,19 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
         uint64_t candidate_backwards_extended_size = 0;
         // If any of the offsets is 0 then there is no way we can backtrack (similar_chunk_pos and/or current_chunk_pos already overflowed)
         if (candidate_similar_chunk_offset > 0 && minichunk_offset > 0) {
-          while (
-            current_chunk_pos >= unaccounted_data_start_pos &&
-            similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
-            ) {
-            candidate_backwards_extended_size++;
+          while (similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]) {
+            if (current_chunk_pos >= unaccounted_data_start_pos) {
+              candidate_backwards_extended_size++;
+            }
+            else if (!result.instructions.empty() && result.instructions.back().type == LZInstructionType::INSERT) {
+              auto& prev_instruction = result.instructions.back();
+              prev_instruction.size--;
+              candidate_backwards_extended_size++;
+              if (prev_instruction.size == 0) {
+                result.instructions.pop_back();
+              }
+            }
+
             if (similar_chunk_pos == 0 || current_chunk_pos == 0) break;
             similar_chunk_pos--;
             current_chunk_pos--;
@@ -635,9 +643,12 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
         current_chunk_pos = minichunk_offset + minichunk_len;
         while (
           similar_chunk_pos < similar_chunk.length &&
-          current_chunk_pos < (chunk.length - end_matching_data_len) &&
+          current_chunk_pos < chunk.length &&
           similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
           ) {
+          if (current_chunk_pos >= chunk.length - end_matching_data_len) {
+            end_matching_data_len--;
+          }
           candidate_extended_size++;
           similar_chunk_pos++;
           current_chunk_pos++;
@@ -765,11 +776,19 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
         uint64_t candidate_backwards_extended_size = 0;
         // If any of the offsets is 0 then there is no way we can backtrack (similar_chunk_pos and/or current_chunk_pos already overflowed)
         if (candidate_similar_chunk_offset > 0 && minichunk_offset > 0) {
-          while (
-            current_chunk_pos >= unaccounted_data_start_pos &&
-            similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
-            ) {
-            candidate_backwards_extended_size++;
+          while (similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]) {
+            if (current_chunk_pos >= unaccounted_data_start_pos) {
+              candidate_backwards_extended_size++;
+            }
+            else if (!result.instructions.empty() && result.instructions.back().type == LZInstructionType::INSERT) {
+              auto& prev_instruction = result.instructions.back();
+              prev_instruction.size--;
+              candidate_backwards_extended_size++;
+              if (prev_instruction.size == 0) {
+                result.instructions.pop_back();
+              }
+            }
+            
             if (similar_chunk_pos == 0 || current_chunk_pos == 0) break;
             similar_chunk_pos--;
             current_chunk_pos--;
@@ -782,9 +801,12 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
         current_chunk_pos = minichunk_offset + minichunk_len;
         while (
           similar_chunk_pos < similar_chunk.length &&
-          current_chunk_pos < (chunk.length - end_matching_data_len) &&
+          current_chunk_pos < chunk.length &&
           similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
           ) {
+          if (current_chunk_pos >= chunk.length - end_matching_data_len) {
+            end_matching_data_len--;
+          }
           candidate_extended_size++;
           similar_chunk_pos++;
           current_chunk_pos++;
