@@ -20,6 +20,7 @@
 #include "contrib/ssdeep/fuzzy.h"
 
 // Resemblance detection support
+#include <deque>
 #include <filesystem>
 #include <ranges>
 #include <unordered_set>
@@ -164,6 +165,11 @@ namespace utility {
     // Set a chunk's data to a future chunk's data, as the previous chunks will be deleted first as the context window moves.
     void setData(CDChunk& otherChunk) {
       data = otherChunk.data;
+      _data.reset();
+    }
+
+    void deleteData() {
+      data = nullptr;
       _data.reset();
     }
   };
@@ -928,16 +934,27 @@ std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(std::vector<utilit
 
 class LZInstructionManager {
   std::vector<utility::CDChunk>* chunks;
-  std::vector<LZInstruction> instructions;
+  std::deque<LZInstruction> instructions;
+
+  std::ostream* ostream;
+  WrappedOStreamOutputStream output_stream;
+  BitOutputStream bit_output_stream;
 
   const bool use_match_extension_backwards;
   const bool use_match_extension;
 
   uint64_t estimated_savings = 0;
+  uint64_t outputted_up_to_offset = 0;
 
 public:
-  LZInstructionManager(std::vector<utility::CDChunk>* _chunks, bool _use_match_extension_backwards, bool _use_match_extension)
-    : chunks(_chunks), use_match_extension_backwards(_use_match_extension_backwards), use_match_extension(_use_match_extension) {}
+  explicit LZInstructionManager(std::vector<utility::CDChunk>* _chunks, bool _use_match_extension_backwards, bool _use_match_extension, std::ostream* _ostream)
+    : chunks(_chunks), ostream(_ostream), output_stream(_ostream), bit_output_stream(output_stream),
+      use_match_extension_backwards(_use_match_extension_backwards), use_match_extension(_use_match_extension) {}
+
+  ~LZInstructionManager() {
+    bit_output_stream.flush();
+    ostream->flush();
+  }
 
   uint64_t instructionCount() const {
     return instructions.size();
@@ -947,7 +964,7 @@ public:
     return estimated_savings;
   }
 
-  void addInstruction(LZInstruction&& instruction, uint64_t current_offset, bool verify = false) {
+  void addInstruction(LZInstruction&& instruction, uint64_t current_offset, bool verify = true, std::optional<uint64_t> earliest_allowed_offset = std::nullopt) {
 #ifndef NDEBUG
     if (instruction.type == LZInstructionType::INSERT && instruction.offset != current_offset) {
       std::cout << "INSERT LZInstruction added is not at current offset!" << std::flush;
@@ -979,7 +996,7 @@ public:
         verify_buffer_instruction_data.resize(prevInstruction->size + instruction.size);
 
         std::fstream verify_file{};
-        verify_file.open("C:\\Users\\Administrator\\Desktop\\fastcdc_test\\motherload.tar.pcf", std::ios_base::in | std::ios_base::binary);
+        verify_file.open("C:\\Users\\Administrator\\Desktop\\fastcdc_test\\sims.tar.pcf", std::ios_base::in | std::ios_base::binary);
         const auto data_count = prevInstruction->size + instruction.size;
         // Read original data
         verify_file.seekg(current_offset - prevInstruction->size);
@@ -996,7 +1013,8 @@ public:
         }
       }
 
-      if (use_match_extension_backwards && instruction.type == LZInstructionType::COPY) {
+      const bool can_backwards_extend_instruction = !earliest_allowed_offset.has_value() || instruction.offset > *earliest_allowed_offset;
+      if (use_match_extension_backwards && instruction.type == LZInstructionType::COPY && can_backwards_extend_instruction) {
         auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset - 1);
         utility::CDChunk* instruction_chunk = &(*chunks)[instruction_chunk_i];
 #ifndef NDEBUG
@@ -1007,8 +1025,8 @@ public:
 #endif
 
         uint64_t prevInstruction_offset = current_offset;
-
-        while (!instructions.empty()) {
+        const bool can_backwards_extend_prevInstruction = !earliest_allowed_offset.has_value() || prevInstruction_offset > *earliest_allowed_offset;
+        while (!instructions.empty() && can_backwards_extend_prevInstruction) {
           prevInstruction = &instructions.back();
           // TODO: figure out why this happens, most likely some match extension is not properly cleaning up INSERTs that are shrunk into nothingness
           if (prevInstruction->size == 0) {
@@ -1045,6 +1063,16 @@ public:
             instruction.size++;
             // Otherwise I would end up double counting savings when adding the instruction at the end
             if (prevInstruction->type == LZInstructionType::COPY) estimated_savings--;
+
+            // Can't keep extending backwards, any previous data is disallowed (presumably to accomodate max matching distance)
+            if (earliest_allowed_offset.has_value() && prevInstruction_offset < *earliest_allowed_offset) {
+              stop_matching = true;
+              break;
+            }
+            if (earliest_allowed_offset.has_value() && instruction.offset < *earliest_allowed_offset) {
+              stop_matching = true;
+              break;
+            }
 
             if (instruction_chunk_pos != 0) {
               instruction_chunk_pos--;
@@ -1085,39 +1113,43 @@ public:
         }
       }
       else if (use_match_extension && prevInstruction->type == LZInstructionType::COPY) {
-        uint64_t prevInstruction_chunk_offset = prevInstruction->offset + prevInstruction->size;
-        auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_chunk_offset);
-        utility::CDChunk* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
+        uint64_t prevInstruction_offset = prevInstruction->offset + prevInstruction->size;
 
-        auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
-        utility::CDChunk* instruction_chunk = &(*chunks)[instruction_chunk_i];
+        const bool can_forward_extend_prevInstruction = !earliest_allowed_offset.has_value() || prevInstruction_offset >= *earliest_allowed_offset;
+        if (can_forward_extend_prevInstruction) {
+          auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_offset);
+          utility::CDChunk* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
 
-        while (instruction.size > 0) {
-          if (*(prevInstruction_chunk->data + prevInstruction_chunk_pos) != *(instruction_chunk->data + instruction_chunk_pos)) {
-            break;
-          }
+          auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
+          utility::CDChunk* instruction_chunk = &(*chunks)[instruction_chunk_i];
 
-          prevInstruction->size++;
-          instruction.offset++;
-          instruction.size--;
-          if (instruction.type == LZInstructionType::INSERT) estimated_savings++;
+          while (instruction.size > 0) {
+            if (*(prevInstruction_chunk->data + prevInstruction_chunk_pos) != *(instruction_chunk->data + instruction_chunk_pos)) {
+              break;
+            }
 
-          prevInstruction_chunk_pos++;
-          if (prevInstruction_chunk_pos == prevInstruction_chunk->length) {
-            prevInstruction_chunk_i++;
-            prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
-            prevInstruction_chunk_pos = 0;
-          }
+            prevInstruction->size++;
+            instruction.offset++;
+            instruction.size--;
+            if (instruction.type == LZInstructionType::INSERT) estimated_savings++;
 
-          if (instruction.size == 0) {
-            break;
-          }
+            prevInstruction_chunk_pos++;
+            if (prevInstruction_chunk_pos == prevInstruction_chunk->length) {
+              prevInstruction_chunk_i++;
+              prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
+              prevInstruction_chunk_pos = 0;
+            }
 
-          instruction_chunk_pos++;
-          if (instruction_chunk_pos == instruction_chunk->length) {
-            instruction_chunk_i++;
-            instruction_chunk = &(*chunks)[instruction_chunk_i];
-            instruction_chunk_pos = 0;
+            if (instruction.size == 0) {
+              break;
+            }
+
+            instruction_chunk_pos++;
+            if (instruction_chunk_pos == instruction_chunk->length) {
+              instruction_chunk_i++;
+              instruction_chunk = &(*chunks)[instruction_chunk_i];
+              instruction_chunk_pos = 0;
+            }
           }
         }
       }
@@ -1125,7 +1157,7 @@ public:
       prevInstruction = &instructions.back();
       if (verify) {
         std::fstream verify_file{};
-        verify_file.open("C:\\Users\\Administrator\\Desktop\\fastcdc_test\\motherload.tar.pcf", std::ios_base::in | std::ios_base::binary);
+        verify_file.open("C:\\Users\\Administrator\\Desktop\\fastcdc_test\\sims.tar.pcf", std::ios_base::in | std::ios_base::binary);
         const auto data_count = prevInstruction->size + instruction.size;
 
         verify_buffer_orig_data.resize(data_count);
@@ -1179,16 +1211,18 @@ public:
     if (prevInstruction->type == LZInstructionType::COPY) estimated_savings -= size;
   }
 
-  void dump(std::istream& istream, std::ostream& ostream, bool verify_copies = false) const {
+  void dump(std::istream& istream, bool verify_copies = true, std::optional<uint64_t> up_to_offset = std::nullopt) {
     std::vector<char> buffer;
     std::vector<char> verify_buffer;
-    auto output_stream = WrappedOStreamOutputStream(&ostream);
-    auto bos = BitOutputStream(output_stream);
 
-    uint64_t offset = 0;
-    for (const auto& instruction : instructions) {
-      bos.put(instruction.type, 8);
-      bos.putVLI(instruction.size);
+    auto prev_outputted_up_to_offset = outputted_up_to_offset;
+    while (!instructions.empty()) {
+      if (up_to_offset.has_value() && outputted_up_to_offset > *up_to_offset) break;
+      auto instruction = std::move(instructions.front());
+      instructions.pop_front();
+
+      bit_output_stream.put(instruction.type, 8);
+      bit_output_stream.putVLI(instruction.size);
       if (instruction.type == LZInstructionType::INSERT) {
         auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
         buffer.resize(instruction.size);
@@ -1202,29 +1236,29 @@ public:
           instruction_chunk_i++;
           instruction_chunk_pos = 0;
         }
-        bos.putBytes(reinterpret_cast<const uint8_t*>(buffer.data()), instruction.size);
+        bit_output_stream.putBytes(reinterpret_cast<const uint8_t*>(buffer.data()), instruction.size);
       }
       else {
-        bos.putVLI(offset - instruction.offset);
+        bit_output_stream.putVLI(outputted_up_to_offset - instruction.offset);
         if (verify_copies) {
           istream.seekg(instruction.offset);
           buffer.resize(instruction.size);
           istream.read(buffer.data(), instruction.size);
 
-          istream.seekg(offset);
+          istream.seekg(outputted_up_to_offset);
           verify_buffer.resize(instruction.size);
           istream.read(verify_buffer.data(), instruction.size);
 
           if (std::memcmp(verify_buffer.data(), buffer.data(), instruction.size) != 0) {
-            std::cout << "Error while verifying outputted match at offset " + std::to_string(offset) + "\n" << std::flush;
+            std::cout << "Error while verifying outputted match at offset " + std::to_string(outputted_up_to_offset) + "\n" << std::flush;
+            std::cout << "With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n" << std::flush;
             exit(1);
           }
         }
       }
-      offset += instruction.size;
+      prev_outputted_up_to_offset = outputted_up_to_offset;
+      outputted_up_to_offset += instruction.size;
     }
-    bos.flush();
-    ostream.flush();
   }
 };
 
@@ -1233,16 +1267,16 @@ int main(int argc, char* argv[])
   //get_char_with_echo();
   std::string file_path{ argv[1] };
   auto file_size = std::filesystem::file_size(file_path);
-  auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
-  if (!file_stream.is_open()) {
-    std::cout << "Can't read file\n";
-    return 1;
-  }
   if (argc > 3) {
     std::cout << "Invalid command line" << std::flush;
     return 1;
   }
   if (argc == 3) {  // decompress
+    auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
+    if (!file_stream.is_open()) {
+      std::cout << "Can't read file\n";
+      return 1;
+    }
     auto decompress_start_time = std::chrono::high_resolution_clock::now();
 
     std::vector<char> buffer;
@@ -1342,7 +1376,6 @@ int main(int argc, char* argv[])
   //std::vector<faiss::idx_t> search_result_labels(5 * batch_size, -1);
   //printf("is_trained = %s\n", index.is_trained ? "true" : "false");
 
-  auto wrapped_file = IStreamWrapper(&file_stream);
   uint64_t total_size = 0;
   uint64_t deduped_size = 0;
   uint64_t delta_compressed_approx_size = 0;
@@ -1400,14 +1433,22 @@ int main(int argc, char* argv[])
   const bool use_match_extension_backwards = true;
   const bool verify_delta_coding = false;
 
+  static constexpr uint64_t max_match_distance = static_cast<uint64_t>(2) * 1024 * 1024 * 1024;//std::numeric_limits<uint64_t>::max();
+  uint64_t first_non_out_of_range_chunk_i = 0;
+
   std::vector<utility::CDChunk> chunks{};
   uint64_t chunk_generator_execution_time_ns = 0;
   uint64_t hashing_execution_time_ns = 0;
   uint64_t simhashing_execution_time_ns = 0;
-  auto total_runtime_start_time = std::chrono::high_resolution_clock::now();  
-  auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
+  auto total_runtime_start_time = std::chrono::high_resolution_clock::now();
 
-  LZInstructionManager lz_manager { &chunks, use_match_extension_backwards, use_match_extension };
+  auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
+  if (!file_stream.is_open()) {
+    std::cout << "Can't read file\n";
+    return 1;
+  }
+  auto wrapped_file = IStreamWrapper(&file_stream);
+  auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
 
   std::optional<uint64_t> similarity_locality_anchor_i{};
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
@@ -1419,6 +1460,9 @@ int main(int argc, char* argv[])
   std::vector<uint8_t> verify_buffer{};
   std::vector<uint8_t> verify_buffer_delta{};
 
+  auto dump_file = std::fstream(file_path + ".ddp", std::ios::out | std::ios::binary | std::ios::trunc);
+  LZInstructionManager lz_manager{ &chunks, use_match_extension_backwards, use_match_extension, &dump_file };
+
   static constexpr auto similar_chunk_tuple_cmp = [](const std::tuple<uint64_t, uint64_t>& a, const std::tuple<uint64_t, uint64_t>& b) {
     // 1st member is hamming dist, less hamming dist, better result, we want those tuple first, so we say they compare as lesser
     // 2nd member is chunk idx, more means more recent chunks, larger idx, to be prioritized because they are closer (locality principle)
@@ -1426,6 +1470,46 @@ int main(int argc, char* argv[])
     return false;
   };
   while (generated_chunk.has_value()) {
+    const auto earliest_allowed_offset = total_size > max_match_distance ? total_size - max_match_distance : 0;
+    lz_manager.dump(verify_file_stream, false, earliest_allowed_offset);
+    while (!chunks.empty()) {
+      auto& previous_chunk = chunks[first_non_out_of_range_chunk_i];
+      if (previous_chunk.offset + previous_chunk.length >= earliest_allowed_offset) break;
+
+      // Delete its data
+      previous_chunk.deleteData();
+
+      // Remove the out of range chunks from the indexes so they can't be used for dedup or delta
+      auto& hash_vec = known_hashes[previous_chunk.hash];
+      if (hash_vec.size() == 1) {
+        known_hashes.erase(previous_chunk.hash);
+      }
+      else {
+        hash_vec.erase(std::ranges::find(hash_vec, first_non_out_of_range_chunk_i));
+      }
+
+      if (use_generalized_resemblance_detection) {
+        const auto base = hamming_base(previous_chunk.lsh);
+        if (simhashes_dict[base] == first_non_out_of_range_chunk_i) {
+          simhashes_dict.erase(base);
+        }
+      }
+
+      if (use_feature_extraction) {
+        for (auto& sf : previous_chunk.super_features) {
+          auto& chunk_idx_vec = superfeatures_dict[sf];
+          if (chunk_idx_vec.size() == 1) {
+            superfeatures_dict.erase(sf);
+          }
+          else {
+            superfeatures_dict[sf].erase(first_non_out_of_range_chunk_i);
+          }
+        }
+      }
+
+      first_non_out_of_range_chunk_i++;
+    }
+
     chunks.emplace_back(std::move(*generated_chunk));
     auto& chunk = chunks.back();
 
@@ -1480,8 +1564,14 @@ int main(int argc, char* argv[])
         uint64_t best_candidate_i = 0;
         for (uint64_t i = 1; i <= resemblance_attempt_window && i <= chunk_i; i++) {
           const auto candidate_i = chunk_i - i;
-          const auto& similar_candidate = chunks[candidate_i];
-          const auto new_dist = hamming_distance(chunk.lsh, similar_candidate.lsh);
+          const auto& similar_chunk = chunks[candidate_i];
+          if (similar_chunk.offset + similar_chunk.length < earliest_allowed_offset) break;
+          // TODO: if the similar_chunk is just at the edge of the earliest_allowed_offset it might appear usable (and even good in
+          // terms of the potential saved size) but all COPYs might end up replaced by INSERTs because part of the chunk is already unreachable.
+          // Find out if it might be a better idea to skip them, penalize their distance, or anything of the sort so if there is some other
+          // good suitable chunk that is not partially unreachable it is used instead
+
+          const auto new_dist = hamming_distance(chunk.lsh, similar_chunk.lsh);
           if (
             new_dist <= max_allowed_dist &&
             // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk
@@ -1516,9 +1606,17 @@ int main(int argc, char* argv[])
           for (const auto& sf : chunk.super_features) {
             if (superfeatures_dict.contains(sf)) {
               for (const auto& candidate_i : superfeatures_dict[sf]) {
+                const auto& similar_chunk = chunks[candidate_i];
+                if (similar_chunk.offset + similar_chunk.length < earliest_allowed_offset) {
+                  continue;
+                }
+                // TODO: if the similar_chunk is just at the edge of the earliest_allowed_offset it might appear usable (and even good in
+                // terms of the potential saved size) but all COPYs might end up replaced by INSERTs because part of the chunk is already unreachable.
+                // Find out if it might be a better idea to skip them, penalize their distance, or anything of the sort so if there is some other
+                // good suitable chunk that is not partially unreachable it is used instead
                 chunk_rank[candidate_i] += 1;
 
-                const auto new_dist = hamming_distance(chunk.lsh, chunks[candidate_i].lsh);
+                const auto new_dist = hamming_distance(chunk.lsh, similar_chunk.lsh);
                 if (
                   new_dist <= max_allowed_dist &&
                   // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk
@@ -1710,6 +1808,12 @@ int main(int argc, char* argv[])
             if (similar_candidate_chunk_i >= backtrack_chunk_i || anchor_instance_chunk_i == 0) continue;
 
             const auto& similar_chunk = chunks[similar_candidate_chunk_i];
+            if (similar_chunk.offset + similar_chunk.length < earliest_allowed_offset) continue;
+            // TODO: if the similar_chunk is just at the edge of the earliest_allowed_offset it might appear usable (and even good in
+            // terms of the potential saved size) but all COPYs might end up replaced by INSERTs because part of the chunk is already unreachable.
+            // Find out if it might be a better idea to skip them, penalize their distance, or anything of the sort so if there is some other
+            // good suitable chunk that is not partially unreachable it is used instead
+
             const auto new_dist = hamming_distance(backtrack_chunk.lsh, similar_chunk.lsh);
             if (
               new_dist <= max_allowed_dist &&
@@ -1734,8 +1838,10 @@ int main(int argc, char* argv[])
           DeltaEncodingResult best_encoding_result;
           for (const auto& [similar_chunk_dist, similar_chunk_i] : backwards_dupadj_similar_chunks) {
             if (only_try_min_dist_delta_matches && best_similar_chunk_dist < similar_chunk_dist) continue;
+            auto& similar_chunk = chunks[similar_chunk_i];
+            if (similar_chunk.offset + similar_chunk.length < earliest_allowed_offset) continue;
 
-            const DeltaEncodingResult encoding_result = simulate_delta_encoding_func(backtrack_chunk, chunks[similar_chunk_i], simhash_chunk_size);
+            const DeltaEncodingResult encoding_result = simulate_delta_encoding_func(backtrack_chunk, similar_chunk, simhash_chunk_size);
             const auto& saved_size = encoding_result.estimated_savings;
             if (saved_size > best_saved_size) {
               best_saved_size = saved_size;
@@ -1777,12 +1883,24 @@ int main(int argc, char* argv[])
 
           // Iterating in reverse as the results are ordered from latest to earliest chunk, and they need to be added from earliest to latest
           lz_manager.revertInstructionSize(revertSize);
-          auto offset = chunk.offset - revertSize;
+          auto lz_offset = chunk.offset - revertSize;
           for (auto& delta_result : std::ranges::reverse_view(dupadj_results)) {
             for (auto& instruction : delta_result.instructions) {
+              if (instruction.type == LZInstructionType::COPY && instruction.offset < earliest_allowed_offset) {
+                // We need to replace any data copy attempt from before the earliest_allowed_offset with an INSERT from current data
+                // Otherwise we would be exceeding the maximum allowed match distance
+                const auto shrink_size_needed = std::min<uint64_t>(earliest_allowed_offset - instruction.offset, instruction.size);
+                instruction.offset += shrink_size_needed;
+                instruction.size -= shrink_size_needed;
+                lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = lz_offset, .size = shrink_size_needed }, lz_offset, false, earliest_allowed_offset);
+                lz_offset += shrink_size_needed;
+
+                // If COPY instruction was in its totality out of range then it was fully shrunk and there is nothing here to add anymore
+                if (instruction.size == 0) continue;
+              }
               const auto instruction_size = instruction.size;
-              lz_manager.addInstruction(std::move(instruction), offset);
-              offset += instruction_size;
+              lz_manager.addInstruction(std::move(instruction), lz_offset, false, earliest_allowed_offset);
+              lz_offset += instruction_size;
             }
           }
         }
@@ -1790,13 +1908,25 @@ int main(int argc, char* argv[])
 
       auto lz_offset = chunk.offset;
       for (auto& instruction : new_instructions) {
-        const auto old_lz_offset = lz_offset;
-        lz_offset += instruction.size;
-        lz_manager.addInstruction(std::move(instruction), old_lz_offset);
+        if (instruction.type == LZInstructionType::COPY && instruction.offset < earliest_allowed_offset) {
+          // We need to replace any data copy attempt from before the earliest_allowed_offset with an INSERT from current data
+          // Otherwise we would be exceeding the maximum allowed match distance
+          const auto shrink_size_needed = std::min<uint64_t>(earliest_allowed_offset - instruction.offset, instruction.size);
+          instruction.offset += shrink_size_needed;
+          instruction.size -= shrink_size_needed;
+          lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = lz_offset, .size = shrink_size_needed }, lz_offset, false, earliest_allowed_offset);
+          lz_offset += shrink_size_needed;
+
+          // If COPY instruction was in its totality out of range then it was fully shrunk and there is nothing here to add anymore
+          if (instruction.size == 0) continue;
+        }
+        const auto instruction_size = instruction.size;
+        lz_manager.addInstruction(std::move(instruction), lz_offset, false, earliest_allowed_offset);
+        lz_offset += instruction_size;
       }
     }
     else {
-      lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = chunk.offset, .size = chunk.length }, chunk.offset);
+      lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = chunk.offset, .size = chunk.length }, chunk.offset, false, earliest_allowed_offset);
     }
 
     chunk_i++;
@@ -1809,11 +1939,8 @@ int main(int argc, char* argv[])
 
   auto total_dedup_end_time = std::chrono::high_resolution_clock::now();
 
-  // Dump results
-  auto dump_file = std::fstream(file_path + ".ddp", std::ios::out | std::ios::binary | std::ios::trunc);
-  file_stream.close();
-  file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
-  lz_manager.dump(file_stream, dump_file);
+  // Dump any remaining data
+  lz_manager.dump(verify_file_stream);
 
   auto dump_end_time = std::chrono::high_resolution_clock::now();
 
