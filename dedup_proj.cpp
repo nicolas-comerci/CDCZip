@@ -944,7 +944,9 @@ class LZInstructionManager {
   const bool use_match_extension;
 
   uint64_t estimated_savings = 0;
+  uint64_t omitted_small_match_size = 0;
   uint64_t outputted_up_to_offset = 0;
+  uint64_t outputted_lz_instructions = 0;
 
 public:
   explicit LZInstructionManager(std::vector<utility::CDChunk>* _chunks, bool _use_match_extension_backwards, bool _use_match_extension, std::ostream* _ostream)
@@ -957,11 +959,15 @@ public:
   }
 
   uint64_t instructionCount() const {
-    return instructions.size();
+    return outputted_lz_instructions;
   }
 
   uint64_t estimatedSavings() const {
     return estimated_savings;
+  }
+
+  uint64_t omittedSmallMatchSize() const {
+    return omitted_small_match_size;
   }
 
   void addInstruction(LZInstruction&& instruction, uint64_t current_offset, bool verify = true, std::optional<uint64_t> earliest_allowed_offset = std::nullopt) {
@@ -1189,6 +1195,7 @@ public:
       // we just extend this insert so that we save that overhead
       if (instruction.type == LZInstructionType::INSERT && prevInstruction->type == LZInstructionType::COPY && prevInstruction->size < 128) {
         estimated_savings -= prevInstruction->size;
+        omitted_small_match_size += prevInstruction->size;
         prevInstruction->type = LZInstructionType::INSERT;
         prevInstruction->offset = instruction.offset - prevInstruction->size;
         prevInstruction->size = instruction.size + prevInstruction->size;
@@ -1258,6 +1265,7 @@ public:
       }
       prev_outputted_up_to_offset = outputted_up_to_offset;
       outputted_up_to_offset += instruction.size;
+      outputted_lz_instructions++;
     }
   }
 };
@@ -1518,6 +1526,8 @@ int main(int argc, char* argv[])
     if (chunk_i % 50000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(generator_ctx.offset) / file_size) * 100) + "\n" << std::flush;
     total_size += chunk.length;
 
+    bool is_duplicate_chunk = false;
+
     // make hashes
     const auto hashing_start_time = std::chrono::high_resolution_clock::now();
     /*
@@ -1709,7 +1719,6 @@ int main(int argc, char* argv[])
           if (only_try_best_delta_match) break;
         }
         if (best_saved_size > 0 && best_saved_size > min_delta_saving) {
-          delta_compressed_approx_size += best_saved_size;
           delta_compressed_chunk_count++;
           similarity_locality_anchor_i = best_similar_chunk_i;
         }
@@ -1755,7 +1764,7 @@ int main(int argc, char* argv[])
       }
     }
     else {
-      deduped_size += chunk.length;
+      is_duplicate_chunk = true;
       const auto& previous_chunk_i = known_hashes[chunk.hash].back();
       similarity_locality_anchor_i = previous_chunk_i;
       // Important to copy LSH in case this duplicate chunk ends up being candidate for Delta encoding via DupAdj or something
@@ -1862,7 +1871,6 @@ int main(int argc, char* argv[])
               instruction.offset += instruction.type == LZInstructionType::INSERT ? backtrack_chunk.offset : similar_chunk.offset;
             }
 
-            delta_compressed_approx_size += best_saved_size;
             delta_compressed_chunk_count++;
             backtrack_similarity_anchor_i = best_candidate_i;
 
@@ -1898,9 +1906,21 @@ int main(int argc, char* argv[])
                 // If COPY instruction was in its totality out of range then it was fully shrunk and there is nothing here to add anymore
                 if (instruction.size == 0) continue;
               }
+
               const auto instruction_size = instruction.size;
+              const auto prev_estimated_savings = lz_manager.estimatedSavings();
+              const auto instruction_type = instruction.type;
               lz_manager.addInstruction(std::move(instruction), lz_offset, false, earliest_allowed_offset);
               lz_offset += instruction_size;
+
+              if (instruction_type == LZInstructionType::COPY) {
+                // If the instruction was a COPY we need to adapt the data reduction counts
+                // The LZManager might have extended or rejected the instruction, so we need to handle that
+                // TODO: this is actually not accurate, some match extension is counted as regular dedup/delta reduction
+                // but at least the count won't overflow anymore
+                const auto instruction_savings = lz_manager.estimatedSavings() - prev_estimated_savings;
+                delta_compressed_approx_size += std::min(instruction_size, instruction_savings);
+              }
             }
           }
         }
@@ -1920,9 +1940,27 @@ int main(int argc, char* argv[])
           // If COPY instruction was in its totality out of range then it was fully shrunk and there is nothing here to add anymore
           if (instruction.size == 0) continue;
         }
+        
         const auto instruction_size = instruction.size;
+        const auto prev_estimated_savings = lz_manager.estimatedSavings();
+        const auto instruction_type = instruction.type;
         lz_manager.addInstruction(std::move(instruction), lz_offset, false, earliest_allowed_offset);
         lz_offset += instruction_size;
+
+        if (instruction_type == LZInstructionType::COPY) {
+          // If the instruction was a COPY we need to adapt the data reduction counts
+          // The LZManager might have extended or rejected the instruction, so we need to handle that
+          // TODO: this is actually not accurate, some match extension is counted as regular dedup/delta reduction
+          // but at least the count won't overflow anymore
+          const auto instruction_savings = lz_manager.estimatedSavings() - prev_estimated_savings;
+
+          if (is_duplicate_chunk) {
+            deduped_size += std::min(instruction_size, instruction_savings);
+          }
+          else {
+            delta_compressed_approx_size += std::min(instruction_size, instruction_savings);
+          }
+        }
       }
     }
     else {
@@ -1952,18 +1990,21 @@ int main(int argc, char* argv[])
   std::cout << "Total delta compressed chunk count: " + std::to_string(delta_compressed_chunk_count) + "\n" << std::flush;
 
   const auto total_estimated_savings = lz_manager.estimatedSavings();
-  const auto match_extension_saved_size = total_estimated_savings - deduped_size - delta_compressed_approx_size;
+  const auto match_omitted_size = lz_manager.omittedSmallMatchSize();
+  const auto match_extension_saved_size = total_estimated_savings - deduped_size - delta_compressed_approx_size + match_omitted_size;
   // Results stats
   const auto total_size_mbs = total_size / (1024.0 * 1024);
   std::printf("Chunk data total size:    %.1f MB\n", total_size_mbs);
   const auto deduped_size_mbs = deduped_size / (1024.0 * 1024);
   std::printf("Chunk data deduped size:    %.1f MB\n", deduped_size_mbs);
-  const auto total_estimated_savings_mbs = total_estimated_savings / (1024.0 * 1024);
-  std::printf("Total estimated reduced size:    %.1f MB\n", total_estimated_savings_mbs);
   const auto deltaed_size_mbs = delta_compressed_approx_size / (1024.0 * 1024);
   std::printf("Chunk data delta compressed size:    %.1f MB\n", deltaed_size_mbs);
   const auto extension_size_mbs = match_extension_saved_size / (1024.0 * 1024);
   std::printf("Match extended size:    %.1f MB\n", extension_size_mbs);
+  const auto omitted_size_mbs = match_omitted_size / (1024.0 * 1024);
+  std::printf("Match omitted size (matches too small):    %.1f MB\n", omitted_size_mbs);
+  const auto total_estimated_savings_mbs = total_estimated_savings / (1024.0 * 1024);
+  std::printf("Total estimated reduced size:    %.1f MB\n", total_estimated_savings_mbs);
   std::printf("Final size:    %.1f MB\n", total_size_mbs - total_estimated_savings_mbs);
 
   std::printf("\n");
