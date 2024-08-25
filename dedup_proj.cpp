@@ -1478,7 +1478,11 @@ int main(int argc, char* argv[])
     return false;
   };
   while (generated_chunk.has_value()) {
-    const auto earliest_allowed_offset = total_size > max_match_distance ? total_size - max_match_distance : 0;
+    // TODO: BEWARE! lz_manager.estimatedSavings() might count some savings that might go away (because of instructions too small) and in that case
+    // earliest_allowed_offset might change in such a way that chunks might not be out of range even though they should.
+    const auto earliest_allowed_offset = total_size > max_match_distance + lz_manager.estimatedSavings()
+      ? total_size - max_match_distance - lz_manager.estimatedSavings()
+      : 0;
     lz_manager.dump(verify_file_stream, false, earliest_allowed_offset);
     while (!chunks.empty()) {
       auto& previous_chunk = chunks[first_non_out_of_range_chunk_i];
