@@ -165,12 +165,12 @@ namespace utility {
     // Set a chunk's data to a future chunk's data, as the previous chunks will be deleted first as the context window moves.
     void setData(CDChunk& otherChunk) {
       data = otherChunk.data;
-      _data.reset();
+      if (_data != nullptr) _data.reset();
     }
 
     void deleteData() {
       data = nullptr;
-      _data.reset();
+      if (_data != nullptr) _data.reset();
     }
   };
 
@@ -1427,6 +1427,8 @@ int main(int argc, char* argv[])
     simulate_delta_encoding_func = &simulate_delta_encoding_using_minichunks;
   }
 
+  const bool output_disabled = false;
+
   const bool use_dupadj = true;
   const bool use_dupadj_backwards = true;
   const bool use_generalized_resemblance_detection = true;
@@ -1441,14 +1443,14 @@ int main(int argc, char* argv[])
   const bool use_match_extension_backwards = true;
   const bool verify_delta_coding = false;
 
-  static constexpr std::optional<uint64_t> max_match_distance = static_cast<uint64_t>(2) * 1024 * 1024 * 1024;//std::nullopt;
+  const bool is_any_delta_on = use_dupadj || use_dupadj_backwards || use_feature_extraction || use_generalized_resemblance_detection || resemblance_attempt_window > 0;
+  // If nothing is on that would require us to keep the data after we chunk and hash it, discard it
+  const bool use_fat_chunks = !output_disabled || is_any_delta_on || use_match_extension || use_match_extension_backwards;
+
+  static constexpr std::optional<uint64_t> max_match_distance = /*static_cast<uint64_t>(2) * 1024 * 1024 * 1024;*/std::nullopt;
   uint64_t first_non_out_of_range_chunk_i = 0;
 
   std::vector<utility::CDChunk> chunks{};
-  uint64_t chunk_generator_execution_time_ns = 0;
-  uint64_t hashing_execution_time_ns = 0;
-  uint64_t simhashing_execution_time_ns = 0;
-  auto total_runtime_start_time = std::chrono::high_resolution_clock::now();
 
   auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
   if (!file_stream.is_open()) {
@@ -1459,10 +1461,6 @@ int main(int argc, char* argv[])
   auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
 
   std::optional<uint64_t> similarity_locality_anchor_i{};
-  auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
-  auto generated_chunk = fastcdc::chunk_generator(generator_ctx);
-  auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
-  chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
 
   auto verify_file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
   std::vector<uint8_t> verify_buffer{};
@@ -1478,6 +1476,10 @@ int main(int argc, char* argv[])
     return false;
   };
 
+  uint64_t chunk_generator_execution_time_ns = 0;
+  uint64_t hashing_execution_time_ns = 0;
+  uint64_t simhashing_execution_time_ns = 0;
+
   const auto calc_simhash_if_needed = [&simhash_func, &simhashing_execution_time_ns](utility::CDChunk& chunk) {
     if (chunk.minichunks != nullptr) return;
     const auto simhashing_start_time = std::chrono::high_resolution_clock::now();
@@ -1486,13 +1488,22 @@ int main(int argc, char* argv[])
     simhashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(simhashing_end_time - simhashing_start_time).count();
   };
 
+  auto total_runtime_start_time = std::chrono::high_resolution_clock::now();
+
+  auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
+  auto generated_chunk = fastcdc::chunk_generator(generator_ctx);
+  auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
+  chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
+
+  XXH3_state_t* state = XXH3_createState();  // TODO: technically need to free this with XXH3_freeState(state), make RAII container
+
   while (generated_chunk.has_value()) {
     // TODO: BEWARE! lz_manager.estimatedSavings() might count some savings that might go away (because of instructions too small) and in that case
     // earliest_allowed_offset might change in such a way that chunks might not be out of range even though they should.
     const auto earliest_allowed_offset = max_match_distance.has_value() && total_size > *max_match_distance + lz_manager.estimatedSavings()
       ? total_size - *max_match_distance - lz_manager.estimatedSavings()
       : 0;
-    lz_manager.dump(verify_file_stream, false, earliest_allowed_offset);
+    if (!output_disabled) lz_manager.dump(verify_file_stream, false, earliest_allowed_offset);
     while (!chunks.empty()) {
       auto& previous_chunk = chunks[first_non_out_of_range_chunk_i];
       if (previous_chunk.offset + previous_chunk.length >= earliest_allowed_offset) break;
@@ -1551,13 +1562,13 @@ int main(int argc, char* argv[])
     */
     
     // xxHash
-    XXH3_state_t* state = XXH3_createState();
     XXH3_64bits_reset(state);
     XXH3_64bits_update(state, chunk.data, chunk.length);
     chunk.hash = XXH3_64bits_digest(state);
-    XXH3_freeState(state);
     const auto hashing_end_time = std::chrono::high_resolution_clock::now();
     hashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - hashing_start_time).count();
+
+    if (!use_fat_chunks) chunk.deleteData();
 
     std::vector<LZInstruction> new_instructions;
     if (!known_hashes.contains(chunk.hash)) {
@@ -1995,7 +2006,7 @@ int main(int argc, char* argv[])
   auto total_dedup_end_time = std::chrono::high_resolution_clock::now();
 
   // Dump any remaining data
-  lz_manager.dump(verify_file_stream);
+  if (!output_disabled) lz_manager.dump(verify_file_stream);
 
   auto dump_end_time = std::chrono::high_resolution_clock::now();
 
