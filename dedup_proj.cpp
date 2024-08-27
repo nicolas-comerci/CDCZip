@@ -1477,6 +1477,15 @@ int main(int argc, char* argv[])
     if (std::get<0>(a) < std::get<0>(b) || (std::get<0>(a) == std::get<0>(b) && std::get<1>(a) > std::get<1>(b))) return true;
     return false;
   };
+
+  const auto calc_simhash_if_needed = [&simhash_func, &simhashing_execution_time_ns](utility::CDChunk& chunk) {
+    if (chunk.minichunks != nullptr) return;
+    const auto simhashing_start_time = std::chrono::high_resolution_clock::now();
+    std::tie(chunk.lsh, chunk.minichunks, chunk.minichunks_len) = simhash_func(chunk.data, chunk.length, simhash_chunk_size);
+    const auto simhashing_end_time = std::chrono::high_resolution_clock::now();
+    simhashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(simhashing_end_time - simhashing_start_time).count();
+  };
+
   while (generated_chunk.has_value()) {
     // TODO: BEWARE! lz_manager.estimatedSavings() might count some savings that might go away (because of instructions too small) and in that case
     // earliest_allowed_offset might change in such a way that chunks might not be out of range even though they should.
@@ -1552,15 +1561,11 @@ int main(int argc, char* argv[])
 
     std::vector<LZInstruction> new_instructions;
     if (!known_hashes.contains(chunk.hash)) {
-      const auto simhashing_start_time = std::chrono::high_resolution_clock::now();
-      std::tie(chunk.lsh, chunk.minichunks, chunk.minichunks_len) = simhash_func(chunk.data, chunk.length, simhash_chunk_size);
-      const auto simhash_base = hamming_base(chunk.lsh);
-      const auto simhashing_end_time = std::chrono::high_resolution_clock::now();
-      simhashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(simhashing_end_time - simhashing_start_time).count();
-
       // Attempt resemblance detection and delta compression, first by using generalized resemblance detection
       std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> similar_chunks{};
       if (use_generalized_resemblance_detection) {
+        calc_simhash_if_needed(chunk);
+        const auto simhash_base = hamming_base(chunk.lsh);
         if (simhashes_dict.contains(simhash_base)) {
           similar_chunks.emplace(0, simhashes_dict[simhash_base]);
         }
@@ -1572,19 +1577,21 @@ int main(int argc, char* argv[])
       // Resemblance detection on the resemblance attempt window, exploiting the principle of data locality, there is a high likelihood data chunks close
       // to the current chunk are fairly similar, just check distance for all chunks within the window
       if (resemblance_attempt_window > 0 && (similar_chunks.empty() || attempt_multiple_delta_methods)) {
+        calc_simhash_if_needed(chunk);
         std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> resemblance_attempt_window_similar_chunks{};
 
         std::optional<uint64_t> best_candidate_dist{};
         uint64_t best_candidate_i = 0;
         for (uint64_t i = 1; i <= resemblance_attempt_window && i <= chunk_i; i++) {
           const auto candidate_i = chunk_i - i;
-          const auto& similar_chunk = chunks[candidate_i];
+          auto& similar_chunk = chunks[candidate_i];
           if (similar_chunk.offset + similar_chunk.length < earliest_allowed_offset) break;
           // TODO: if the similar_chunk is just at the edge of the earliest_allowed_offset it might appear usable (and even good in
           // terms of the potential saved size) but all COPYs might end up replaced by INSERTs because part of the chunk is already unreachable.
           // Find out if it might be a better idea to skip them, penalize their distance, or anything of the sort so if there is some other
           // good suitable chunk that is not partially unreachable it is used instead
 
+          calc_simhash_if_needed(similar_chunk);
           const auto new_dist = hamming_distance(chunk.lsh, similar_chunk.lsh);
           if (
             new_dist <= max_allowed_dist &&
@@ -1610,6 +1617,7 @@ int main(int argc, char* argv[])
       if (use_feature_extraction && !chunk.feature_sampling_failure) {
         // If we don't have a similar chunk yet, attempt to find one by SuperFeature matching
         if (similar_chunks.empty() || attempt_multiple_delta_methods) {
+          calc_simhash_if_needed(chunk);
           std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> feature_extraction_similar_chunks{};
 
           std::optional<uint64_t> best_candidate_dist{};
@@ -1620,7 +1628,7 @@ int main(int argc, char* argv[])
           for (const auto& sf : chunk.super_features) {
             if (superfeatures_dict.contains(sf)) {
               for (const auto& candidate_i : superfeatures_dict[sf]) {
-                const auto& similar_chunk = chunks[candidate_i];
+                auto& similar_chunk = chunks[candidate_i];
                 if (similar_chunk.offset + similar_chunk.length < earliest_allowed_offset) {
                   continue;
                 }
@@ -1630,6 +1638,7 @@ int main(int argc, char* argv[])
                 // good suitable chunk that is not partially unreachable it is used instead
                 chunk_rank[candidate_i] += 1;
 
+                calc_simhash_if_needed(similar_chunk);
                 const auto new_dist = hamming_distance(chunk.lsh, similar_chunk.lsh);
                 if (
                   new_dist <= max_allowed_dist &&
@@ -1670,6 +1679,7 @@ int main(int argc, char* argv[])
       // If we don't have a similar chunk yet, attempt to find similar block via DARE's DupAdj,
       // checking if the next chunk from the similarity locality anchor is similar to this one
       if (use_dupadj && (similar_chunks.empty() || attempt_multiple_delta_methods)) {
+        calc_simhash_if_needed(chunk);
         std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> dupadj_similar_chunks{};
 
         std::optional<uint64_t> best_candidate_dist{};
@@ -1679,7 +1689,8 @@ int main(int argc, char* argv[])
             const auto similar_candidate_chunk_i = anchor_instance_chunk_i + 1;
             if (similar_candidate_chunk_i == chunk_i) continue;
 
-            const auto& similar_candidate = chunks[similar_candidate_chunk_i];
+            auto& similar_candidate = chunks[similar_candidate_chunk_i];
+            calc_simhash_if_needed(similar_candidate);
             const auto new_dist = hamming_distance(chunk.lsh, similar_candidate.lsh);
             if (
               new_dist <= max_allowed_dist &&
@@ -1810,7 +1821,7 @@ int main(int argc, char* argv[])
         std::vector<DeltaEncodingResult> dupadj_results{};
 
         for (; backtrack_chunk_i > prev_last_reduced_chunk_i; backtrack_chunk_i--) {
-          const auto& backtrack_chunk = chunks[backtrack_chunk_i];
+          auto& backtrack_chunk = chunks[backtrack_chunk_i];
 
           std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> backwards_dupadj_similar_chunks{};
 
@@ -1820,13 +1831,15 @@ int main(int argc, char* argv[])
             const auto similar_candidate_chunk_i = anchor_instance_chunk_i - 1;
             if (similar_candidate_chunk_i >= backtrack_chunk_i || anchor_instance_chunk_i == 0) continue;
 
-            const auto& similar_chunk = chunks[similar_candidate_chunk_i];
+            auto& similar_chunk = chunks[similar_candidate_chunk_i];
             if (similar_chunk.offset + similar_chunk.length < earliest_allowed_offset) continue;
             // TODO: if the similar_chunk is just at the edge of the earliest_allowed_offset it might appear usable (and even good in
             // terms of the potential saved size) but all COPYs might end up replaced by INSERTs because part of the chunk is already unreachable.
             // Find out if it might be a better idea to skip them, penalize their distance, or anything of the sort so if there is some other
             // good suitable chunk that is not partially unreachable it is used instead
 
+            calc_simhash_if_needed(backtrack_chunk);
+            calc_simhash_if_needed(similar_chunk);
             const auto new_dist = hamming_distance(backtrack_chunk.lsh, similar_chunk.lsh);
             if (
               new_dist <= max_allowed_dist &&
