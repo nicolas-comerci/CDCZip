@@ -1441,7 +1441,7 @@ int main(int argc, char* argv[])
   const bool use_match_extension_backwards = true;
   const bool verify_delta_coding = false;
 
-  static constexpr uint64_t max_match_distance = static_cast<uint64_t>(2) * 1024 * 1024 * 1024;//std::numeric_limits<uint64_t>::max();
+  static constexpr std::optional<uint64_t> max_match_distance = static_cast<uint64_t>(2) * 1024 * 1024 * 1024;//std::nullopt;
   uint64_t first_non_out_of_range_chunk_i = 0;
 
   std::vector<utility::CDChunk> chunks{};
@@ -1480,8 +1480,8 @@ int main(int argc, char* argv[])
   while (generated_chunk.has_value()) {
     // TODO: BEWARE! lz_manager.estimatedSavings() might count some savings that might go away (because of instructions too small) and in that case
     // earliest_allowed_offset might change in such a way that chunks might not be out of range even though they should.
-    const auto earliest_allowed_offset = total_size > max_match_distance + lz_manager.estimatedSavings()
-      ? total_size - max_match_distance - lz_manager.estimatedSavings()
+    const auto earliest_allowed_offset = max_match_distance.has_value() && total_size > *max_match_distance + lz_manager.estimatedSavings()
+      ? total_size - *max_match_distance - lz_manager.estimatedSavings()
       : 0;
     lz_manager.dump(verify_file_stream, false, earliest_allowed_offset);
     while (!chunks.empty()) {
