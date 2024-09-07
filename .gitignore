@@ -61,3 +61,12 @@ cmake-build-relwithdebinfo/
 7zPlugin/PrecompCodec/Debug/
 7zPlugin/PrecompCodec/Release/
 cmake-build-default/
+
+# Datasets
+*.tar
+*.xz
+*.gz
+*.ddp
+*.qcow2
+*.qcow2c
+*.img

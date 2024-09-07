@@ -139,38 +139,33 @@ namespace constants {
 
 namespace utility {
   class CDChunk {
-    std::unique_ptr<uint8_t[]> _data;
   public:
     uint64_t offset;
     uint32_t length;
-    // Non owning pointer to the data, the data is owned on _data, and might actually be owned by another chunk, never ever free this.
-    uint8_t* data;
+    std::shared_ptr<uint8_t[]> data;
     std::bitset<64> hash;
     std::bitset<64> lsh;
     std::array<uint32_t, 4> super_features{};
     bool feature_sampling_failure = true;
     // Smaller chunks inside this chunk, used for delta compression
     std::shared_ptr<uint32_t[]> minichunks{};
-    uint32_t minichunks_len;
+    uint32_t minichunks_len = 0;
 
-    CDChunk(uint64_t _offset, uint32_t _length) : offset(_offset), length(_length), data(nullptr) {}
-    CDChunk(uint64_t _offset, uint32_t _length, uint8_t* _data)
-      : _data(std::make_unique_for_overwrite<uint8_t[]>(_length)), offset(_offset), length(_length)
+    explicit CDChunk(uint64_t _offset, uint32_t _length) : offset(_offset), length(_length), data(nullptr) {}
+    explicit CDChunk(uint64_t _offset, uint32_t _length, uint8_t* _data)
+      : offset(_offset), length(_length), data(std::make_shared_for_overwrite<uint8_t[]>(_length))
     {
-      std::copy_n(_data, _length, this->_data.get());
-      data = this->_data.get();
+      std::copy_n(_data, _length, data.get());
     }
 
     // This is used to set the chunk's data to a span of data owned by another (hopefully duplicate) chunk, so we can save space.
     // Set a chunk's data to a future chunk's data, as the previous chunks will be deleted first as the context window moves.
     void setData(CDChunk& otherChunk) {
       data = otherChunk.data;
-      if (_data != nullptr) _data.reset();
     }
 
     void deleteData() {
       data = nullptr;
-      if (_data != nullptr) _data.reset();
     }
   };
 
@@ -347,7 +342,6 @@ namespace fastcdc {
     uint32_t min_size;
     uint32_t avg_size;
     uint32_t max_size;
-    bool fat;
     bool extract_features;
 
     uint32_t bits;
@@ -361,8 +355,8 @@ namespace fastcdc {
     uint32_t blob_len = 0;
     std::span<unsigned char>::iterator blob_it;
 
-    ChunkGeneratorContext(IStreamLike* _stream, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _fat, bool _extract_features = false)
-      : stream(_stream), min_size(_min_size), avg_size(_avg_size), max_size(_max_size), fat(_fat), extract_features(_extract_features) {
+    ChunkGeneratorContext(IStreamLike* _stream, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _extract_features = false)
+      : stream(_stream), min_size(_min_size), avg_size(_avg_size), max_size(_max_size), extract_features(_extract_features) {
       bits = utility::logarithm2(avg_size);
       mask_s = utility::mask(bits + 1);
       mask_l = utility::mask(bits - 1);
@@ -375,7 +369,7 @@ namespace fastcdc {
       blob_it = blob.begin();
     }
     ChunkGeneratorContext(std::span<uint8_t> _blob, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _fat, bool _extract_features = false)
-      : min_size(_min_size), avg_size(_avg_size), max_size(_max_size), fat(_fat), extract_features(_extract_features), blob(_blob) {
+      : min_size(_min_size), avg_size(_avg_size), max_size(_max_size), extract_features(_extract_features), blob(_blob) {
       bits = utility::logarithm2(avg_size);
       mask_s = utility::mask(bits + 1);
       mask_l = utility::mask(bits - 1);
@@ -386,9 +380,9 @@ namespace fastcdc {
     }
   };
 
-  std::optional<utility::CDChunk> chunk_generator(ChunkGeneratorContext& context) {
-    std::optional<utility::CDChunk> chunk{};
-    if (context.blob_len == 0) return chunk;
+  std::optional<std::tuple<utility::CDChunk, std::span<uint8_t>>> chunk_generator(ChunkGeneratorContext& context) {
+    std::optional<std::tuple<utility::CDChunk, std::span<uint8_t>>> result{};
+    if (context.blob_len == 0) return result;
 
     if (context.blob_len <= context.max_size && context.stream != nullptr) {
       std::memmove(context.blob.data(), &*context.blob_it, context.blob_len);
@@ -404,23 +398,19 @@ namespace fastcdc {
     else {
       cp = cdc_offset(std::span(context.blob_it, context.blob_len), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l);
     }
-    if (context.fat) {
-      chunk.emplace(context.offset, cp, &*context.blob_it);
-    }
-    else {
-      chunk.emplace(context.offset, cp);
-    }
+    result.emplace(utility::CDChunk(context.offset, cp), std::span(context.blob_it, cp));
     if (!features.empty()) {
+      auto& chunk = std::get<0>(*result);
       for (uint64_t i = 0; i < 4; i++) {
         // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
-        chunk->super_features[i] = XXH32(features.data() + static_cast<ptrdiff_t>(i * 4), 16, constants::CDS_SAMPLING_MASK);
+        chunk.super_features[i] = XXH32(features.data() + static_cast<ptrdiff_t>(i * 4), 16, constants::CDS_SAMPLING_MASK);
       }
-      chunk->feature_sampling_failure = false;
+      chunk.feature_sampling_failure = false;
     }
     context.offset += cp;
     context.blob_it += cp;
     context.blob_len -= cp;
-    return chunk;
+    return result;
   }
 }
 
@@ -478,21 +468,21 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
   std::vector<uint32_t> minichunks_vec{};
 
   // Iterate over the data in chunks
-  auto cdc_minichunk = fastcdc::chunk_generator(ctx);
-  while (cdc_minichunk.has_value()) {
-    auto& chunk = *cdc_minichunk;
+  auto cdc_minichunk_result = fastcdc::chunk_generator(ctx);
+  while (cdc_minichunk_result.has_value()) {
+    auto& [chunk, chunk_data] = *cdc_minichunk_result;
     // Calculate hash for current chunk
-    XXH3_64bits_update(state, data + chunk.offset, chunk.length);
-    chunk.hash = XXH3_64bits_digest(state);
+    XXH3_64bits_update(state, data + chunk.offset, chunk_data.size());
+    const std::bitset<64> chunk_hash = XXH3_64bits_digest(state);
     XXH3_64bits_reset(state);
 
     // Update SimHash vector with the hash of the chunk
     for (uint8_t bit_i = 0; bit_i < 64; bit_i++) {
-      simhash_vector[bit_i] += (chunk.hash.test(bit_i) ? 1 : -1);
+      simhash_vector[bit_i] += (chunk_hash.test(bit_i) ? 1 : -1);
     }
 
     minichunks_vec.emplace_back(chunk.length);
-    cdc_minichunk = fastcdc::chunk_generator(ctx);
+    cdc_minichunk_result = fastcdc::chunk_generator(ctx);
   }
 
   // Truncate simhash_vector into simhash, by keeping values larger than 0 as 1bit and values 0 or less to 0bit
@@ -552,25 +542,74 @@ struct DeltaEncodingResult {
   std::vector<LZInstruction> instructions;
 };
 
+uint64_t find_identical_prefix_byte_count(std::span<uint8_t> data1_span, std::span<uint8_t> data2_span) {
+  // TODO: we just use std::memcmp and hope we have SIMD optimized versions, maybe explicitly handle SIMD?
+  const auto cmp_size = std::min(data1_span.size(), data2_span.size());
+  uint64_t matching_data_count = 0;
+  uint64_t i = 0;
+  while (i < cmp_size) {
+    const bool can_sse_compare = cmp_size - i >= 16;
+    if (can_sse_compare && std::memcmp(data1_span.data() + i, data2_span.data() + i, 16) == 0) {
+      matching_data_count += 16;
+      i += 16;
+      continue;
+    }
+
+    const bool can_u64int_compare = cmp_size - i >= 8;
+    if (can_u64int_compare && std::memcmp(data1_span.data() + i, data2_span.data() + i, 8) == 0) {
+      matching_data_count += 8;
+      i += 8;
+      continue;
+    }
+
+    if (*(data1_span.data() + i) != *(data2_span.data() + i)) break;
+    matching_data_count++;
+    i++;
+  }
+  return matching_data_count;
+}
+
+uint64_t find_identical_suffix_byte_count(std::span<uint8_t> data1_span, std::span<uint8_t> data2_span) {
+  // TODO: we just use std::memcmp and hope we have SIMD optimized versions, maybe explicitly handle SIMD?
+  const auto cmp_size = std::min(data1_span.size(), data2_span.size());
+  const auto data1_start = data1_span.data() + data1_span.size() - cmp_size;
+  const auto data2_start = data2_span.data() + data2_span.size() - cmp_size;
+
+  uint64_t matching_data_count = 0;
+  uint64_t i = 0;
+  while (i < cmp_size) {
+    const bool can_sse_compare = cmp_size - i >= 16;
+    if (
+      can_sse_compare &&
+      std::memcmp(data1_start + cmp_size - 16 - i, data2_start + cmp_size - 16 - i, 16) == 0
+      ) {
+      matching_data_count += 16;
+      i += 16;
+      continue;
+    }
+
+    const bool can_u64int_compare = cmp_size - i >= 8;
+    if (
+      can_u64int_compare &&
+      std::memcmp(data1_start + cmp_size - 8 - i, data2_start + cmp_size - 8 - i, 8) == 0
+      ) {
+      matching_data_count += 8;
+      i += 8;
+      continue;
+    }
+
+    if (*(data1_start + cmp_size - 1 - i) != *(data2_start + cmp_size - 1 - i)) break;
+    matching_data_count++;
+    i++;
+  }
+  return matching_data_count;
+}
+
 DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, uint32_t minichunk_size) {
   DeltaEncodingResult result;
   //DDelta style delta encoding, first start by greedily attempting to match data at the start and end on the chunks
-  uint64_t start_matching_data_len = 0;
-  const auto cmp_size = std::min(chunk.length, similar_chunk.length);
-  std::span chunk_data_span{ chunk.data, cmp_size };
-  std::span similar_chunk_data_span{ similar_chunk.data, cmp_size };
-  for (uint64_t i = 0; i < cmp_size; i++) {
-    if (chunk_data_span[i] != similar_chunk_data_span[i]) break;
-    ++start_matching_data_len;
-  }
-
-  uint64_t end_matching_data_len = 0;
-  chunk_data_span = std::span{ chunk.data + chunk.length - cmp_size, cmp_size };
-  similar_chunk_data_span = std::span{ similar_chunk.data + similar_chunk.length - cmp_size, cmp_size };
-  for (uint64_t i = 0; i < cmp_size; i++) {
-    if (chunk_data_span[cmp_size - 1 - i] != similar_chunk_data_span[cmp_size - 1 - i]) break;
-    ++end_matching_data_len;
-  }
+  const uint64_t start_matching_data_len = find_identical_prefix_byte_count(std::span(chunk.data.get(), chunk.length), std::span(similar_chunk.data.get(), similar_chunk.length));
+  uint64_t end_matching_data_len = find_identical_suffix_byte_count(std::span(chunk.data.get(), chunk.length), std::span(similar_chunk.data.get(), similar_chunk.length));
 
   uint64_t saved_size = start_matching_data_len + end_matching_data_len;
 
@@ -581,7 +620,7 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
   for (uint64_t i = 0; i < similar_chunk.length; i += minichunk_size) {
     // Calculate hash for current chunk
     XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, similar_chunk.data + i, std::min<uint64_t>(minichunk_size, similar_chunk.length - i));
+    XXH3_64bits_update(state, similar_chunk.data.get() + i, std::min<uint64_t>(minichunk_size, similar_chunk.length - i));
     uint64_t minichunk_hash = XXH3_64bits_digest(state);
     similar_chunk_minichunks_map[minichunk_hash].emplace_back(i);
   }
@@ -595,94 +634,70 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
     const auto minichunk_len = std::min<uint64_t>(minichunk_size, chunk.length - minichunk_offset);
     XXH64_hash_t minichunk_hash = 0;
 
-    // If we already matched this minichunk (or part of it) by matching the beginning of both chunks, or extending a previous minichunk, we skip it
-    if (minichunk_offset + minichunk_len <= unaccounted_data_start_pos) {
-      continue;
-    }
-    // Similarly, if the amount of data matched at the end means that part of this minichunk was already matched there, we quit
-    if (minichunk_offset + minichunk_len >= chunk.length - end_matching_data_len) {
-      break;
-    }
-
     XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, chunk.data + minichunk_offset, minichunk_len);
+    XXH3_64bits_update(state, chunk.data.get() + minichunk_offset, minichunk_len);
     minichunk_hash = XXH3_64bits_digest(state);
 
-    if (similar_chunk_minichunks_map.contains(minichunk_hash)) {
-      uint64_t extended_size = 0;
-      uint64_t backwards_extended_size = 0;
-      uint64_t best_similar_chunk_minichunk_offset = 0;  // we will select the minichunk that can be extended the most
-      const auto minichunk_already_accounted_len = unaccounted_data_start_pos > minichunk_offset ? unaccounted_data_start_pos - minichunk_offset : 0;
-      saved_size += minichunk_len - minichunk_already_accounted_len;
+    if (!similar_chunk_minichunks_map.contains(minichunk_hash)) continue;
 
-      // We find the instance of the minichunk on the similar_chunk that can be extended the most
-      for (const auto& candidate_similar_chunk_offset : similar_chunk_minichunks_map[minichunk_hash]) {
-        // We have a match, attempt to extend it, first backwards
-        auto similar_chunk_pos = candidate_similar_chunk_offset - 1;
-        auto current_chunk_pos = minichunk_offset - 1;
+    uint64_t extended_size = 0;
+    uint64_t backwards_extended_size = 0;
+    uint64_t best_similar_chunk_minichunk_offset = 0;  // we will select the minichunk that can be extended the most
 
-        uint64_t candidate_backwards_extended_size = 0;
-        // If any of the offsets is 0 then there is no way we can backtrack (similar_chunk_pos and/or current_chunk_pos already overflowed)
-        if (candidate_similar_chunk_offset > 0 && minichunk_offset > 0) {
-          while (similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]) {
-            if (current_chunk_pos >= unaccounted_data_start_pos) {
-              candidate_backwards_extended_size++;
-            }
-            else if (!result.instructions.empty() && result.instructions.back().type == LZInstructionType::INSERT) {
-              auto& prev_instruction = result.instructions.back();
-              prev_instruction.size--;
-              candidate_backwards_extended_size++;
-              if (prev_instruction.size == 0) {
-                result.instructions.pop_back();
-              }
-            }
-
-            if (similar_chunk_pos == 0 || current_chunk_pos == 0) break;
-            similar_chunk_pos--;
-            current_chunk_pos--;
-          }
-        }
-
-        // Then extend forwards
-        uint64_t candidate_extended_size = 0;
-        similar_chunk_pos = candidate_similar_chunk_offset + minichunk_len;
-        current_chunk_pos = minichunk_offset + minichunk_len;
-        while (
-          similar_chunk_pos < similar_chunk.length &&
-          current_chunk_pos < chunk.length &&
-          similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
-          ) {
-          if (current_chunk_pos >= chunk.length - end_matching_data_len) {
-            end_matching_data_len--;
-          }
-          candidate_extended_size++;
-          similar_chunk_pos++;
-          current_chunk_pos++;
-        }
-
-        if (candidate_backwards_extended_size + candidate_extended_size >= backwards_extended_size + extended_size) {
-          extended_size = candidate_extended_size;
-          backwards_extended_size = candidate_backwards_extended_size;
-          best_similar_chunk_minichunk_offset = candidate_similar_chunk_offset;
-        }
-      }
-
-      // Any remaining unaccounted data needs to be INSERTed as it couldn't be matched from the similar_chunk
-      if (unaccounted_data_start_pos < minichunk_offset - backwards_extended_size) {
-        result.instructions.emplace_back(
-          LZInstructionType::INSERT,
-          unaccounted_data_start_pos,
-          minichunk_offset - backwards_extended_size - unaccounted_data_start_pos
-        );
-      }
-      result.instructions.emplace_back(
-        LZInstructionType::COPY,
-        best_similar_chunk_minichunk_offset - backwards_extended_size + minichunk_already_accounted_len,
-        backwards_extended_size + minichunk_len - minichunk_already_accounted_len + extended_size
+    // We find the instance of the minichunk on the similar_chunk that can be extended the most
+    for (const auto& candidate_similar_chunk_offset : similar_chunk_minichunks_map[minichunk_hash]) {
+      // We have a match, attempt to extend it, first backwards
+      const uint64_t candidate_backwards_extended_size = find_identical_suffix_byte_count(
+        std::span(chunk.data.get(), minichunk_offset),
+        std::span(similar_chunk.data.get(), candidate_similar_chunk_offset)
       );
-      saved_size += backwards_extended_size + extended_size;
-      unaccounted_data_start_pos = minichunk_offset + minichunk_len + extended_size;
+
+      // Then extend forwards
+      const uint64_t candidate_extended_size = find_identical_prefix_byte_count(
+        std::span(chunk.data.get() + minichunk_offset + minichunk_len, chunk.length - minichunk_offset - minichunk_len),
+        std::span(similar_chunk.data.get() + candidate_similar_chunk_offset + minichunk_len, similar_chunk.length - candidate_similar_chunk_offset - minichunk_len)
+      );
+
+      if (candidate_backwards_extended_size + candidate_extended_size >= backwards_extended_size + extended_size) {
+        extended_size = candidate_extended_size;
+        backwards_extended_size = candidate_backwards_extended_size;
+        best_similar_chunk_minichunk_offset = candidate_similar_chunk_offset;
+      }
     }
+
+    // Any remaining unaccounted data needs to be INSERTed as it couldn't be matched from the similar_chunk
+    const auto backward_extended_minichunk_start = minichunk_offset - backwards_extended_size;
+    if (unaccounted_data_start_pos < backward_extended_minichunk_start) {
+      result.instructions.emplace_back(
+        LZInstructionType::INSERT,
+        unaccounted_data_start_pos,
+        minichunk_offset - backwards_extended_size - unaccounted_data_start_pos
+      );
+    }
+    else {
+      uint64_t to_backtrack_len = unaccounted_data_start_pos - backward_extended_minichunk_start;
+      while (to_backtrack_len > 0) {
+        auto& prevInstruction = result.instructions.back();
+        const auto possible_backtrack = std::min(to_backtrack_len, prevInstruction.size);
+        // Prevent double counting as this will all be added back with the current minichunk's COPY
+        if (prevInstruction.type == LZInstructionType::COPY) saved_size -= possible_backtrack;
+        if (prevInstruction.size <= to_backtrack_len) {
+          result.instructions.pop_back();
+        }
+        else {
+          prevInstruction.size -= to_backtrack_len;
+        }
+        to_backtrack_len -= possible_backtrack;
+      }
+    }
+    const auto copy_instruction_size = backwards_extended_size + minichunk_len + extended_size;
+    result.instructions.emplace_back(
+      LZInstructionType::COPY,
+      best_similar_chunk_minichunk_offset - backwards_extended_size,
+      copy_instruction_size
+    );
+    saved_size += copy_instruction_size;
+    unaccounted_data_start_pos = minichunk_offset + minichunk_len + extended_size;
   }
   // After the iteration there could remain some unaccounted data at the end (before the matched data), if so save it as an INSERT
   const auto end_matched_data_start_pos = std::max<uint64_t>(unaccounted_data_start_pos, chunk.length - end_matching_data_len);
@@ -711,22 +726,8 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
 DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDChunk& chunk, const utility::CDChunk& similar_chunk, uint32_t minichunk_size) {
   DeltaEncodingResult result;
   //DDelta style delta encoding, first start by greedily attempting to match data at the start and end on the chunks
-  uint64_t start_matching_data_len = 0;
-  const auto cmp_size = std::min(chunk.length, similar_chunk.length);
-  std::span chunk_data_span{ chunk.data, cmp_size };
-  std::span similar_chunk_data_span{ similar_chunk.data, cmp_size };
-  for (uint64_t i = 0; i < cmp_size; i++) {
-    if (chunk_data_span[i] != similar_chunk_data_span[i]) break;
-    ++start_matching_data_len;
-  }
-
-  uint64_t end_matching_data_len = 0;
-  chunk_data_span = std::span{ chunk.data + chunk.length - cmp_size, cmp_size };
-  similar_chunk_data_span = std::span{ similar_chunk.data + similar_chunk.length - cmp_size, cmp_size };
-  for (uint64_t i = 0; i < cmp_size; i++) {
-    if (chunk_data_span[cmp_size - 1 - i] != similar_chunk_data_span[cmp_size - 1 - i]) break;
-    ++end_matching_data_len;
-  }
+  const uint64_t start_matching_data_len = find_identical_prefix_byte_count(std::span(chunk.data.get(), chunk.length), std::span(similar_chunk.data.get(), similar_chunk.length));
+  uint64_t end_matching_data_len = find_identical_suffix_byte_count(std::span(chunk.data.get(), chunk.length), std::span(similar_chunk.data.get(), similar_chunk.length));
 
   uint64_t saved_size = start_matching_data_len + end_matching_data_len;
 
@@ -736,7 +737,7 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
   uint32_t minichunk_offset = 0;
   for (const auto& minichunk_len : std::span(similar_chunk.minichunks.get(), similar_chunk.minichunks_len)) {
     XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, similar_chunk.data + minichunk_offset, minichunk_len);
+    XXH3_64bits_update(state, similar_chunk.data.get() + minichunk_offset, minichunk_len);
     XXH64_hash_t minichunk_hash = XXH3_64bits_digest(state);
     similar_chunk_minichunks_map[minichunk_hash].emplace_back(minichunk_offset);
     minichunk_offset += minichunk_len;
@@ -751,97 +752,74 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
   for (uint32_t minichunk_i = 0; minichunk_i < chunk.minichunks_len; minichunk_i++) {
     const auto& minichunk_len = chunk.minichunks[minichunk_i];
     XXH64_hash_t minichunk_hash = 0;
-    
-    // If we already matched this minichunk (or part of it) by matching the beginning of both chunks, or extending a previous minichunk, we skip it
-    if (minichunk_offset + minichunk_len <= unaccounted_data_start_pos) {
+
+    XXH3_64bits_reset(state);
+    XXH3_64bits_update(state, chunk.data.get() + minichunk_offset, minichunk_len);
+    minichunk_hash = XXH3_64bits_digest(state);
+
+    if (!similar_chunk_minichunks_map.contains(minichunk_hash)) {
       minichunk_offset += minichunk_len;
       continue;
     }
-    // Similarly, if the amount of data matched at the end means that part of this minichunk was already matched there, we quit
-    if (minichunk_offset + minichunk_len >= chunk.length - end_matching_data_len) {
-      break;
-    }
 
-    XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, chunk.data + minichunk_offset, minichunk_len);
-    minichunk_hash = XXH3_64bits_digest(state);
+    uint64_t extended_size = 0;
+    uint64_t backwards_extended_size = 0;
+    uint64_t best_similar_chunk_minichunk_offset = 0;  // we will select the minichunk that can be extended the most
 
-    if (similar_chunk_minichunks_map.contains(minichunk_hash)) {
-      uint64_t extended_size = 0;
-      uint64_t backwards_extended_size = 0;
-      uint64_t best_similar_chunk_minichunk_offset = 0;  // we will select the minichunk that can be extended the most
-      const auto minichunk_already_accounted_len = unaccounted_data_start_pos > minichunk_offset ? unaccounted_data_start_pos - minichunk_offset : 0;
-      saved_size += minichunk_len - minichunk_already_accounted_len;
-      
-      // We find the instance of the minichunk on the similar_chunk that can be extended the most
-      for (const auto& candidate_similar_chunk_offset : similar_chunk_minichunks_map[minichunk_hash]) {
-        // We have a match, attempt to extend it, first backwards
-        auto similar_chunk_pos = candidate_similar_chunk_offset - 1;
-        auto current_chunk_pos = minichunk_offset - 1;
-
-        uint64_t candidate_backwards_extended_size = 0;
-        // If any of the offsets is 0 then there is no way we can backtrack (similar_chunk_pos and/or current_chunk_pos already overflowed)
-        if (candidate_similar_chunk_offset > 0 && minichunk_offset > 0) {
-          while (similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]) {
-            if (current_chunk_pos >= unaccounted_data_start_pos) {
-              candidate_backwards_extended_size++;
-            }
-            else if (!result.instructions.empty() && result.instructions.back().type == LZInstructionType::INSERT) {
-              auto& prev_instruction = result.instructions.back();
-              prev_instruction.size--;
-              candidate_backwards_extended_size++;
-              if (prev_instruction.size == 0) {
-                result.instructions.pop_back();
-              }
-            }
-            
-            if (similar_chunk_pos == 0 || current_chunk_pos == 0) break;
-            similar_chunk_pos--;
-            current_chunk_pos--;
-          }
-        }
-
-        // Then extend forwards
-        uint64_t candidate_extended_size = 0;
-        similar_chunk_pos = candidate_similar_chunk_offset + minichunk_len;
-        current_chunk_pos = minichunk_offset + minichunk_len;
-        while (
-          similar_chunk_pos < similar_chunk.length &&
-          current_chunk_pos < chunk.length &&
-          similar_chunk.data[similar_chunk_pos] == chunk.data[current_chunk_pos]
-          ) {
-          if (current_chunk_pos >= chunk.length - end_matching_data_len) {
-            end_matching_data_len--;
-          }
-          candidate_extended_size++;
-          similar_chunk_pos++;
-          current_chunk_pos++;
-        }
-
-        if (candidate_backwards_extended_size + candidate_extended_size >= backwards_extended_size + extended_size) {
-          extended_size = candidate_extended_size;
-          backwards_extended_size = candidate_backwards_extended_size;
-          best_similar_chunk_minichunk_offset = candidate_similar_chunk_offset;
-        }
-      }
-
-      // Any remaining unaccounted data needs to be INSERTed as it couldn't be matched from the similar_chunk
-      if (unaccounted_data_start_pos < minichunk_offset - backwards_extended_size) {
-        result.instructions.emplace_back(
-          LZInstructionType::INSERT,
-          unaccounted_data_start_pos,
-          minichunk_offset - backwards_extended_size - unaccounted_data_start_pos
-        );
-      }
-      result.instructions.emplace_back(
-        LZInstructionType::COPY,
-        best_similar_chunk_minichunk_offset - backwards_extended_size + minichunk_already_accounted_len,
-        backwards_extended_size + minichunk_len - minichunk_already_accounted_len + extended_size
+    // We find the instance of the minichunk on the similar_chunk that can be extended the most
+    for (const auto& candidate_similar_chunk_offset : similar_chunk_minichunks_map[minichunk_hash]) {
+      // We have a match, attempt to extend it, first backwards
+      const uint64_t candidate_backwards_extended_size = find_identical_suffix_byte_count(
+        std::span(chunk.data.get(), minichunk_offset),
+        std::span(similar_chunk.data.get(), candidate_similar_chunk_offset)
       );
-      saved_size += backwards_extended_size + extended_size;
-      unaccounted_data_start_pos = minichunk_offset + minichunk_len + extended_size;
+
+      // Then extend forwards
+      const uint64_t candidate_extended_size = find_identical_prefix_byte_count(
+        std::span(chunk.data.get() + minichunk_offset + minichunk_len, chunk.length - minichunk_offset - minichunk_len),
+        std::span(similar_chunk.data.get() + candidate_similar_chunk_offset + minichunk_len, similar_chunk.length - candidate_similar_chunk_offset - minichunk_len)
+      );
+
+      if (candidate_backwards_extended_size + candidate_extended_size >= backwards_extended_size + extended_size) {
+        extended_size = candidate_extended_size;
+        backwards_extended_size = candidate_backwards_extended_size;
+        best_similar_chunk_minichunk_offset = candidate_similar_chunk_offset;
+      }
     }
 
+    // Any remaining unaccounted data needs to be INSERTed as it couldn't be matched from the similar_chunk
+    const auto backward_extended_minichunk_start = minichunk_offset - backwards_extended_size;
+    if (unaccounted_data_start_pos < backward_extended_minichunk_start) {
+      result.instructions.emplace_back(
+        LZInstructionType::INSERT,
+        unaccounted_data_start_pos,
+        minichunk_offset - backwards_extended_size - unaccounted_data_start_pos
+      );
+    }
+    else {
+      uint64_t to_backtrack_len = unaccounted_data_start_pos - backward_extended_minichunk_start;
+      while (to_backtrack_len > 0) {
+        auto& prevInstruction = result.instructions.back();
+        const auto possible_backtrack = std::min(to_backtrack_len, prevInstruction.size);
+        // Prevent double counting as this will all be added back with the current minichunk's COPY
+        if (prevInstruction.type == LZInstructionType::COPY) saved_size -= possible_backtrack;
+        if (prevInstruction.size <= to_backtrack_len) {
+          result.instructions.pop_back();
+        }
+        else {
+          prevInstruction.size -= to_backtrack_len;
+        }
+        to_backtrack_len -= possible_backtrack;
+      }
+    }
+    const auto copy_instruction_size = backwards_extended_size + minichunk_len + extended_size;
+    result.instructions.emplace_back(
+      LZInstructionType::COPY,
+      best_similar_chunk_minichunk_offset - backwards_extended_size,
+      copy_instruction_size
+    );
+    saved_size += copy_instruction_size;
+    unaccounted_data_start_pos = minichunk_offset + minichunk_len + extended_size;
     minichunk_offset += minichunk_len;
   }
   // After the iteration there could remain some unaccounted data at the end (before the matched data), if so save it as an INSERT
@@ -943,7 +921,9 @@ class LZInstructionManager {
   const bool use_match_extension_backwards;
   const bool use_match_extension;
 
-  uint64_t estimated_savings = 0;
+  uint64_t accumulated_savings = 0;
+  uint64_t accumulated_extended_backwards_savings = 0;
+  uint64_t accumulated_extended_forwards_savings = 0;
   uint64_t omitted_small_match_size = 0;
   uint64_t outputted_up_to_offset = 0;
   uint64_t outputted_lz_instructions = 0;
@@ -962,15 +942,22 @@ public:
     return outputted_lz_instructions;
   }
 
-  uint64_t estimatedSavings() const {
-    return estimated_savings;
+  uint64_t accumulatedSavings() const {
+    return accumulated_savings;
+  }
+  uint64_t accumulatedExtendedBackwardsSavings() const {
+    return accumulated_extended_backwards_savings;
+  }
+  uint64_t accumulatedExtendedForwardsSavings() const {
+    return accumulated_extended_forwards_savings;
   }
 
   uint64_t omittedSmallMatchSize() const {
     return omitted_small_match_size;
   }
 
-  void addInstruction(LZInstruction&& instruction, uint64_t current_offset, bool verify = true, std::optional<uint64_t> earliest_allowed_offset = std::nullopt) {
+  void addInstruction(LZInstruction&& instruction, uint64_t current_offset, bool verify = true, std::optional<uint64_t> _earliest_allowed_offset = std::nullopt) {
+    uint64_t earliest_allowed_offset = _earliest_allowed_offset.has_value() ? *_earliest_allowed_offset : 0;
 #ifndef NDEBUG
     if (instruction.type == LZInstructionType::INSERT && instruction.offset != current_offset) {
       std::cout << "INSERT LZInstruction added is not at current offset!" << std::flush;
@@ -990,7 +977,7 @@ public:
     ) {
       prevInstruction->size += instruction.size;
       if (prevInstruction->type == LZInstructionType::COPY) {
-        estimated_savings += instruction.size;
+        accumulated_savings += instruction.size;
       }
     }
     else {
@@ -1019,7 +1006,9 @@ public:
         }
       }
 
-      const bool can_backwards_extend_instruction = !earliest_allowed_offset.has_value() || instruction.offset > *earliest_allowed_offset;
+      const uint64_t original_instruction_size = instruction.size;
+      uint64_t extended_backwards_savings = 0;
+      const bool can_backwards_extend_instruction = instruction.offset > earliest_allowed_offset;
       if (use_match_extension_backwards && instruction.type == LZInstructionType::COPY && can_backwards_extend_instruction) {
         auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset - 1);
         utility::CDChunk* instruction_chunk = &(*chunks)[instruction_chunk_i];
@@ -1030,23 +1019,23 @@ public:
         }
 #endif
 
-        uint64_t prevInstruction_offset = current_offset;
-        const bool can_backwards_extend_prevInstruction = !earliest_allowed_offset.has_value() || prevInstruction_offset > *earliest_allowed_offset;
+        uint64_t prevInstruction_end_offset = current_offset;
+        const bool can_backwards_extend_prevInstruction = prevInstruction_end_offset > earliest_allowed_offset;
         while (!instructions.empty() && can_backwards_extend_prevInstruction) {
-          prevInstruction = &instructions.back();
           // TODO: figure out why this happens, most likely some match extension is not properly cleaning up INSERTs that are shrunk into nothingness
           if (prevInstruction->size == 0) {
             instructions.pop_back();
             if (instructions.empty()) {
               break;
             }
+            prevInstruction = &instructions.back();
             continue;
           }
 
-          auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_offset - 1);
+          auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_end_offset - 1);
           utility::CDChunk* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
 #ifndef NDEBUG
-          if (prevInstruction_chunk->offset + prevInstruction_chunk_pos != prevInstruction_offset - 1) {
+          if (prevInstruction_chunk->offset + prevInstruction_chunk_pos != prevInstruction_end_offset - 1) {
             std::cout << "BACKWARD MATCH EXTENSION PREVIOUS INSTRUCTION OFFSET MISMATCH" << std::flush;
             exit(1);
           }
@@ -1054,34 +1043,44 @@ public:
 
           bool stop_matching = false;
           while (true) {
-            const auto instruction_chunk_char = *(instruction_chunk->data + instruction_chunk_pos);
-            const auto prevInstruction_chunk_char = *(prevInstruction_chunk->data + prevInstruction_chunk_pos);
+            const auto bytes_remaining_for_prevInstruction_to_earliest_allowed_offset = prevInstruction_end_offset - earliest_allowed_offset;
+            // bytes_remaining_for_prevInstruction_backtrack is including the current byte, which is why we +1 to bytes_remaining_for_prevInstruction_to_earliest_allowed_offset,
+            // otherwise this would be 0 when we are on the actual earliest_allowed_offset
+            const auto bytes_remaining_for_prevInstruction_backtrack = std::min(
+              bytes_remaining_for_prevInstruction_to_earliest_allowed_offset + 1,
+              std::min(prevInstruction->size, prevInstruction_chunk_pos + 1)
+            );
 
-            const auto instruction_chunk_offset = instruction_chunk->offset + instruction_chunk_pos;
-            if (instruction_chunk_char != prevInstruction_chunk_char) {
+            const auto prevInstruction_backtrack_data = std::span(
+              prevInstruction_chunk->data.get() + prevInstruction_chunk_pos - (bytes_remaining_for_prevInstruction_backtrack - 1),
+              bytes_remaining_for_prevInstruction_backtrack
+            );
+            const auto instruction_backtrack_data = std::span(instruction_chunk->data.get(),instruction_chunk_pos + 1);
+
+            uint64_t matched_amt = find_identical_suffix_byte_count(prevInstruction_backtrack_data, instruction_backtrack_data);
+            if (matched_amt == 0) {
               stop_matching = true;
               break;
             }
 
-            prevInstruction_offset--;
-            prevInstruction->size--;
-            instruction.offset--;
-            instruction.size++;
-            // Otherwise I would end up double counting savings when adding the instruction at the end
-            if (prevInstruction->type == LZInstructionType::COPY) estimated_savings--;
+            prevInstruction_end_offset -= matched_amt;
+            prevInstruction->size -= matched_amt;
+            instruction.offset -= matched_amt;
+            instruction.size += matched_amt;
+            if (prevInstruction->type == LZInstructionType::INSERT) extended_backwards_savings += matched_amt;
 
             // Can't keep extending backwards, any previous data is disallowed (presumably to accomodate max matching distance)
-            if (earliest_allowed_offset.has_value() && prevInstruction_offset < *earliest_allowed_offset) {
+            if (prevInstruction_end_offset < earliest_allowed_offset) {
               stop_matching = true;
               break;
             }
-            if (earliest_allowed_offset.has_value() && instruction.offset < *earliest_allowed_offset) {
+            if (instruction.offset < earliest_allowed_offset) {
               stop_matching = true;
               break;
             }
 
-            if (instruction_chunk_pos != 0) {
-              instruction_chunk_pos--;
+            if (instruction_chunk_pos >= matched_amt) {
+              instruction_chunk_pos -= matched_amt;
             }
             else if (instruction_chunk_i == 0) {
               stop_matching = true;
@@ -1099,11 +1098,12 @@ public:
                 stop_matching = true;
                 break;
               }
+              prevInstruction = &instructions.back();
               break;
             }
 
-            if (prevInstruction_chunk_pos != 0) {
-              prevInstruction_chunk_pos--;
+            if (prevInstruction_chunk_pos >= matched_amt) {
+              prevInstruction_chunk_pos -= matched_amt;
             }
             else if (prevInstruction_chunk_i == 0) {
               stop_matching = true;
@@ -1118,10 +1118,11 @@ public:
           if (stop_matching) break;
         }
       }
-      else if (use_match_extension && prevInstruction->type == LZInstructionType::COPY) {
+      uint64_t extended_forwards_savings = 0;
+      if (use_match_extension && prevInstruction->type == LZInstructionType::COPY) {
         uint64_t prevInstruction_offset = prevInstruction->offset + prevInstruction->size;
 
-        const bool can_forward_extend_prevInstruction = !earliest_allowed_offset.has_value() || prevInstruction_offset >= *earliest_allowed_offset;
+        const bool can_forward_extend_prevInstruction = prevInstruction_offset >= earliest_allowed_offset;
         if (can_forward_extend_prevInstruction) {
           auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_offset);
           utility::CDChunk* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
@@ -1130,16 +1131,24 @@ public:
           utility::CDChunk* instruction_chunk = &(*chunks)[instruction_chunk_i];
 
           while (instruction.size > 0) {
-            if (*(prevInstruction_chunk->data + prevInstruction_chunk_pos) != *(instruction_chunk->data + instruction_chunk_pos)) {
-              break;
-            }
+            const auto prevInstruction_extend_data = std::span(
+              prevInstruction_chunk->data.get() + prevInstruction_chunk_pos,
+              prevInstruction_chunk->length - prevInstruction_chunk_pos
+            );
+            const auto instruction_extend_data = std::span(
+              instruction_chunk->data.get() + instruction_chunk_pos,
+              std::min(instruction_chunk->length - instruction_chunk_pos, instruction.size)
+            );
 
-            prevInstruction->size++;
-            instruction.offset++;
-            instruction.size--;
-            if (instruction.type == LZInstructionType::INSERT) estimated_savings++;
+            uint64_t matched_amt = find_identical_prefix_byte_count(prevInstruction_extend_data, instruction_extend_data);
+            if (matched_amt == 0) break;
 
-            prevInstruction_chunk_pos++;
+            prevInstruction->size += matched_amt;
+            instruction.offset += matched_amt;
+            instruction.size -= matched_amt;
+            if (instruction.type == LZInstructionType::INSERT) extended_forwards_savings += matched_amt;
+
+            prevInstruction_chunk_pos += matched_amt;
             if (prevInstruction_chunk_pos == prevInstruction_chunk->length) {
               prevInstruction_chunk_i++;
               prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
@@ -1150,7 +1159,7 @@ public:
               break;
             }
 
-            instruction_chunk_pos++;
+            instruction_chunk_pos += matched_amt;
             if (instruction_chunk_pos == instruction_chunk->length) {
               instruction_chunk_i++;
               instruction_chunk = &(*chunks)[instruction_chunk_i];
@@ -1186,6 +1195,13 @@ public:
         }
       }
 
+      // If instruction is COPY then any forward extending is actually just retreading ground from what was extended backwards and
+      // at most from the instruction itself, so it's all already counted there
+      if (instruction.type == LZInstructionType::COPY) accumulated_savings += extended_backwards_savings + original_instruction_size;
+      else accumulated_savings += extended_forwards_savings;
+      accumulated_extended_backwards_savings += extended_backwards_savings;
+      accumulated_extended_forwards_savings += extended_forwards_savings;
+
       // If the whole instruction is consumed by extending the previous COPY, then just quit, there is no instruction to add anymore
       if (instruction.size == 0) {
         return;
@@ -1194,14 +1210,13 @@ public:
       // If it's still so small that the overhead of outputting the extra instruction is larger than the deduplication we would get
       // we just extend this insert so that we save that overhead
       if (instruction.type == LZInstructionType::INSERT && prevInstruction->type == LZInstructionType::COPY && prevInstruction->size < 128) {
-        estimated_savings -= prevInstruction->size;
+        accumulated_savings -= prevInstruction->size;
         omitted_small_match_size += prevInstruction->size;
         prevInstruction->type = LZInstructionType::INSERT;
         prevInstruction->offset = instruction.offset - prevInstruction->size;
         prevInstruction->size = instruction.size + prevInstruction->size;
         return;
       }
-      if (instruction.type == LZInstructionType::COPY) estimated_savings += instruction.size;
       instructions.insert(instructions.end(), std::move(instruction));
     }
   }
@@ -1209,13 +1224,13 @@ public:
   void revertInstructionSize(uint64_t size) {
     LZInstruction* prevInstruction = &instructions.back();
     while (prevInstruction->size <= size) {
-      if (prevInstruction->type == LZInstructionType::COPY) estimated_savings -= size;
+      if (prevInstruction->type == LZInstructionType::COPY) accumulated_savings -= size;
       size -= prevInstruction->size;
       instructions.pop_back();
       prevInstruction = &instructions.back();
     }
     prevInstruction->size -= size;
-    if (prevInstruction->type == LZInstructionType::COPY) estimated_savings -= size;
+    if (prevInstruction->type == LZInstructionType::COPY) accumulated_savings -= size;
   }
 
   void dump(std::istream& istream, bool verify_copies = true, std::optional<uint64_t> up_to_offset = std::nullopt) {
@@ -1237,7 +1252,7 @@ public:
         while (written < instruction.size) {
           auto& instruction_chunk = (*chunks)[instruction_chunk_i];
           uint64_t to_read_from_chunk = std::min(instruction.size - written, instruction_chunk.length - instruction_chunk_pos);
-          std::copy_n(instruction_chunk.data + instruction_chunk_pos, to_read_from_chunk, buffer.data() + written);
+          std::copy_n(instruction_chunk.data.get() + instruction_chunk_pos, to_read_from_chunk, buffer.data() + written);
           written += to_read_from_chunk;
 
           instruction_chunk_i++;
@@ -1270,9 +1285,8 @@ public:
   }
 };
 
-int main(int argc, char* argv[])
-{
   //get_char_with_echo();
+int main(int argc, char* argv[]) {
   std::string file_path{ argv[1] };
   auto file_size = std::filesystem::file_size(file_path);
   if (argc > 3) {
@@ -1458,7 +1472,7 @@ int main(int argc, char* argv[])
     return 1;
   }
   auto wrapped_file = IStreamWrapper(&file_stream);
-  auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, true, use_feature_extraction);
+  auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, use_feature_extraction);
 
   std::optional<uint64_t> similarity_locality_anchor_i{};
 
@@ -1483,7 +1497,7 @@ int main(int argc, char* argv[])
   const auto calc_simhash_if_needed = [&simhash_func, &simhashing_execution_time_ns](utility::CDChunk& chunk) {
     if (chunk.minichunks != nullptr) return;
     const auto simhashing_start_time = std::chrono::high_resolution_clock::now();
-    std::tie(chunk.lsh, chunk.minichunks, chunk.minichunks_len) = simhash_func(chunk.data, chunk.length, simhash_chunk_size);
+    std::tie(chunk.lsh, chunk.minichunks, chunk.minichunks_len) = simhash_func(chunk.data.get(), chunk.length, simhash_chunk_size);
     const auto simhashing_end_time = std::chrono::high_resolution_clock::now();
     simhashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(simhashing_end_time - simhashing_start_time).count();
   };
@@ -1500,8 +1514,8 @@ int main(int argc, char* argv[])
   while (generated_chunk.has_value()) {
     // TODO: BEWARE! lz_manager.estimatedSavings() might count some savings that might go away (because of instructions too small) and in that case
     // earliest_allowed_offset might change in such a way that chunks might not be out of range even though they should.
-    const auto earliest_allowed_offset = max_match_distance.has_value() && total_size > *max_match_distance + lz_manager.estimatedSavings()
-      ? total_size - *max_match_distance - lz_manager.estimatedSavings()
+    const auto earliest_allowed_offset = max_match_distance.has_value() && total_size > *max_match_distance + lz_manager.accumulatedSavings()
+      ? total_size - *max_match_distance - lz_manager.accumulatedSavings()
       : 0;
     if (!output_disabled) lz_manager.dump(verify_file_stream, false, earliest_allowed_offset);
     while (!chunks.empty()) {
@@ -1542,7 +1556,7 @@ int main(int argc, char* argv[])
       first_non_out_of_range_chunk_i++;
     }
 
-    chunks.emplace_back(std::move(*generated_chunk));
+    chunks.emplace_back(std::move(std::get<0>(*generated_chunk)));
     auto& chunk = chunks.back();
 
     std::optional<uint64_t> prev_similarity_locality_anchor_i = similarity_locality_anchor_i;
@@ -1550,7 +1564,7 @@ int main(int argc, char* argv[])
     if (chunk_i % 50000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(generator_ctx.offset) / file_size) * 100) + "\n" << std::flush;
     total_size += chunk.length;
 
-    bool is_duplicate_chunk = false;
+    const auto& data_span = std::get<1>(*generated_chunk);
 
     // make hashes
     const auto hashing_start_time = std::chrono::high_resolution_clock::now();
@@ -1563,15 +1577,20 @@ int main(int argc, char* argv[])
     
     // xxHash
     XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, chunk.data, chunk.length);
+    XXH3_64bits_update(state, data_span.data(), chunk.length);
     chunk.hash = XXH3_64bits_digest(state);
     const auto hashing_end_time = std::chrono::high_resolution_clock::now();
     hashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - hashing_start_time).count();
 
-    if (!use_fat_chunks) chunk.deleteData();
+    const bool is_duplicate_chunk = known_hashes.contains(chunk.hash);
+
+    if (use_fat_chunks && !is_duplicate_chunk) {
+      chunk.data = std::make_shared_for_overwrite<uint8_t[]>(chunk.length);
+      std::copy_n(data_span.data(), chunk.length, chunk.data.get());
+    }
 
     std::vector<LZInstruction> new_instructions;
-    if (!known_hashes.contains(chunk.hash)) {
+    if (!is_duplicate_chunk) {
       // Attempt resemblance detection and delta compression, first by using generalized resemblance detection
       std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> similar_chunks{};
       if (use_generalized_resemblance_detection) {
@@ -1790,19 +1809,15 @@ int main(int argc, char* argv[])
       }
     }
     else {
-      is_duplicate_chunk = true;
       const auto& previous_chunk_i = known_hashes[chunk.hash].back();
       similarity_locality_anchor_i = previous_chunk_i;
-      // Important to copy LSH in case this duplicate chunk ends up being candidate for Delta encoding via DupAdj or something
       const auto& previous_chunk_instance = chunks[previous_chunk_i];
+      chunk.data = previous_chunk_instance.data;
+      // Important to copy LSH in case this duplicate chunk ends up being candidate for Delta encoding via DupAdj or something
       chunk.lsh = previous_chunk_instance.lsh;
       // Get the minichunks from the first instance of the duplicate chunk as well
       chunk.minichunks = previous_chunk_instance.minichunks;
       chunk.minichunks_len = previous_chunk_instance.minichunks_len;
-      // Get the previous instances of this chunk's data to use the data from this chunk, this way we only store duplicate data in memory once
-      for (auto& dupChunk_i : known_hashes[chunk.hash]) {
-        chunks[dupChunk_i].setData(chunk);
-      }
 
       if (use_generalized_resemblance_detection) {
         // Overwrite index for generalized resemblance detection with this newer chunk.
@@ -1936,7 +1951,7 @@ int main(int argc, char* argv[])
               }
 
               const auto instruction_size = instruction.size;
-              const auto prev_estimated_savings = lz_manager.estimatedSavings();
+              const auto prev_estimated_savings = lz_manager.accumulatedSavings();
               const auto instruction_type = instruction.type;
               lz_manager.addInstruction(std::move(instruction), lz_offset, false, earliest_allowed_offset);
               lz_offset += instruction_size;
@@ -1946,7 +1961,7 @@ int main(int argc, char* argv[])
                 // The LZManager might have extended or rejected the instruction, so we need to handle that
                 // TODO: this is actually not accurate, some match extension is counted as regular dedup/delta reduction
                 // but at least the count won't overflow anymore
-                const auto instruction_savings = lz_manager.estimatedSavings() - prev_estimated_savings;
+                const auto instruction_savings = lz_manager.accumulatedSavings() - prev_estimated_savings;
                 delta_compressed_approx_size += std::min(instruction_size, instruction_savings);
               }
             }
@@ -1970,7 +1985,7 @@ int main(int argc, char* argv[])
         }
         
         const auto instruction_size = instruction.size;
-        const auto prev_estimated_savings = lz_manager.estimatedSavings();
+        const auto prev_estimated_savings = lz_manager.accumulatedSavings();
         const auto instruction_type = instruction.type;
         lz_manager.addInstruction(std::move(instruction), lz_offset, false, earliest_allowed_offset);
         lz_offset += instruction_size;
@@ -1980,7 +1995,7 @@ int main(int argc, char* argv[])
           // The LZManager might have extended or rejected the instruction, so we need to handle that
           // TODO: this is actually not accurate, some match extension is counted as regular dedup/delta reduction
           // but at least the count won't overflow anymore
-          const auto instruction_savings = lz_manager.estimatedSavings() - prev_estimated_savings;
+          const auto instruction_savings = lz_manager.accumulatedSavings() - prev_estimated_savings;
 
           if (is_duplicate_chunk) {
             deduped_size += std::min(instruction_size, instruction_savings);
@@ -2005,6 +2020,8 @@ int main(int argc, char* argv[])
 
   auto total_dedup_end_time = std::chrono::high_resolution_clock::now();
 
+  std::printf("Total dedup time:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(total_dedup_end_time - total_runtime_start_time).count());
+
   // Dump any remaining data
   if (!output_disabled) lz_manager.dump(verify_file_stream);
 
@@ -2017,9 +2034,9 @@ int main(int argc, char* argv[])
   std::cout << "Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n" << std::flush;
   std::cout << "Total delta compressed chunk count: " + std::to_string(delta_compressed_chunk_count) + "\n" << std::flush;
 
-  const auto total_estimated_savings = lz_manager.estimatedSavings();
+  const auto total_accumulated_savings = lz_manager.accumulatedSavings();
   const auto match_omitted_size = lz_manager.omittedSmallMatchSize();
-  const auto match_extension_saved_size = total_estimated_savings - deduped_size - delta_compressed_approx_size + match_omitted_size;
+  const auto match_extension_saved_size = lz_manager.accumulatedExtendedBackwardsSavings() + lz_manager.accumulatedExtendedForwardsSavings();
   // Results stats
   const auto total_size_mbs = total_size / (1024.0 * 1024);
   std::printf("Chunk data total size:    %.1f MB\n", total_size_mbs);
@@ -2031,9 +2048,9 @@ int main(int argc, char* argv[])
   std::printf("Match extended size:    %.1f MB\n", extension_size_mbs);
   const auto omitted_size_mbs = match_omitted_size / (1024.0 * 1024);
   std::printf("Match omitted size (matches too small):    %.1f MB\n", omitted_size_mbs);
-  const auto total_estimated_savings_mbs = total_estimated_savings / (1024.0 * 1024);
-  std::printf("Total estimated reduced size:    %.1f MB\n", total_estimated_savings_mbs);
-  std::printf("Final size:    %.1f MB\n", total_size_mbs - total_estimated_savings_mbs);
+  const auto total_accummulated_savings_mbs = total_accumulated_savings / (1024.0 * 1024);
+  std::printf("Total estimated reduced size:    %.1f MB\n", total_accummulated_savings_mbs);
+  std::printf("Final size:    %.1f MB\n", total_size_mbs - total_accummulated_savings_mbs);
 
   std::printf("\n");
 
