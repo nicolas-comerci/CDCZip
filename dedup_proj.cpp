@@ -442,9 +442,6 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
   __m256i upper_counter_vector = _mm256_set1_epi8(0);
   __m256i lower_counter_vector = _mm256_set1_epi8(0);
 
-  XXH3_state_t* state = XXH3_createState();
-  XXH3_64bits_reset(state);
-
   std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> return_val{};
   auto& simhash = std::get<0>(return_val);
   auto& minichunks_ptr = std::get<1>(return_val);
@@ -455,9 +452,7 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
   for (uint32_t i = 0; i < data_len; i += chunk_size) {
     // Calculate hash for current chunk
     const auto current_chunk_len = std::min(chunk_size, data_len - i);
-    XXH3_64bits_update(state, data + i, current_chunk_len);
-    std::bitset<64> chunk_hash = XXH3_64bits_digest(state);
-    XXH3_64bits_reset(state);
+    std::bitset<64> chunk_hash = XXH3_64bits(data + i, current_chunk_len);
 
     // Update SimHash vector with the hash of the chunk
     // Using AVX/2 we don't have enough vector size to handle the whole 64bit hash, we should be able to do it with AVX512,
@@ -473,7 +468,6 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
   const uint32_t upper_chunk_hash = finalize_32bit_simhash_from_counter(upper_counter_vector);
   const uint32_t lower_chunk_hash = finalize_32bit_simhash_from_counter(lower_counter_vector);
   simhash = (static_cast<uint64_t>(upper_chunk_hash) << 32) | lower_chunk_hash;
-  XXH3_freeState(state);
   minichunks_ptr = std::make_shared_for_overwrite<uint32_t[]>(minichunks_vec.size());
   std::copy_n(minichunks_vec.data(), minichunks_vec.size(), minichunks_ptr.get());
   minichunks_len = minichunks_vec.size();
@@ -483,9 +477,6 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
 std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_xxhash_cdc(uint8_t* data, uint32_t data_len, uint32_t chunk_size) {
   __m256i upper_counter_vector = _mm256_set1_epi8(0);
   __m256i lower_counter_vector = _mm256_set1_epi8(0);
-
-  XXH3_state_t* state = XXH3_createState();
-  XXH3_64bits_reset(state);
 
   auto ctx = fastcdc::ChunkGeneratorContext(std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2, false);
 
@@ -500,9 +491,7 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
   while (cdc_minichunk_result.has_value()) {
     auto& [chunk, chunk_data] = *cdc_minichunk_result;
     // Calculate hash for current chunk
-    XXH3_64bits_update(state, data + chunk.offset, chunk_data.size());
-    const std::bitset<64> chunk_hash = XXH3_64bits_digest(state);
-    XXH3_64bits_reset(state);
+    const std::bitset<64> chunk_hash = XXH3_64bits(data + chunk.offset, chunk_data.size());
 
     // Update SimHash vector with the hash of the chunk
     // Using AVX/2 we don't have enough vector size to handle the whole 64bit hash, we should be able to do it with AVX512,
@@ -519,7 +508,6 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
   const uint32_t upper_chunk_hash = finalize_32bit_simhash_from_counter(upper_counter_vector);
   const uint32_t lower_chunk_hash = finalize_32bit_simhash_from_counter(lower_counter_vector);
   simhash = (static_cast<uint64_t>(upper_chunk_hash) << 32) | lower_chunk_hash;
-  XXH3_freeState(state);
   minichunks_ptr = std::make_shared_for_overwrite<uint32_t[]>(minichunks_vec.size());
   std::copy_n(minichunks_vec.data(), minichunks_vec.size(), minichunks_ptr.get());
   minichunks_len = minichunks_vec.size();
@@ -643,7 +631,6 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
 
   uint64_t saved_size = start_matching_data_len + end_matching_data_len;
 
-  XXH3_state_t* state = XXH3_createState();
   // (offset, hash), it might be tempting to change this for a hashmap, don't, it will be slower as sequential search is really fast because there won't be many minuchunks
   std::vector<std::tuple<uint32_t, uint64_t>> similar_chunk_minichunk_hashes;
 
@@ -651,10 +638,8 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
   uint32_t minichunk_offset = 0;
   for (uint64_t i = 0; i < similar_chunk.length; i += minichunk_size) {
     // Calculate hash for current chunk
-    XXH3_64bits_reset(state);
     const auto minichunk_len = std::min<uint64_t>(minichunk_size, similar_chunk.length - i);
-    XXH3_64bits_update(state, similar_chunk.data.get() + i, minichunk_len);
-    uint64_t minichunk_hash = XXH3_64bits_digest(state);
+    uint64_t minichunk_hash = XXH3_64bits(similar_chunk.data.get() + i, minichunk_len);
     similar_chunk_minichunk_hashes.emplace_back(minichunk_offset, minichunk_hash);
     minichunk_offset += minichunk_len;
   }
@@ -668,9 +653,7 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
     const auto minichunk_len = std::min<uint64_t>(minichunk_size, chunk.length - minichunk_offset);
     XXH64_hash_t minichunk_hash = 0;
 
-    XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, chunk.data.get() + minichunk_offset, minichunk_len);
-    minichunk_hash = XXH3_64bits_digest(state);
+    minichunk_hash = XXH3_64bits(chunk.data.get() + minichunk_offset, minichunk_len);
 
     const auto search_for_similar_minichunk = [&minichunk_hash](const std::tuple<uint32_t, uint64_t>& minichunk_data) { return std::get<1>(minichunk_data) == minichunk_hash; };
     auto similar_minichunk_iter = std::find_if(
@@ -763,7 +746,6 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
     );
   }
 
-  XXH3_freeState(state);
   result.estimated_savings = saved_size;
   return result;
 }
@@ -776,15 +758,12 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
 
   uint64_t saved_size = start_matching_data_len + end_matching_data_len;
 
-  XXH3_state_t* state = XXH3_createState();
   // (offset, hash), it might be tempting to change this for a hashmap, don't, it will be slower as sequential search is really fast because there won't be many minuchunks
   std::vector<std::tuple<uint32_t, uint64_t>> similar_chunk_minichunk_hashes;
 
   uint32_t minichunk_offset = 0;
   for (const auto& minichunk_len : std::span(similar_chunk.minichunks.get(), similar_chunk.minichunks_len)) {
-    XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, similar_chunk.data.get() + minichunk_offset, minichunk_len);
-    XXH64_hash_t minichunk_hash = XXH3_64bits_digest(state);
+    XXH64_hash_t minichunk_hash = XXH3_64bits(similar_chunk.data.get() + minichunk_offset, minichunk_len);
     similar_chunk_minichunk_hashes.emplace_back(minichunk_offset, minichunk_hash);
     minichunk_offset += minichunk_len;
   }
@@ -799,9 +778,7 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
     const auto& minichunk_len = chunk.minichunks[minichunk_i];
     XXH64_hash_t minichunk_hash = 0;
 
-    XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, chunk.data.get() + minichunk_offset, minichunk_len);
-    minichunk_hash = XXH3_64bits_digest(state);
+    minichunk_hash = XXH3_64bits(chunk.data.get() + minichunk_offset, minichunk_len);
 
     const auto search_for_similar_minichunk = [&minichunk_hash](const std::tuple<uint32_t, uint64_t>& minichunk_data) { return std::get<1>(minichunk_data) == minichunk_hash; };
     auto similar_minichunk_iter = std::find_if(
@@ -898,7 +875,6 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
     );
   }
 
-  XXH3_freeState(state);
   result.estimated_savings = saved_size;
   return result;
 }
@@ -1566,8 +1542,6 @@ int main(int argc, char* argv[]) {
   auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
   chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
 
-  XXH3_state_t* state = XXH3_createState();  // TODO: technically need to free this with XXH3_freeState(state), make RAII container
-
   while (generated_chunk.has_value()) {
     // TODO: BEWARE! lz_manager.estimatedSavings() might count some savings that might go away (because of instructions too small) and in that case
     // earliest_allowed_offset might change in such a way that chunks might not be out of range even though they should.
@@ -1633,9 +1607,7 @@ int main(int argc, char* argv[]) {
     */
     
     // xxHash
-    XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, data_span.data(), chunk.length);
-    chunk.hash = XXH3_64bits_digest(state);
+    chunk.hash = XXH3_64bits(data_span.data(), chunk.length);
     const auto hashing_end_time = std::chrono::high_resolution_clock::now();
     hashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - hashing_start_time).count();
 
