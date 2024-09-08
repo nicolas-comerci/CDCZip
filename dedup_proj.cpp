@@ -414,8 +414,33 @@ namespace fastcdc {
   }
 }
 
+#include <immintrin.h>
+
+__m256i movemask_inverse_epi8(const uint32_t mask) {
+  __m256i vmask(_mm256_set1_epi32(mask));
+  const __m256i shuffle(_mm256_setr_epi64x(0x0000000000000000, 0x0101010101010101, 0x0202020202020202, 0x0303030303030303));
+  vmask = _mm256_shuffle_epi8(vmask, shuffle);
+  const __m256i bit_mask(_mm256_set1_epi64x(0x7fbfdfeff7fbfdfe));
+  vmask = _mm256_or_si256(vmask, bit_mask);
+  return _mm256_cmpeq_epi8(vmask, _mm256_set1_epi64x(-1));
+}
+
+const __m256i all_1s = _mm256_set1_epi8(1);
+const __m256i all_minus_1s = _mm256_set1_epi8(-1);
+
+__m256i add_32bit_hash_to_simhash_counter(const uint32_t new_hash, __m256i counter_vector) {
+  const auto new_hash_mask = movemask_inverse_epi8(new_hash);
+  __m256i new_simhash_encoded = _mm256_blendv_epi8(all_1s, all_minus_1s, new_hash_mask);
+  return _mm256_adds_epi8(new_simhash_encoded, counter_vector);
+}
+
+uint32_t finalize_32bit_simhash_from_counter(const __m256i counter_vector) {
+  return _mm256_movemask_epi8(counter_vector);
+}
+
 std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_xxhash_shingling(uint8_t* data, uint32_t data_len, uint32_t chunk_size) {
-  std::array<int, 64> simhash_vector{};
+  __m256i upper_counter_vector = _mm256_set1_epi8(0);
+  __m256i lower_counter_vector = _mm256_set1_epi8(0);
 
   XXH3_state_t* state = XXH3_createState();
   XXH3_64bits_reset(state);
@@ -435,17 +460,19 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
     XXH3_64bits_reset(state);
 
     // Update SimHash vector with the hash of the chunk
-    for (uint8_t bit_i = 0; bit_i < 64; bit_i++) {
-      simhash_vector[bit_i] += (chunk_hash.test(bit_i) ? 1 : -1);
-    }
+    // Using AVX/2 we don't have enough vector size to handle the whole 64bit hash, we should be able to do it with AVX512,
+    // but that is less readily available in desktop chips, so we split the hash into 2 and process it that way
+    const std::bitset<64> upper_chunk_hash = chunk_hash >> 32;
+    upper_counter_vector = add_32bit_hash_to_simhash_counter(upper_chunk_hash.to_ulong(), upper_counter_vector);
+    const std::bitset<64> lower_chunk_hash = (chunk_hash << 32) >> 32;
+    lower_counter_vector = add_32bit_hash_to_simhash_counter(lower_chunk_hash.to_ulong(), lower_counter_vector);
 
     minichunks_vec.emplace_back(current_chunk_len);
   }
 
-  // Truncate simhash_vector into simhash, by keeping values larger than 0 as 1bit and values 0 or less to 0bit
-  for (uint8_t bit_i = 0; bit_i < 64; bit_i++) {
-    simhash[bit_i] = simhash_vector[bit_i] > 0 ? 1 : 0;
-  }
+  const uint32_t upper_chunk_hash = finalize_32bit_simhash_from_counter(upper_counter_vector);
+  const uint32_t lower_chunk_hash = finalize_32bit_simhash_from_counter(lower_counter_vector);
+  simhash = (static_cast<uint64_t>(upper_chunk_hash) << 32) | lower_chunk_hash;
   XXH3_freeState(state);
   minichunks_ptr = std::make_shared_for_overwrite<uint32_t[]>(minichunks_vec.size());
   std::copy_n(minichunks_vec.data(), minichunks_vec.size(), minichunks_ptr.get());
@@ -454,7 +481,8 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
 }
 
 std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_xxhash_cdc(uint8_t* data, uint32_t data_len, uint32_t chunk_size) {
-  std::array<int, 64> simhash_vector{};
+  __m256i upper_counter_vector = _mm256_set1_epi8(0);
+  __m256i lower_counter_vector = _mm256_set1_epi8(0);
 
   XXH3_state_t* state = XXH3_createState();
   XXH3_64bits_reset(state);
@@ -477,18 +505,20 @@ std::tuple<std::bitset<64>, std::shared_ptr<uint32_t[]>, uint32_t> simhash_data_
     XXH3_64bits_reset(state);
 
     // Update SimHash vector with the hash of the chunk
-    for (uint8_t bit_i = 0; bit_i < 64; bit_i++) {
-      simhash_vector[bit_i] += (chunk_hash.test(bit_i) ? 1 : -1);
-    }
+    // Using AVX/2 we don't have enough vector size to handle the whole 64bit hash, we should be able to do it with AVX512,
+    // but that is less readily available in desktop chips, so we split the hash into 2 and process it that way
+    const std::bitset<64> upper_chunk_hash = chunk_hash >> 32;
+    upper_counter_vector = add_32bit_hash_to_simhash_counter(upper_chunk_hash.to_ulong(), upper_counter_vector);
+    const std::bitset<64> lower_chunk_hash = (chunk_hash << 32) >> 32;
+    lower_counter_vector = add_32bit_hash_to_simhash_counter(lower_chunk_hash.to_ulong(), lower_counter_vector);
 
     minichunks_vec.emplace_back(chunk.length);
     cdc_minichunk_result = fastcdc::chunk_generator(ctx);
   }
 
-  // Truncate simhash_vector into simhash, by keeping values larger than 0 as 1bit and values 0 or less to 0bit
-  for (uint8_t bit_i = 0; bit_i < 64; bit_i++) {
-    simhash[bit_i] = simhash_vector[bit_i] > 0 ? 1 : 0;
-  }
+  const uint32_t upper_chunk_hash = finalize_32bit_simhash_from_counter(upper_counter_vector);
+  const uint32_t lower_chunk_hash = finalize_32bit_simhash_from_counter(lower_counter_vector);
+  simhash = (static_cast<uint64_t>(upper_chunk_hash) << 32) | lower_chunk_hash;
   XXH3_freeState(state);
   minichunks_ptr = std::make_shared_for_overwrite<uint32_t[]>(minichunks_vec.size());
   std::copy_n(minichunks_vec.data(), minichunks_vec.size(), minichunks_ptr.get());
