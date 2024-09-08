@@ -644,15 +644,19 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
   uint64_t saved_size = start_matching_data_len + end_matching_data_len;
 
   XXH3_state_t* state = XXH3_createState();
-  std::unordered_map<uint64_t, std::vector<uint64_t>> similar_chunk_minichunks_map{};  // key:hash, value:list of offsets
+  // (offset, hash), it might be tempting to change this for a hashmap, don't, it will be slower as sequential search is really fast because there won't be many minuchunks
+  std::vector<std::tuple<uint32_t, uint64_t>> similar_chunk_minichunk_hashes;
 
   // Iterate over the data in chunks
+  uint32_t minichunk_offset = 0;
   for (uint64_t i = 0; i < similar_chunk.length; i += minichunk_size) {
     // Calculate hash for current chunk
     XXH3_64bits_reset(state);
-    XXH3_64bits_update(state, similar_chunk.data.get() + i, std::min<uint64_t>(minichunk_size, similar_chunk.length - i));
+    const auto minichunk_len = std::min<uint64_t>(minichunk_size, similar_chunk.length - i);
+    XXH3_64bits_update(state, similar_chunk.data.get() + i, minichunk_len);
     uint64_t minichunk_hash = XXH3_64bits_digest(state);
-    similar_chunk_minichunks_map[minichunk_hash].emplace_back(i);
+    similar_chunk_minichunk_hashes.emplace_back(minichunk_offset, minichunk_hash);
+    minichunk_offset += minichunk_len;
   }
 
   if (start_matching_data_len) {
@@ -668,14 +672,23 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
     XXH3_64bits_update(state, chunk.data.get() + minichunk_offset, minichunk_len);
     minichunk_hash = XXH3_64bits_digest(state);
 
-    if (!similar_chunk_minichunks_map.contains(minichunk_hash)) continue;
+    const auto search_for_similar_minichunk = [&minichunk_hash](const std::tuple<uint32_t, uint64_t>& minichunk_data) { return std::get<1>(minichunk_data) == minichunk_hash; };
+    auto similar_minichunk_iter = std::find_if(
+      similar_chunk_minichunk_hashes.cbegin(),
+      similar_chunk_minichunk_hashes.cend(),
+      search_for_similar_minichunk
+    );
+    if (similar_minichunk_iter == similar_chunk_minichunk_hashes.cend()) continue;
 
     uint64_t extended_size = 0;
     uint64_t backwards_extended_size = 0;
     uint64_t best_similar_chunk_minichunk_offset = 0;  // we will select the minichunk that can be extended the most
 
     // We find the instance of the minichunk on the similar_chunk that can be extended the most
-    for (const auto& candidate_similar_chunk_offset : similar_chunk_minichunks_map[minichunk_hash]) {
+    while (similar_minichunk_iter != similar_chunk_minichunk_hashes.cend()) {
+      auto& similar_minichunk_data = *similar_minichunk_iter;
+      auto& candidate_similar_chunk_offset = std::get<0>(similar_minichunk_data);
+
       // We have a match, attempt to extend it, first backwards
       const uint64_t candidate_backwards_extended_size = find_identical_suffix_byte_count(
         std::span(chunk.data.get(), minichunk_offset),
@@ -693,6 +706,8 @@ DeltaEncodingResult simulate_delta_encoding_shingling(const utility::CDChunk& ch
         backwards_extended_size = candidate_backwards_extended_size;
         best_similar_chunk_minichunk_offset = candidate_similar_chunk_offset;
       }
+
+      similar_minichunk_iter = std::find_if(similar_minichunk_iter + 1, similar_chunk_minichunk_hashes.cend(), search_for_similar_minichunk);
     }
 
     // Any remaining unaccounted data needs to be INSERTed as it couldn't be matched from the similar_chunk
@@ -762,14 +777,15 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
   uint64_t saved_size = start_matching_data_len + end_matching_data_len;
 
   XXH3_state_t* state = XXH3_createState();
-  std::unordered_map<uint64_t, std::vector<uint64_t>> similar_chunk_minichunks_map{};  // key:hash, value:list of offsets
+  // (offset, hash), it might be tempting to change this for a hashmap, don't, it will be slower as sequential search is really fast because there won't be many minuchunks
+  std::vector<std::tuple<uint32_t, uint64_t>> similar_chunk_minichunk_hashes;
 
   uint32_t minichunk_offset = 0;
   for (const auto& minichunk_len : std::span(similar_chunk.minichunks.get(), similar_chunk.minichunks_len)) {
     XXH3_64bits_reset(state);
     XXH3_64bits_update(state, similar_chunk.data.get() + minichunk_offset, minichunk_len);
     XXH64_hash_t minichunk_hash = XXH3_64bits_digest(state);
-    similar_chunk_minichunks_map[minichunk_hash].emplace_back(minichunk_offset);
+    similar_chunk_minichunk_hashes.emplace_back(minichunk_offset, minichunk_hash);
     minichunk_offset += minichunk_len;
   }
 
@@ -787,7 +803,13 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
     XXH3_64bits_update(state, chunk.data.get() + minichunk_offset, minichunk_len);
     minichunk_hash = XXH3_64bits_digest(state);
 
-    if (!similar_chunk_minichunks_map.contains(minichunk_hash)) {
+    const auto search_for_similar_minichunk = [&minichunk_hash](const std::tuple<uint32_t, uint64_t>& minichunk_data) { return std::get<1>(minichunk_data) == minichunk_hash; };
+    auto similar_minichunk_iter = std::find_if(
+      similar_chunk_minichunk_hashes.cbegin(),
+      similar_chunk_minichunk_hashes.cend(),
+      search_for_similar_minichunk
+    );
+    if (similar_minichunk_iter == similar_chunk_minichunk_hashes.cend()) {
       minichunk_offset += minichunk_len;
       continue;
     }
@@ -797,7 +819,10 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
     uint64_t best_similar_chunk_minichunk_offset = 0;  // we will select the minichunk that can be extended the most
 
     // We find the instance of the minichunk on the similar_chunk that can be extended the most
-    for (const auto& candidate_similar_chunk_offset : similar_chunk_minichunks_map[minichunk_hash]) {
+    while (similar_minichunk_iter != similar_chunk_minichunk_hashes.cend()) {
+      auto& similar_minichunk_data = *similar_minichunk_iter;
+      auto& candidate_similar_chunk_offset = std::get<0>(similar_minichunk_data);
+
       // We have a match, attempt to extend it, first backwards
       const uint64_t candidate_backwards_extended_size = find_identical_suffix_byte_count(
         std::span(chunk.data.get(), minichunk_offset),
@@ -815,6 +840,8 @@ DeltaEncodingResult simulate_delta_encoding_using_minichunks(const utility::CDCh
         backwards_extended_size = candidate_backwards_extended_size;
         best_similar_chunk_minichunk_offset = candidate_similar_chunk_offset;
       }
+
+      similar_minichunk_iter = std::find_if(similar_minichunk_iter + 1, similar_chunk_minichunk_hashes.cend(), search_for_similar_minichunk);
     }
 
     // Any remaining unaccounted data needs to be INSERTed as it couldn't be matched from the similar_chunk
