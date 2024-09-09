@@ -68,7 +68,7 @@ namespace constants {
   static constexpr uint32_t MAXIMUM_MAX = 1'073'741'824;
 
   static constexpr uint32_t GEAR[256] = {
-    1553318008, 574654857,  759734804,  310648967,  1393527547, 1195718329,
+    0,          574654857,  759734804,  310648967,  1393527547, 1195718329,
     694400241,  1154184075, 1319583805, 1298164590, 122602963,  989043992,
     1918895050, 933636724,  1369634190, 1963341198, 1565176104, 1296753019,
     1105746212, 1191982839, 1195494369, 29065008,   1635524067, 722221599,
@@ -247,24 +247,27 @@ namespace fastcdc {
     uint32_t mask_b = mask_l >> 1;
 
     // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
-    // the content defined nature of the Hashes
-    if (i < barrier) {  // Only do it if we are not going to quit immediately
-      for (uint32_t idx = 0; idx < std::min<uint32_t>(i, 32); idx++) {
-        pattern += (constants::GEAR[data[i - idx - 1]] >> idx);
-      }
-    }
+    // the content defined nature of the Hashes.
+    // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
+    uint32_t remaining_minmax_adjustment = std::min<uint32_t>(i, 32);
+    i -= remaining_minmax_adjustment;
 
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
+      if (remaining_minmax_adjustment > 0) {
+        remaining_minmax_adjustment--;
+        i++;
+        continue;
+      }
       if (!(pattern & mask_s)) return i;
-      i += 1;
+      i++;
     }
     barrier = std::min(max_size, size);
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
       if (!(pattern & mask_l)) return i;
       if (!backup_i.has_value() && !(pattern & mask_b)) backup_i = i;
-      i += 1;
+      i++;
     }
     return backup_i.has_value() ? *backup_i : i;
   }
@@ -293,15 +296,18 @@ namespace fastcdc {
     uint32_t mask_b = mask_l >> 1;
 
     // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
-    // the content defined nature of the Hashes
-    if (i < barrier) {  // Only do it if we are not going to quit immediately
-      for (uint32_t idx = 0; idx < std::min<uint32_t>(i, 32); idx++) {
-        pattern += (constants::GEAR[data[i - idx - 1]] >> idx);
-      }
-    }
+    // the content defined nature of the Hashes.
+    // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
+    uint32_t remaining_minmax_adjustment = std::min<uint32_t>(i, 32);
+    i -= remaining_minmax_adjustment;
 
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
+      if (remaining_minmax_adjustment > 0) {
+        remaining_minmax_adjustment--;
+        i++;
+        continue;
+      }
       if (!(pattern & mask_s)) return return_val;
       if (!(pattern & constants::CDS_SAMPLING_MASK)) {
         if (features.empty()) {
