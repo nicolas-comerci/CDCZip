@@ -23,6 +23,7 @@
 #include <deque>
 #include <filesystem>
 #include <ranges>
+#include <stack>
 #include <unordered_set>
 
 #include "contrib/bitstream.h"
@@ -1442,7 +1443,7 @@ int main(int argc, char* argv[]) {
   uint64_t delta_compressed_approx_size = 0;
   uint64_t delta_compressed_chunk_count = 0;
 
-  std::unordered_map<std::bitset<64>, std::vector<uint64_t>> known_hashes{};  // Find chunk pos by hash
+  std::unordered_map<std::bitset<64>, std::list<uint64_t>> known_hashes{};  // Find chunk pos by hash
 
   uint64_t chunk_i = 0;
   uint64_t last_reduced_chunk_i = 0;
@@ -1451,7 +1452,7 @@ int main(int argc, char* argv[]) {
   std::unordered_map<std::bitset<64>, uint64_t> simhashes_dict{};
 
   // Find chunk_i that has a given SuperFeature
-  std::unordered_map<uint32_t, std::set<uint64_t>> superfeatures_dict{};
+  std::unordered_map<uint32_t, std::list<uint64_t>> superfeatures_dict{};
 
   const uint32_t simhash_chunk_size = 16;
   const uint32_t max_allowed_dist = 32;
@@ -1555,42 +1556,60 @@ int main(int argc, char* argv[]) {
       ? total_size - *max_match_distance - lz_manager.accumulatedSavings()
       : 0;
     if (!output_disabled) lz_manager.dump(verify_file_stream, false, earliest_allowed_offset);
-    while (!chunks.empty()) {
-      auto& previous_chunk = chunks[first_non_out_of_range_chunk_i];
-      if (previous_chunk.offset + previous_chunk.length >= earliest_allowed_offset) break;
 
-      // Delete its data
-      previous_chunk.deleteData();
+    {
+      std::stack<uint64_t> to_unindex_chunks{};
+      while (!chunks.empty()) {
+        auto& previous_chunk = chunks[first_non_out_of_range_chunk_i];
+        if (previous_chunk.offset + previous_chunk.length >= earliest_allowed_offset) break;
 
-      // Remove the out of range chunks from the indexes so they can't be used for dedup or delta
-      auto& hash_vec = known_hashes[previous_chunk.hash];
-      if (hash_vec.size() == 1) {
-        known_hashes.erase(previous_chunk.hash);
+        // Delete its data
+        previous_chunk.deleteData();
+        previous_chunk.minichunks.reset();
+        previous_chunk.minichunks_len = 0;
+
+        to_unindex_chunks.push(first_non_out_of_range_chunk_i);
+
+        first_non_out_of_range_chunk_i++;
       }
-      else {
-        hash_vec.erase(std::ranges::find(hash_vec, first_non_out_of_range_chunk_i));
-      }
 
-      if (use_generalized_resemblance_detection) {
-        const auto base = hamming_base(previous_chunk.lsh);
-        if (simhashes_dict[base] == first_non_out_of_range_chunk_i) {
-          simhashes_dict.erase(base);
+      while (!to_unindex_chunks.empty()) {
+        auto previous_chunk_i = to_unindex_chunks.top();
+        to_unindex_chunks.pop();
+
+        auto& previous_chunk = chunks[previous_chunk_i];
+        // Remove the out of range chunks from the indexes so they can't be used for dedup or delta
+        auto hash_list_iter = known_hashes.find(previous_chunk.hash);
+        if (hash_list_iter == known_hashes.end()) continue;  // Duplicate with higher chunk_i already de-indexed, so all other indexes already updated as well
+
+        auto* hash_list = &hash_list_iter->second;
+        const auto hash_vec_size = hash_list->size();
+        if (hash_vec_size == 1 || hash_list->back() <= previous_chunk_i) {
+          known_hashes.erase(previous_chunk.hash);
+        }
+        else {
+          hash_list->pop_front();
+        }
+
+        if (use_generalized_resemblance_detection) {
+          const auto base = hamming_base(previous_chunk.lsh);
+          if (simhashes_dict[base] <= previous_chunk_i) {
+            simhashes_dict.erase(base);
+          }
+        }
+
+        if (use_feature_extraction) {
+          for (auto& sf : previous_chunk.super_features) {
+            auto& sf_list = superfeatures_dict[sf];
+            if (sf_list.size() == 1 || sf_list.back() <= previous_chunk_i) {
+              superfeatures_dict.erase(sf);
+            }
+            else if (sf_list.front() == previous_chunk_i) {
+              sf_list.pop_front();
+            }
+          }
         }
       }
-
-      if (use_feature_extraction) {
-        for (auto& sf : previous_chunk.super_features) {
-          auto& chunk_idx_vec = superfeatures_dict[sf];
-          if (chunk_idx_vec.size() == 1) {
-            superfeatures_dict.erase(sf);
-          }
-          else {
-            superfeatures_dict[sf].erase(first_non_out_of_range_chunk_i);
-          }
-        }
-      }
-
-      first_non_out_of_range_chunk_i++;
     }
 
     chunks.emplace_back(std::move(std::get<0>(*generated_chunk)));
@@ -1617,7 +1636,8 @@ int main(int argc, char* argv[]) {
     const auto hashing_end_time = std::chrono::high_resolution_clock::now();
     hashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - hashing_start_time).count();
 
-    const bool is_duplicate_chunk = known_hashes.contains(chunk.hash);
+    const std::optional<uint64_t> duplicate_chunk_i = known_hashes.contains(chunk.hash) ? std::optional{known_hashes[chunk.hash].back()} : std::nullopt;
+    const bool is_duplicate_chunk = duplicate_chunk_i.has_value() && chunk_i > 0 && *duplicate_chunk_i >= first_non_out_of_range_chunk_i;
 
     if (use_fat_chunks && !is_duplicate_chunk) {
       chunk.data = std::make_shared_for_overwrite<uint8_t[]>(chunk.length);
@@ -1729,14 +1749,18 @@ int main(int argc, char* argv[]) {
           for (const auto& [candidate_i, sf_count] : chunk_rank) {
             if (sf_count == 4) {
               for (const auto& sf : chunk.super_features) {
-                superfeatures_dict[sf].erase(candidate_i);
+                auto& sf_vec = superfeatures_dict[sf];
+                auto sf_iter = std::find(sf_vec.begin(), sf_vec.end(), candidate_i);
+                if (sf_iter != sf_vec.end()) {
+                  sf_vec.erase(sf_iter);
+                }
               }
             }
           }
 
           // Register this chunk's SuperFeatures so that matches may be found with subsequent chunks
-          for (uint64_t i = 0; i < 4; i++) {
-            superfeatures_dict[chunk.super_features[i]].insert(chunk_i);
+          for (const auto& sf : chunk.super_features) {
+            superfeatures_dict[sf].push_back(chunk_i);
           }
         }
       }
@@ -1844,9 +1868,8 @@ int main(int argc, char* argv[]) {
       }
     }
     else {
-      const auto& previous_chunk_i = known_hashes[chunk.hash].back();
-      similarity_locality_anchor_i = previous_chunk_i;
-      const auto& previous_chunk_instance = chunks[previous_chunk_i];
+      similarity_locality_anchor_i = duplicate_chunk_i;
+      const auto& previous_chunk_instance = chunks[*duplicate_chunk_i];
       chunk.data = previous_chunk_instance.data;
       // Important to copy LSH in case this duplicate chunk ends up being candidate for Delta encoding via DupAdj or something
       chunk.lsh = previous_chunk_instance.lsh;
@@ -1865,7 +1888,7 @@ int main(int argc, char* argv[]) {
 
       new_instructions.emplace_back(LZInstructionType::COPY, previous_chunk_instance.offset, chunk.length);
     }
-    known_hashes[chunk.hash].push_back(chunk_i);
+    known_hashes[chunk.hash].emplace_back(chunk_i);
 
     // if similarity_locality_anchor has a value it means we either deduplicated the chunk or delta compressed it
     if (similarity_locality_anchor_i.has_value()) {
