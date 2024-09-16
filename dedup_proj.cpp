@@ -550,18 +550,127 @@ struct DeltaEncodingResult {
 };
 
 uint64_t find_identical_prefix_byte_count(const std::span<const uint8_t> data1_span, const std::span<const uint8_t> data2_span) {
-  // TODO: we just use std::memcmp and hope we have SIMD optimized versions, maybe explicitly handle SIMD?
   const auto cmp_size = std::min(data1_span.size(), data2_span.size());
   uint64_t matching_data_count = 0;
   uint64_t i = 0;
-  while (i < cmp_size) {
-    const bool can_sse_compare = cmp_size - i >= 16;
-    if (can_sse_compare && std::memcmp(data1_span.data() + i, data2_span.data() + i, 16) == 0) {
-      matching_data_count += 16;
-      i += 16;
-      continue;
+
+  const uint64_t avx2_batches = cmp_size / 32;
+  if (avx2_batches > 0) {
+    uint64_t avx2_batches_size = avx2_batches * 32;
+
+    const auto alignment_mask = ~31;
+    const uintptr_t data1_ptr = reinterpret_cast<uintptr_t>(data1_span.data() + i);
+    const auto data1_misalignment = data1_ptr ^ (data1_ptr & alignment_mask);
+    const uintptr_t data2_ptr = reinterpret_cast<uintptr_t>(data2_span.data() + i);
+    const auto data2_misalignment = data2_ptr ^ (data2_ptr & alignment_mask);
+    __m256i data1_avx2_vector;
+    __m256i data2_avx2_vector;
+    bool data_aligned = data1_misalignment == 0 && data2_misalignment == 0;
+    if (
+      // If data is not aligned but aligning it might be worth it we align it
+      // (if aligning it means sse can no longer run we run misaligned and be done with it)
+      !data_aligned &&
+      (data1_misalignment == data2_misalignment && avx2_batches_size > 1)
+      ) {
+      // To align the data we need to skip the misaligned bytes, but also adjust the sse_batches_size so it's still a multiple of 16
+      for (uint64_t j = 0; j < data1_misalignment; j++) {
+        if (*(data1_span.data() + i) != *(data2_span.data() + i)) return matching_data_count;
+        matching_data_count++;
+        i++;
+      }
+      avx2_batches_size -= 32 - data1_misalignment;
+      data_aligned = true;
     }
 
+    while (i < avx2_batches_size) {
+      if (!data_aligned) {
+        data1_avx2_vector = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data1_span.data() + i));
+        data2_avx2_vector = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data2_span.data() + i));
+      }
+      else {
+        data1_avx2_vector = _mm256_load_si256(reinterpret_cast<const __m256i*>(data1_span.data() + i));
+        data2_avx2_vector = _mm256_load_si256(reinterpret_cast<const __m256i*>(data2_span.data() + i));
+      }
+      const __m256i avx2_cmp_result = _mm256_cmpeq_epi8(data1_avx2_vector, data2_avx2_vector);
+      const uint32_t result_mask = _mm256_movemask_epi8(avx2_cmp_result);
+
+      unsigned long avx2_matching_data_count;
+      switch (result_mask) {
+      case 0:
+        avx2_matching_data_count = 0;
+        break;
+      case 0b11111111111111111111111111111111:
+        avx2_matching_data_count = 32;
+        break;
+      default:
+        const uint32_t inverted_mask = result_mask ^ 0b11111111111111111111111111111111;
+        avx2_matching_data_count = _BitScanForward64(&avx2_matching_data_count, inverted_mask) ? avx2_matching_data_count : 0;
+      }
+      matching_data_count += avx2_matching_data_count;
+      if (avx2_matching_data_count < 32) return matching_data_count;
+      i += avx2_matching_data_count;
+    }
+  }
+  
+  const uint64_t sse_batches = (cmp_size - i) / 16;
+  if (sse_batches > 0) {
+    uint64_t sse_batches_size = sse_batches * 16;
+
+    const auto alignment_mask = ~15;
+    const uintptr_t data1_ptr = reinterpret_cast<uintptr_t>(data1_span.data() + i);
+    const auto data1_misalignment = data1_ptr ^ (data1_ptr & alignment_mask);
+    const uintptr_t data2_ptr = reinterpret_cast<uintptr_t>(data2_span.data() + i);
+    const auto data2_misalignment = data2_ptr ^ (data2_ptr & alignment_mask);
+    __m128i data1_sse_vector;
+    __m128i data2_sse_vector;
+    bool data_aligned = data1_misalignment == 0 && data2_misalignment == 0;
+    if (
+      // If data is not aligned but aligning it might be worth it we align it
+      // (if aligning it means sse can no longer run we run misaligned and be done with it)
+      !data_aligned &&
+      (data1_misalignment == data2_misalignment && sse_batches > 1)
+      ) {
+      // To align the data we need to skip the misaligned bytes, but also adjust the sse_batches_size so it's still a multiple of 16
+      for (uint64_t j = 0; j < data1_misalignment; j++) {
+        if (*(data1_span.data() + i) != *(data2_span.data() + i)) return matching_data_count;
+        matching_data_count++;
+        i++;
+      }
+      sse_batches_size -= 16 - data1_misalignment;
+      data_aligned = true;
+    }
+
+    while (i < sse_batches_size) {
+      if (!data_aligned) {
+        data1_sse_vector = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data1_span.data() + i));
+        data2_sse_vector = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data2_span.data() + i));
+      }
+      else {
+        data1_sse_vector = _mm_load_si128(reinterpret_cast<const __m128i*>(data1_span.data() + i));
+        data2_sse_vector = _mm_load_si128(reinterpret_cast<const __m128i*>(data2_span.data() + i));
+      }
+      const __m128i sse_cmp_result = _mm_cmpeq_epi8(data1_sse_vector, data2_sse_vector);
+      const uint32_t result_mask = _mm_movemask_epi8(sse_cmp_result);
+
+      unsigned long sse_matching_data_count;
+      switch (result_mask) {
+      case 0:
+        sse_matching_data_count = 0;
+        break;
+      case 0b1111111111111111:
+        sse_matching_data_count = 16;
+        break;
+      default:
+        const uint32_t inverted_mask = result_mask ^ 0b1111111111111111;
+        sse_matching_data_count = _BitScanForward64(&sse_matching_data_count, inverted_mask) ? sse_matching_data_count : 0;
+      }
+      matching_data_count += sse_matching_data_count;
+      if (sse_matching_data_count < 16) return matching_data_count;
+      i += sse_matching_data_count;
+    }
+  }
+
+  while (i < cmp_size) {
     const bool can_u64int_compare = cmp_size - i >= 8;
     if (can_u64int_compare && std::memcmp(data1_span.data() + i, data2_span.data() + i, 8) == 0) {
       matching_data_count += 8;
@@ -577,24 +686,130 @@ uint64_t find_identical_prefix_byte_count(const std::span<const uint8_t> data1_s
 }
 
 uint64_t find_identical_suffix_byte_count(const std::span<const uint8_t> data1_span, const std::span<const uint8_t> data2_span) {
-  // TODO: we just use std::memcmp and hope we have SIMD optimized versions, maybe explicitly handle SIMD?
   const auto cmp_size = std::min(data1_span.size(), data2_span.size());
   const auto data1_start = data1_span.data() + data1_span.size() - cmp_size;
   const auto data2_start = data2_span.data() + data2_span.size() - cmp_size;
 
   uint64_t matching_data_count = 0;
   uint64_t i = 0;
-  while (i < cmp_size) {
-    const bool can_sse_compare = cmp_size - i >= 16;
+
+  const uint64_t avx2_batches = cmp_size / 32;
+  if (avx2_batches > 0) {
+    uint64_t avx2_batches_size = avx2_batches * 32;
+
+    const auto alignment_mask = ~31;
+    const uintptr_t data1_ptr = reinterpret_cast<uintptr_t>(data1_start + cmp_size);
+    const auto data1_misalignment = data1_ptr ^ (data1_ptr & alignment_mask);
+    const uintptr_t data2_ptr = reinterpret_cast<uintptr_t>(data2_start + cmp_size);
+    const auto data2_misalignment = data2_ptr ^ (data2_ptr & alignment_mask);
+    __m256i data1_avx2_vector;
+    __m256i data2_avx2_vector;
+    bool data_aligned = data1_misalignment == 0 && data2_misalignment == 0;
     if (
-      can_sse_compare &&
-      std::memcmp(data1_start + cmp_size - 16 - i, data2_start + cmp_size - 16 - i, 16) == 0
+      // If data is not aligned but aligning it might be worth it we align it
+      // (if aligning it means sse can no longer run we run misaligned and be done with it)
+      !data_aligned &&
+      (data1_misalignment == data2_misalignment && avx2_batches_size > 1)
       ) {
-      matching_data_count += 16;
-      i += 16;
-      continue;
+      // To align the data we need to skip the misaligned bytes, but also adjust the sse_batches_size so it's still a multiple of 16
+      for (uint64_t j = 0; j < data1_misalignment; j++) {
+        if (*(data1_start + cmp_size - 1 - i) != *(data2_start + cmp_size - 1 - i)) return matching_data_count;
+        matching_data_count++;
+        i++;
+      }
+      avx2_batches_size -= 32 - data1_misalignment;
+      data_aligned = true;
     }
 
+    while (i < avx2_batches_size) {
+      if (!data_aligned) {
+        data1_avx2_vector = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data1_start + cmp_size - 32 - i));
+        data2_avx2_vector = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data2_start + cmp_size - 32 - i));
+      }
+      else {
+        data1_avx2_vector = _mm256_load_si256(reinterpret_cast<const __m256i*>(data1_start + cmp_size - 32 - i));
+        data2_avx2_vector = _mm256_load_si256(reinterpret_cast<const __m256i*>(data2_start + cmp_size - 32 - i));
+      }
+      const __m256i avx2_cmp_result = _mm256_cmpeq_epi8(data1_avx2_vector, data2_avx2_vector);
+      const uint32_t result_mask = _mm256_movemask_epi8(avx2_cmp_result);
+
+      unsigned long avx2_matching_data_count;
+      switch (result_mask) {
+      case 0:
+        avx2_matching_data_count = 0;
+        break;
+      case 0b11111111111111111111111111111111:
+        avx2_matching_data_count = 32;
+        break;
+      default:
+        const uint32_t inverted_mask = result_mask ^ 0b11111111111111111111111111111111;
+        avx2_matching_data_count = _BitScanReverse64(&avx2_matching_data_count, inverted_mask) ? (32 - 1 - avx2_matching_data_count) : 0;
+      }
+      matching_data_count += avx2_matching_data_count;
+      if (avx2_matching_data_count < 32) return matching_data_count;
+      i += avx2_matching_data_count;
+    }
+  }
+
+  const uint64_t sse_batches = (cmp_size - i) / 16;
+  if (sse_batches > 0) {
+    uint64_t sse_batches_size = sse_batches * 16;
+
+    const auto alignment_mask = ~15;
+    const uintptr_t data1_ptr = reinterpret_cast<uintptr_t>(data1_start + cmp_size - i);
+    const auto data1_misalignment = data1_ptr ^ (data1_ptr & alignment_mask);
+    const uintptr_t data2_ptr = reinterpret_cast<uintptr_t>(data2_start + cmp_size - i);
+    const auto data2_misalignment = data2_ptr ^ (data2_ptr & alignment_mask);
+    __m128i data1_sse_vector;
+    __m128i data2_sse_vector;
+    bool data_aligned = data1_misalignment == 0 && data2_misalignment == 0;
+    if (
+      // If data is not aligned but aligning it might be worth it we align it
+      // (if aligning it means sse can no longer run we run misaligned and be done with it)
+      !data_aligned &&
+      (data1_misalignment == data2_misalignment && sse_batches > 1)
+      ) {
+      // To align the data we need to skip the misaligned bytes, but also adjust the sse_batches_size so it's still a multiple of 16
+      for (uint64_t j = 0; j < data1_misalignment; j++) {
+        if (*(data1_start + cmp_size - 1 - i) != *(data2_start + cmp_size - 1 - i)) return matching_data_count;
+        matching_data_count++;
+        i++;
+      }
+      sse_batches_size -= 16 - data1_misalignment;
+      data_aligned = true;
+    }
+
+    while (i < sse_batches_size) {
+      if (!data_aligned) {
+        data1_sse_vector = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data1_start + cmp_size - 16 - i));
+        data2_sse_vector = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data2_start + cmp_size - 16 - i));
+      }
+      else {
+        data1_sse_vector = _mm_load_si128(reinterpret_cast<const __m128i*>(data1_start + cmp_size - 16 - i));
+        data2_sse_vector = _mm_load_si128(reinterpret_cast<const __m128i*>(data2_start + cmp_size - 16 - i));
+      }
+      const __m128i sse_cmp_result = _mm_cmpeq_epi8(data1_sse_vector, data2_sse_vector);
+      const uint32_t result_mask = _mm_movemask_epi8(sse_cmp_result);
+
+      unsigned long sse_matching_data_count;
+      switch (result_mask) {
+      case 0:
+        sse_matching_data_count = 0;
+        break;
+      case 0b1111111111111111:
+        sse_matching_data_count = 16;
+        break;
+      default:
+        const uint32_t inverted_mask = result_mask ^ 0b1111111111111111;
+        sse_matching_data_count = _BitScanReverse64(&sse_matching_data_count, inverted_mask) ? (16 - 1 - sse_matching_data_count) : 0;
+      }
+      matching_data_count += sse_matching_data_count;
+      if (sse_matching_data_count < 16) return matching_data_count;
+      i += sse_matching_data_count;
+    }
+  }
+
+  while (i < cmp_size) {
     const bool can_u64int_compare = cmp_size - i >= 8;
     if (
       can_u64int_compare &&
@@ -1104,7 +1319,7 @@ public:
             if (instruction_chunk_pos >= matched_amt) {
               instruction_chunk_pos -= matched_amt;
             }
-            else if (instruction_chunk_i == 0) {
+            else if (instruction_chunk_i == 0 || instruction_chunk->offset == earliest_allowed_offset) {
               stop_matching = true;
               break;
             }
@@ -1127,7 +1342,7 @@ public:
             if (prevInstruction_chunk_pos >= matched_amt) {
               prevInstruction_chunk_pos -= matched_amt;
             }
-            else if (prevInstruction_chunk_i == 0) {
+            else if (prevInstruction_chunk_i == 0 || prevInstruction_chunk->offset == earliest_allowed_offset) {
               stop_matching = true;
               break;
             }
@@ -1488,7 +1703,9 @@ int main(int argc, char* argv[]) {
 
   const bool is_any_delta_on = use_dupadj || use_dupadj_backwards || use_feature_extraction || use_generalized_resemblance_detection || resemblance_attempt_window > 0;
 
-  const std::optional<uint64_t> dictionary_size_limit = argc == 3 ? std::optional<uint64_t>(std::stoi(std::string(argv[2] + 3)) * 1024 * 1024) : std::nullopt;
+  const std::optional<uint64_t> dictionary_size_limit = argc == 3
+    ? std::optional(static_cast<uint64_t>(std::stoi(std::string(argv[2] + 3))) * 1024 * 1024)
+    : std::nullopt;
   uint64_t dictionary_size_used = 0;
   uint64_t first_non_out_of_range_chunk_i = 0;
 
@@ -1618,8 +1835,23 @@ int main(int argc, char* argv[]) {
     const auto hashing_end_time = std::chrono::high_resolution_clock::now();
     hashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(hashing_end_time - hashing_start_time).count();
 
-    const std::optional<uint64_t> duplicate_chunk_i = known_hashes.contains(chunk.chunk_data->hash) ? std::optional{known_hashes[chunk.chunk_data->hash].back()} : std::nullopt;
-    const bool is_duplicate_chunk = duplicate_chunk_i.has_value() && chunk_i > 0 && *duplicate_chunk_i >= first_non_out_of_range_chunk_i;
+    std::optional<uint64_t> duplicate_chunk_i = std::nullopt;
+    // If last chunk was a duplicate or similar chunk, it's possible the next chunk from there is a duplicate of the current chunk, and if it is,
+    // it's likely it will allow for better reduction (or at least less LZInstructions and match extension attempts)
+    if (prev_similarity_locality_anchor_i.has_value()) {
+      const auto prev_similarity_anchor_next_chunk_i = *prev_similarity_locality_anchor_i + 1;
+      if (prev_similarity_anchor_next_chunk_i >= first_non_out_of_range_chunk_i) {
+        auto& prev_similarity_anchor_next_chunk = chunks[prev_similarity_anchor_next_chunk_i];
+        if (prev_similarity_anchor_next_chunk.chunk_data->hash == chunk.chunk_data->hash) {
+          duplicate_chunk_i = prev_similarity_anchor_next_chunk_i;
+        }
+      }
+    }
+    if (!duplicate_chunk_i.has_value() && known_hashes.contains(chunk.chunk_data->hash)) {
+      const auto duplicate_chunk_i_candidate = known_hashes[chunk.chunk_data->hash].back();
+      duplicate_chunk_i = duplicate_chunk_i_candidate >= first_non_out_of_range_chunk_i ? std::optional{duplicate_chunk_i_candidate} : std::nullopt;
+    }
+    const bool is_duplicate_chunk = duplicate_chunk_i.has_value();
 
     if (!is_duplicate_chunk) {
       chunk.chunk_data->data = std::vector(data_span.data(), data_span.data() + data_span.size());

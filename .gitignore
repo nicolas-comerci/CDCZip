@@ -71,3 +71,4 @@ cmake-build-default/
 *.qcow2c
 *.img
 *.7z
+*.zstd
