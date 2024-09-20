@@ -13,6 +13,15 @@
 #include <array>
 #include <unordered_map>
 #include <bitset>
+#include <cassert>
+#include <cstdarg>
+
+#ifndef __unix
+//#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#include <conio.h>
+#endif
 
 // Hash libraries
 #include "contrib/boost/uuid/detail/sha1.hpp"
@@ -35,8 +44,58 @@
 //#include <faiss/IndexLSH.h>
 //#include <faiss/IndexBinaryHash.h>
 
+typedef enum
+{
+  STDIN_HANDLE = 0,
+  STDOUT_HANDLE = 1,
+  STDERR_HANDLE = 2,
+} StdHandles;
+#ifndef __unix
+void set_std_handle_binary_mode(StdHandles handle) { _setmode(handle, O_BINARY); }
+#else
+void set_std_handle_binary_mode(StdHandles handle) {}
+#endif
+
+#ifndef _WIN32
+int ttyfd = -1;
+#endif
+
+void print_to_console(const std::string& format) {
+#ifdef _WIN32
+  for (char chr : format) {
+    putch(chr);
+  }
+#else
+  if (ttyfd < 0)
+    ttyfd = open("/dev/tty", O_RDWR);
+  write(ttyfd, format.c_str(), format.length());
+#endif
+}
+
+void print_to_console(const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  va_list args_copy;
+  va_copy(args_copy, args);
+  int length = std::vsnprintf(nullptr, 0, fmt, args);
+  va_end(args);
+  assert(length >= 0);
+
+  char* buf = new char[length + 1];
+  std::vsnprintf(buf, length + 1, fmt, args_copy);
+  va_end(args_copy);
+
+  std::string str(buf);
+  delete[] buf;
+  print_to_console(str);
+}
+
 char get_char_with_echo() {
-  return getchar();
+#ifndef __unix
+  return getche();
+#else
+  return fgetc(stdin);
+#endif
 }
 
 std::string get_sha1_hash(boost::uuids::detail::sha1& s) {
@@ -412,6 +471,7 @@ namespace fastcdc {
 }
 
 #include <immintrin.h>
+#include <thread>
 
 __m256i movemask_inverse_epi8(const uint32_t mask) {
   __m256i vmask(_mm256_set1_epi32(mask));
@@ -1097,21 +1157,35 @@ public:
   }
 };
 
+void dump_vector_to_ostream_with_guard(std::vector<uint8_t>&& _output_buffer, uint64_t buffer_used_len, std::ostream* ostream) {
+  std::vector<uint8_t> output_buffer = std::move(_output_buffer);
+  ostream->write(reinterpret_cast<const char*>(output_buffer.data()), buffer_used_len);
+}
+
 class WrappedOStreamOutputStream: public OutputStream {
 private:
   std::ostream* ostream;
+  uint64_t buffer_size;
   std::vector<uint8_t> output_buffer;
   uint64_t buffer_used_len = 0;
+  std::thread dump_thread;
+
+  void write_with_thread() {
+    if (dump_thread.joinable()) dump_thread.join();
+    dump_thread = std::thread(dump_vector_to_ostream_with_guard, std::move(output_buffer), buffer_used_len, ostream);
+    buffer_used_len = 0;
+    output_buffer.resize(buffer_size);
+  }
 
 public:
-  explicit WrappedOStreamOutputStream(std::ostream* _ostream, uint64_t buffer_size = 200 * 1024 * 1024): ostream(_ostream) {
+  explicit WrappedOStreamOutputStream(std::ostream* _ostream, uint64_t _buffer_size = 200ull * 1024 * 1024): ostream(_ostream), buffer_size(_buffer_size) {
     output_buffer.resize(buffer_size);
   }
 
   ~WrappedOStreamOutputStream() override {
     if (buffer_used_len > 0) {
-      ostream->write(reinterpret_cast<const char*>(output_buffer.data()), buffer_used_len);
-      buffer_used_len = 0;
+      write_with_thread();
+      dump_thread.join();
     }
     ostream->flush();
   }
@@ -1126,8 +1200,7 @@ public:
       return size;
     }
     if (size + buffer_used_len > output_buffer.size()) {
-      ostream->write(reinterpret_cast<const char*>(output_buffer.data()), buffer_used_len);
-      buffer_used_len = 0;
+      write_with_thread();
     }
     std::copy_n(buffer, size, output_buffer.data() + buffer_used_len);
     buffer_used_len += size;
@@ -1197,7 +1270,7 @@ public:
     uint64_t earliest_allowed_offset = _earliest_allowed_offset.has_value() ? *_earliest_allowed_offset : 0;
 #ifndef NDEBUG
     if (instruction.type == LZInstructionType::INSERT && instruction.offset != current_offset) {
-      std::cout << "INSERT LZInstruction added is not at current offset!" << std::flush;
+      print_to_console("INSERT LZInstruction added is not at current offset!");
       exit(1);
     }
 #endif
@@ -1238,7 +1311,7 @@ public:
         verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()) + prevInstruction->size, instruction.size);
         // Ensure data matches
         if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), data_count) != 0) {
-          std::cout << "Error while verifying addInstruction at offset " + std::to_string(current_offset) + "\n" << std::flush;
+          print_to_console("Error while verifying addInstruction at offset " + std::to_string(current_offset) + "\n");
           exit(1);
         }
       }
@@ -1251,7 +1324,7 @@ public:
         utility::ChunkEntry* instruction_chunk = &(*chunks)[instruction_chunk_i];
 #ifndef NDEBUG
         if (instruction_chunk->offset + instruction_chunk_pos != instruction.offset - 1) {
-          std::cout << "BACKWARD MATCH EXTENSION NEW INSTRUCTION OFFSET MISMATCH" << std::flush;
+          print_to_console("BACKWARD MATCH EXTENSION NEW INSTRUCTION OFFSET MISMATCH\n");
           exit(1);
         }
 #endif
@@ -1273,7 +1346,7 @@ public:
           utility::ChunkEntry* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
 #ifndef NDEBUG
           if (prevInstruction_chunk->offset + prevInstruction_chunk_pos != prevInstruction_end_offset - 1) {
-            std::cout << "BACKWARD MATCH EXTENSION PREVIOUS INSTRUCTION OFFSET MISMATCH" << std::flush;
+            print_to_console("BACKWARD MATCH EXTENSION PREVIOUS INSTRUCTION OFFSET MISMATCH\n");
             exit(1);
           }
 #endif
@@ -1427,7 +1500,7 @@ public:
         verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()) + prevInstruction->size, instruction.size);
         // Ensure data matches
         if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), data_count) != 0) {
-          std::cout << "Error while verifying addInstruction at offset " + std::to_string(current_offset) + "\n" << std::flush;
+          print_to_console("Error while verifying addInstruction at offset " + std::to_string(current_offset) + "\n");
           exit(1);
         }
       }
@@ -1470,7 +1543,7 @@ public:
     if (prevInstruction->type == LZInstructionType::COPY) accumulated_savings -= size;
   }
 
-  void dump(std::istream& istream, bool verify_copies = true, std::optional<uint64_t> up_to_offset = std::nullopt) {
+  void dump(std::istream& istream, bool verify_copies, std::optional<uint64_t> up_to_offset = std::nullopt) {
     std::vector<char> buffer;
     std::vector<char> verify_buffer;
 
@@ -1509,10 +1582,63 @@ public:
           istream.read(verify_buffer.data(), instruction.size);
 
           if (std::memcmp(verify_buffer.data(), buffer.data(), instruction.size) != 0) {
-            std::cout << "Error while verifying outputted match at offset " + std::to_string(outputted_up_to_offset) + "\n" << std::flush;
-            std::cout << "With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n" << std::flush;
+            print_to_console("Error while verifying outputted match at offset " + std::to_string(outputted_up_to_offset) + "\n");
+            print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
             exit(1);
           }
+
+          /*
+          auto* buffer_ptr = buffer.data();
+          auto* verify_buffer_ptr = verify_buffer.data();
+
+          auto [copy_instruction_chunk_i, copy_instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
+          auto [curr_instruction_chunk_i, curr_instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, outputted_up_to_offset);
+          auto* copy_instruction_chunk = &(*chunks)[copy_instruction_chunk_i];
+          auto* curr_instruction_chunk = &(*chunks)[curr_instruction_chunk_i];
+
+          uint64_t remaining_size = instruction.size;
+          while (remaining_size > 0) {
+            if (copy_instruction_chunk->chunk_data->data.size() == copy_instruction_chunk_pos) {
+              copy_instruction_chunk_i++;
+              copy_instruction_chunk_pos = 0;
+              copy_instruction_chunk = &(*chunks)[copy_instruction_chunk_i];
+            }
+            if (curr_instruction_chunk->chunk_data->data.size() == curr_instruction_chunk_pos) {
+              curr_instruction_chunk_i++;
+              curr_instruction_chunk_pos = 0;
+              curr_instruction_chunk = &(*chunks)[curr_instruction_chunk_i];
+            }
+            auto cmp_size = std::min<uint64_t>(
+              copy_instruction_chunk->chunk_data->data.size() - copy_instruction_chunk_pos,
+              curr_instruction_chunk->chunk_data->data.size() - curr_instruction_chunk_pos
+            );
+            cmp_size = std::min(cmp_size, remaining_size);
+            const auto copy_chunk_data = copy_instruction_chunk->chunk_data->data.data() + copy_instruction_chunk_pos;
+            const auto curr_chunk_data = curr_instruction_chunk->chunk_data->data.data() + curr_instruction_chunk_pos;
+
+            if (std::memcmp(curr_chunk_data, verify_buffer_ptr, cmp_size) != 0) {
+              print_to_console("ERROR ON CURR CHUNK DATA!\n");
+              print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
+              exit(1);
+            }
+            verify_buffer_ptr += cmp_size;
+            if (std::memcmp(copy_chunk_data, buffer_ptr, cmp_size) != 0) {
+              print_to_console("ERROR ON COPY CHUNK DATA!\n");
+              print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
+              exit(1);
+            }
+            buffer_ptr += cmp_size;
+
+            if (std::memcmp(copy_chunk_data, curr_chunk_data, cmp_size) != 0) {
+              print_to_console("Error while verifying outputted match with chunk data at offset " + std::to_string(outputted_up_to_offset) + "\n");
+              print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
+              exit(1);
+            }
+            remaining_size -= cmp_size;
+            copy_instruction_chunk_pos += cmp_size;
+            curr_instruction_chunk_pos += cmp_size;
+          }
+          */
         }
       }
       prev_outputted_up_to_offset = outputted_up_to_offset;
@@ -1522,12 +1648,12 @@ public:
   }
 };
 
-  //get_char_with_echo();
 int main(int argc, char* argv[]) {
+  //get_char_with_echo();
   std::string file_path{ argv[1] };
-  auto file_size = std::filesystem::file_size(file_path);
+  auto file_size = file_path == "-" ? 0 : std::filesystem::file_size(file_path);
   if (argc > 3) {
-    std::cout << "Invalid command line" << std::flush;
+    print_to_console("Invalid command line\n");
     return 1;
   }
   bool do_decompression = false;
@@ -1540,7 +1666,7 @@ int main(int argc, char* argv[]) {
   if (do_decompression) {  // decompress
     auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
     if (!file_stream.is_open()) {
-      std::cout << "Can't read file\n";
+      print_to_console("Can't read file\n");
       return 1;
     }
     auto decompress_start_time = std::chrono::high_resolution_clock::now();
@@ -1558,7 +1684,7 @@ int main(int argc, char* argv[]) {
       const auto fail = decomp_file_stream.fail();
       const auto bad = decomp_file_stream.bad();
       if (eof || fail || bad) {
-        std::cout << "Something wrong bad during decompression\n" << std::flush;
+        print_to_console("Something wrong bad during decompression\n");
         return 1;
       }
 
@@ -1609,7 +1735,7 @@ int main(int argc, char* argv[]) {
     }
 
     auto decompress_end_time = std::chrono::high_resolution_clock::now();
-    std::printf("Decompression finished in %lld seconds!\n", std::chrono::duration_cast<std::chrono::seconds>(decompress_end_time - decompress_start_time).count());
+    print_to_console("Decompression finished in " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(decompress_end_time - decompress_start_time).count()) + " seconds!\n");
     return 0;
   }
 
@@ -1687,13 +1813,13 @@ int main(int argc, char* argv[]) {
 
   const bool output_disabled = false;
 
-  const bool use_dupadj = true;
-  const bool use_dupadj_backwards = true;
-  const bool use_generalized_resemblance_detection = true;
-  const bool use_feature_extraction = true;
+  const bool use_dupadj = false;
+  const bool use_dupadj_backwards = false;
+  const bool use_generalized_resemblance_detection = false;
+  const bool use_feature_extraction = false;
   // Because of data locality, chunks close to the current one might be similar to it, we attempt to find the most similar out of the previous ones in this window,
   // and use it if it's good enough
-  const int resemblance_attempt_window = 100;
+  const int resemblance_attempt_window = 0;
   // if false, the first similar block found by any method will be used and other methods won't run, if true, all methods will run and the most similar block found will be used
   const bool attempt_multiple_delta_methods = true;
   const bool exhausive_delta_search = false;  // All delta matches with the best hamming distance will be tried
@@ -1711,21 +1837,36 @@ int main(int argc, char* argv[]) {
 
   std::vector<utility::ChunkEntry> chunks{};
 
-  auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
-  if (!file_stream.is_open()) {
-    std::cout << "Can't read file\n";
-    return 1;
+  auto file_stream = std::ifstream();
+  if (file_path == "-") {
+    set_std_handle_binary_mode(StdHandles::STDIN_HANDLE);
+    reinterpret_cast<std::istream*>(&file_stream)->rdbuf(std::cin.rdbuf());
   }
+  else {
+    file_stream.open(file_path, std::ios::in | std::ios::binary);
+    if (!file_stream.is_open()) {
+      print_to_console("Can't read file\n");
+      return 1;
+    }
+  }
+  
   auto wrapped_file = IStreamWrapper(&file_stream);
   auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, use_feature_extraction);
 
   std::optional<uint64_t> similarity_locality_anchor_i{};
 
-  auto verify_file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
+  auto verify_file_stream = std::fstream();
+  bool verify_dumps = false;
+  if (file_path != "-") {
+    verify_file_stream.open(file_path, std::ios::in | std::ios::binary);
+    verify_dumps = true;
+  }
   std::vector<uint8_t> verify_buffer{};
   std::vector<uint8_t> verify_buffer_delta{};
 
-  auto dump_file = std::fstream(file_path + ".ddp", std::ios::out | std::ios::binary | std::ios::trunc);
+  auto dump_file = std::ofstream(/*file_path + ".ddp", std::ios::out | std::ios::binary | std::ios::trunc*/);
+  set_std_handle_binary_mode(StdHandles::STDOUT_HANDLE);
+  reinterpret_cast<std::ostream*>(&dump_file)->rdbuf(std::cout.rdbuf());
   LZInstructionManager lz_manager{ &chunks, use_match_extension_backwards, use_match_extension, &dump_file };
 
   static constexpr auto similar_chunk_tuple_cmp = [](const std::tuple<uint64_t, uint64_t>& a, const std::tuple<uint64_t, uint64_t>& b) {
@@ -1802,13 +1943,12 @@ int main(int argc, char* argv[]) {
       }
 
       uint64_t earliest_allowed_offset = chunks[first_non_out_of_range_chunk_i].offset;
-      if (!output_disabled) lz_manager.dump(verify_file_stream, false, earliest_allowed_offset);
+      if (!output_disabled) lz_manager.dump(verify_file_stream, verify_dumps, earliest_allowed_offset);
 
       // Actually remove the chunk's data, we had to wait until after dump to do this because dumping required the data to still be there
       for (uint64_t i = prev_first_non_out_of_range_chunk_i; i < first_non_out_of_range_chunk_i; i++) {
-        auto& previous_chunk = chunks[i];
         // Delete its data
-        previous_chunk.chunk_data = nullptr;
+        chunks[i].chunk_data = nullptr;
       }
     }
 
@@ -1817,7 +1957,7 @@ int main(int argc, char* argv[]) {
 
     std::optional<uint64_t> prev_similarity_locality_anchor_i = similarity_locality_anchor_i;
     similarity_locality_anchor_i = std::nullopt;
-    if (chunk_i % 50000 == 0) std::cout << "\n%" + std::to_string((static_cast<float>(generator_ctx.offset) / file_size) * 100) + "\n" << std::flush;
+    if (chunk_i % 50000 == 0) print_to_console("\n%" + std::to_string((static_cast<float>(generator_ctx.offset) / file_size) * 100) + "\n");
     const auto& data_span = std::get<1>(*generated_chunk);
     total_size += data_span.size();
 
@@ -2063,14 +2203,14 @@ int main(int argc, char* argv[]) {
             verify_file_stream.read(reinterpret_cast<char*>(verify_buffer_delta.data()) + chunk_offset_pos, instruction.size);
 
             if (std::memcmp(verify_buffer_delta.data() + chunk_offset_pos, verify_buffer.data() + chunk_offset_pos, instruction.size) != 0) {
-              std::cout << "Delta coding data verification mismatch!\n" << std::flush;
+              print_to_console("Delta coding data verification mismatch!\n");
               exit(1);
             }
           }
           chunk_offset_pos += instruction.size;
         }
         if (chunk_offset_pos != chunk.chunk_data->data.size()) {
-          std::cout << "Delta coding size mismatch: chunk_size/delta size " + std::to_string(chunk.chunk_data->data.size()) + "/" + std::to_string(chunk_offset_pos) + "\n" << std::flush;
+          print_to_console("Delta coding size mismatch: chunk_size/delta size " + std::to_string(chunk.chunk_data->data.size()) + "/" + std::to_string(chunk_offset_pos) + "\n");
           exit(1);
         }
       }
@@ -2253,54 +2393,54 @@ int main(int argc, char* argv[]) {
 
   auto total_dedup_end_time = std::chrono::high_resolution_clock::now();
 
-  std::printf("Total dedup time:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(total_dedup_end_time - total_runtime_start_time).count());
+  print_to_console("Total dedup time:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(total_dedup_end_time - total_runtime_start_time).count()) + " seconds\n");
 
   // Dump any remaining data
-  if (!output_disabled) lz_manager.dump(verify_file_stream);
+  if (!output_disabled) lz_manager.dump(verify_file_stream, verify_dumps);
 
   auto dump_end_time = std::chrono::high_resolution_clock::now();
 
   // Chunk stats
-  std::cout << std::string("Chunk Sizes:    min ") + std::to_string(min_size) + " - avg " + std::to_string(avg_size) + " - max " + std::to_string(max_size) + "\n" << std::flush;
-  std::cout << "Total chunk count: " + std::to_string(chunks.size()) + "\n" << std::flush;
-  std::cout << "Real AVG chunk size: " + std::to_string(total_size / chunks.size()) + "\n" << std::flush;
-  std::cout << "Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n" << std::flush;
-  std::cout << "Total delta compressed chunk count: " + std::to_string(delta_compressed_chunk_count) + "\n" << std::flush;
+  print_to_console(std::string("Chunk Sizes:    min ") + std::to_string(min_size) + " - avg " + std::to_string(avg_size) + " - max " + std::to_string(max_size) + "\n");
+  print_to_console("Total chunk count: " + std::to_string(chunks.size()) + "\n");
+  print_to_console("Real AVG chunk size: " + std::to_string(total_size / chunks.size()) + "\n");
+  print_to_console("Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n");
+  print_to_console("Total delta compressed chunk count: " + std::to_string(delta_compressed_chunk_count) + "\n");
 
   const auto total_accumulated_savings = lz_manager.accumulatedSavings();
   const auto match_omitted_size = lz_manager.omittedSmallMatchSize();
   const auto match_extension_saved_size = lz_manager.accumulatedExtendedBackwardsSavings() + lz_manager.accumulatedExtendedForwardsSavings();
   // Results stats
   const auto total_size_mbs = total_size / (1024.0 * 1024);
-  std::printf("Chunk data total size:    %.1f MB\n", total_size_mbs);
+  print_to_console("Chunk data total size:    %.1f MB\n", total_size_mbs);
   const auto deduped_size_mbs = deduped_size / (1024.0 * 1024);
-  std::printf("Chunk data deduped size:    %.1f MB\n", deduped_size_mbs);
+  print_to_console("Chunk data deduped size:    %.1f MB\n", deduped_size_mbs);
   const auto deltaed_size_mbs = delta_compressed_approx_size / (1024.0 * 1024);
-  std::printf("Chunk data delta compressed size:    %.1f MB\n", deltaed_size_mbs);
+  print_to_console("Chunk data delta compressed size:    %.1f MB\n", deltaed_size_mbs);
   const auto extension_size_mbs = match_extension_saved_size / (1024.0 * 1024);
-  std::printf("Match extended size:    %.1f MB\n", extension_size_mbs);
+  print_to_console("Match extended size:    %.1f MB\n", extension_size_mbs);
   const auto omitted_size_mbs = match_omitted_size / (1024.0 * 1024);
-  std::printf("Match omitted size (matches too small):    %.1f MB\n", omitted_size_mbs);
+  print_to_console("Match omitted size (matches too small):    %.1f MB\n", omitted_size_mbs);
   const auto total_accummulated_savings_mbs = total_accumulated_savings / (1024.0 * 1024);
-  std::printf("Total estimated reduced size:    %.1f MB\n", total_accummulated_savings_mbs);
-  std::printf("Final size:    %.1f MB\n", total_size_mbs - total_accummulated_savings_mbs);
+  print_to_console("Total estimated reduced size:    %.1f MB\n", total_accummulated_savings_mbs);
+  print_to_console("Final size:    %.1f MB\n", total_size_mbs - total_accummulated_savings_mbs);
 
-  std::printf("\n");
+  print_to_console("\n");
 
   // Throughput stats
   const auto chunking_mb_per_nanosecond = total_size_mbs / chunk_generator_execution_time_ns;
-  std::printf("Chunking Throughput:    %.1f MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Chunking Throughput:    %.1f MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
   const auto hashing_mb_per_nanosecond = total_size_mbs / hashing_execution_time_ns;
-  std::printf("Hashing Throughput:    %.1f MB/s\n", hashing_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Hashing Throughput:    %.1f MB/s\n", hashing_mb_per_nanosecond * std::pow(10, 9));
   const auto simhashing_mb_per_nanosecond = total_size_mbs / simhashing_execution_time_ns;
-  std::printf("SimHashing Throughput:    %.1f MB/s\n", simhashing_mb_per_nanosecond* std::pow(10, 9));
+  print_to_console("SimHashing Throughput:    %.1f MB/s\n", simhashing_mb_per_nanosecond* std::pow(10, 9));
   const auto total_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(total_dedup_end_time - total_runtime_start_time).count();
   const auto total_mb_per_nanosecond = total_size_mbs / total_elapsed_nanoseconds;
-  std::printf("Total Throughput:    %.1f MB/s\n", total_mb_per_nanosecond * std::pow(10, 9));
-  std::cout << "Total LZ instructions:    " + std::to_string(lz_manager.instructionCount()) + "\n" << std::flush;
-  std::printf("Total dedup time:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(total_dedup_end_time - total_runtime_start_time).count());
-  std::printf("Dump time:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_dedup_end_time).count());
-  std::printf("Total runtime:    %lld seconds\n", std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_runtime_start_time).count());
+  print_to_console("Total Throughput:    %.1f MB/s\n", total_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Total LZ instructions:    " + std::to_string(lz_manager.instructionCount()) + "\n");
+  print_to_console("Total dedup time:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(total_dedup_end_time - total_runtime_start_time).count()) + " seconds\n");
+  print_to_console("Dump time:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_dedup_end_time).count()) + " seconds\n");
+  print_to_console("Total runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_runtime_start_time).count()) + " seconds\n");
 
   //get_char_with_echo();
   return 0;
