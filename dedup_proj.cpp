@@ -11,6 +11,7 @@
 #include <chrono>
 #include <span>
 #include <array>
+#include <list>
 #include <unordered_map>
 #include <bitset>
 #include <cassert>
@@ -216,6 +217,7 @@ namespace utility {
   public:
     uint64_t offset;
     std::shared_ptr<ChunkData> chunk_data;
+    explicit ChunkEntry() = default;
     explicit ChunkEntry(uint64_t _offset) : offset(_offset), chunk_data(std::make_shared<ChunkData>()) {}
   };
 
@@ -563,17 +565,17 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
   return return_val;
 }
 
-template<uint8_t bit_size>
-uint64_t hamming_distance(std::bitset<bit_size> data1, std::bitset<bit_size> data2) {
+template<std::size_t bit_size>
+uint64_t hamming_distance(const std::bitset<bit_size>& data1, const std::bitset<bit_size>& data2) {
   const auto val = data1 ^ data2;
   return val.count();
 }
 
-template<uint8_t bit_size>
-uint8_t hamming_syndrome(const std::bitset<bit_size>& data) {
+template<std::size_t bit_size>
+std::size_t hamming_syndrome(const std::bitset<bit_size>& data) {
   int result = 0;
   std::bitset<bit_size> mask {0b1};
-  for (uint8_t i = 0; i < bit_size; i++) {
+  for (std::size_t i = 0; i < bit_size; i++) {
     auto bit = data & mask;
     if (bit != 0) result ^= i;
     mask <<= 1;
@@ -582,10 +584,11 @@ uint8_t hamming_syndrome(const std::bitset<bit_size>& data) {
   return result;
 }
 
-template<uint8_t bit_size>
-std::bitset<bit_size> hamming_base(std::bitset<bit_size> data) {
+template<std::size_t bit_size>
+std::bitset<bit_size> hamming_base(const std::bitset<bit_size>& data) {
   auto syndrome = hamming_syndrome(data);
-  auto base = data.flip(syndrome);
+  std::bitset<bit_size> base = data;
+  base = base.flip(syndrome);
   // The first bit doesn't really participate in non-extended hamming codes (and extended ones are not useful to us)
   // So we just collapse to them all to the version with 0 on the first bit, allows us to match some hamming distance 2 data
   base[0] = 0;
@@ -608,6 +611,29 @@ struct DeltaEncodingResult {
   uint64_t estimated_savings;
   std::vector<LZInstruction> instructions;
 };
+
+inline unsigned long trailingZeroesCount32(uint32_t mask) {
+#ifndef __GNUC__
+  unsigned long result;
+  result = _BitScanForward(&result, mask) ? result : 0;
+  return result;
+#else
+  // TODO: This requires BMI instruction set, is there not a better way to do it?
+  return _tzcnt_u32(mask);
+#endif
+}
+
+inline unsigned long leadingZeroesCount32(uint32_t mask) {
+#ifndef __GNUC__
+  unsigned long result;
+  // _BitScanReverse gets us the bit INDEX of the highest set bit, so we do 31 - result as 31 is the highest possible bit in a 32bit mask
+  result = _BitScanReverse(&result, mask) ? 31 - result : 0;
+  return result;
+#else
+  // TODO: This requires BMI instruction set, is there not a better way to do it?
+  return _lzcnt_u32(mask);
+#endif
+}
 
 uint64_t find_identical_prefix_byte_count(const std::span<const uint8_t> data1_span, const std::span<const uint8_t> data2_span) {
   const auto cmp_size = std::min(data1_span.size(), data2_span.size());
@@ -664,7 +690,7 @@ uint64_t find_identical_prefix_byte_count(const std::span<const uint8_t> data1_s
         break;
       default:
         const uint32_t inverted_mask = result_mask ^ 0b11111111111111111111111111111111;
-        avx2_matching_data_count = _BitScanForward64(&avx2_matching_data_count, inverted_mask) ? avx2_matching_data_count : 0;
+        avx2_matching_data_count = trailingZeroesCount32(inverted_mask);
       }
       matching_data_count += avx2_matching_data_count;
       if (avx2_matching_data_count < 32) return matching_data_count;
@@ -722,7 +748,7 @@ uint64_t find_identical_prefix_byte_count(const std::span<const uint8_t> data1_s
         break;
       default:
         const uint32_t inverted_mask = result_mask ^ 0b1111111111111111;
-        sse_matching_data_count = _BitScanForward64(&sse_matching_data_count, inverted_mask) ? sse_matching_data_count : 0;
+        sse_matching_data_count = trailingZeroesCount32(inverted_mask);
       }
       matching_data_count += sse_matching_data_count;
       if (sse_matching_data_count < 16) return matching_data_count;
@@ -803,7 +829,7 @@ uint64_t find_identical_suffix_byte_count(const std::span<const uint8_t> data1_s
         break;
       default:
         const uint32_t inverted_mask = result_mask ^ 0b11111111111111111111111111111111;
-        avx2_matching_data_count = _BitScanReverse64(&avx2_matching_data_count, inverted_mask) ? (32 - 1 - avx2_matching_data_count) : 0;
+        avx2_matching_data_count = leadingZeroesCount32(inverted_mask);
       }
       matching_data_count += avx2_matching_data_count;
       if (avx2_matching_data_count < 32) return matching_data_count;
@@ -861,7 +887,9 @@ uint64_t find_identical_suffix_byte_count(const std::span<const uint8_t> data1_s
         break;
       default:
         const uint32_t inverted_mask = result_mask ^ 0b1111111111111111;
-        sse_matching_data_count = _BitScanReverse64(&sse_matching_data_count, inverted_mask) ? (16 - 1 - sse_matching_data_count) : 0;
+        // despite the mask being 32bit, SSE has 16bytes so only the 16 lower bits could possibly be set, so we will always
+        // get 16 extra leading zeroes we don't actually care about, so we subtract them from the result
+        sse_matching_data_count = leadingZeroesCount32(inverted_mask) - 16;
       }
       matching_data_count += sse_matching_data_count;
       if (sse_matching_data_count < 16) return matching_data_count;
@@ -1208,7 +1236,144 @@ public:
   }
 };
 
-std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(std::vector<utility::ChunkEntry>& chunks, uint64_t offset) {
+template <class T>
+class circular_vector {
+  std::vector<T> vec{};
+  // The first index for the circular vector in vec
+  uint64_t first_index_vec = 0;
+  // The first index overall num, like if this had been a regular expanding vector, what would the first item's index be
+  uint64_t first_index_num = 0;
+  // The last index for the circular vector in vec
+  std::optional<uint64_t> last_index_vec = std::nullopt;
+
+  uint64_t reclaimable_slots = 0;
+
+  template <class U>
+  class const_iterator {
+  public:
+    using difference_type = std::ptrdiff_t;
+    using value_type = U;
+
+  private:
+    const std::vector<value_type>* vec = nullptr;
+    uint64_t index = 0;
+
+  public:
+    const_iterator(const std::vector<value_type>* _vec, uint64_t _index) : vec(_vec), index(_index) {}
+    const_iterator() = default;
+
+    // Forward iterator requirements
+    const value_type& operator*() const { return (*vec)[index]; }
+    bool operator==(const const_iterator& other) const { return other.index == this->index && other.vec == this->vec; }
+
+    const_iterator& operator++() {
+      index++;
+      return *this;
+    }
+    const_iterator operator++(int) {
+      auto tmp = *this;
+      ++*this;
+      return tmp;
+    }
+
+    // Bidirectional iterator requirements
+    const_iterator& operator--() {
+      index--;
+      return *this;
+    }
+    const_iterator operator--(int) {
+      auto tmp = *this;
+      --*this;
+      return tmp;
+    }    
+
+    // Random access iterator requirements
+    const value_type& operator[](difference_type rhs) const { return (*vec)[index + rhs]; }
+
+    const_iterator operator+(difference_type rhs) const { return { this->vec, this->index + rhs }; }
+    friend const_iterator operator+(difference_type lhs, const const_iterator& rhs) { return { rhs.vec, rhs.index + lhs }; }
+    const_iterator& operator+=(difference_type rhs) { index += rhs; return *this; }
+
+    difference_type operator-(const const_iterator& rhs) const { return this->index - rhs.index; }
+    const_iterator operator-(difference_type rhs) const { return { this->vec, this->index - rhs }; }
+    friend const_iterator operator-(difference_type lhs, const const_iterator& rhs) { return { rhs.vec, rhs.index - lhs }; }
+    const_iterator& operator-=(difference_type rhs) { index -= rhs; return *this; }
+
+    bool operator>(const const_iterator& rhs) const { return this->index > rhs.index; }
+    bool operator>=(const const_iterator& rhs) const { return this->index >= rhs.index; }
+    bool operator<(const const_iterator& rhs) const { return this->index < rhs.index; }
+    bool operator<=(const const_iterator& rhs) const { return this->index <= rhs.index; }
+  };
+  static_assert(std::random_access_iterator<const_iterator<utility::ChunkEntry>>);
+
+public:
+  explicit circular_vector() = default;
+
+  T& operator[](typename std::vector<T>::size_type pos) {
+    auto relative_pos = pos - first_index_num;
+    // TODO: make actual check we are not out of bounds, here we are assuming pos is not so large we are circling more than once
+    auto in_vec_index = (first_index_vec + relative_pos) % vec.size();
+    return vec[in_vec_index];
+  }
+
+  //typename std::vector<T>::const_iterator begin() const { return vec.cbegin(); }
+  //typename std::vector<T>::const_iterator end() const { return vec.cend(); }
+  //typename std::vector<T>::const_iterator cbegin() const { return vec.cbegin(); }
+  //typename std::vector<T>::const_iterator cend() const { return vec.cend(); }
+  const_iterator<T> begin() const { return const_iterator<T>(&vec, 0); }
+  const_iterator<T> end() const { return const_iterator<T>(&vec, vec.size()); }
+  const_iterator<T> cbegin() const { return const_iterator<T>(&vec, 0); }
+  const_iterator<T> cend() const { return const_iterator<T>(&vec, vec.size()); }
+
+  typename std::vector<T>::size_type size() { return vec.size(); }
+  void pop_front() {
+    reclaimable_slots++;
+  }
+  void emplace_back(T&& chunk) {
+    // If we can still expand without realloc just do it
+    if (vec.empty() || vec.size() < vec.capacity()) {
+      vec.emplace_back(std::move(chunk));
+    }
+    // If vec is full but some slots are reclaimable, we do circular buffer style usage
+    else if (reclaimable_slots > 0) {
+      if (last_index_vec.has_value()) {
+        (*last_index_vec)++;
+      }
+      else {
+        last_index_vec = 0;
+      }
+      first_index_vec++;
+      first_index_num++;
+      vec[*last_index_vec] = std::move(chunk);
+      reclaimable_slots--;
+    }
+    // max capacity and no reclaimable_slots, realloc unavoidable
+    else {
+      std::vector<T> new_vec{};
+      new_vec.reserve(static_cast<uint64_t>(std::ceil(static_cast<double>(vec.capacity()) * 1.5)));
+      auto cap = new_vec.capacity();
+      new_vec.resize(vec.size());
+      
+      std::move(vec.begin() + first_index_vec, vec.end(), new_vec.begin());
+      // If we had circular usage, ensure the last items, stored at the start of the now old vector,
+      // are moved at the end of new_vec
+      if (last_index_vec.has_value()) {
+        std::move(vec.begin(), vec.begin() + *last_index_vec + 1, new_vec.end());
+      }
+      new_vec.emplace_back(std::move(chunk));
+
+      vec = std::move(new_vec);
+      // Reset everything so the new vec is now accessed in a non-circular way, at least until needed again
+      last_index_vec = std::nullopt;
+      first_index_vec = 0;
+    }
+  }
+
+  T& back() { return last_index_vec.has_value() ? vec[*last_index_vec] : vec.back(); }
+};
+static_assert(std::ranges::range<circular_vector<utility::ChunkEntry>>);
+
+std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<utility::ChunkEntry>& chunks, uint64_t offset) {
   static constexpr auto compare_offset = [](const utility::ChunkEntry& x, const utility::ChunkEntry& y) { return x.offset < y.offset; };
 
   const auto search_chunk = utility::ChunkEntry(offset);
@@ -1221,7 +1386,7 @@ std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(std::vector<utilit
 }
 
 class LZInstructionManager {
-  std::vector<utility::ChunkEntry>* chunks;
+  circular_vector<utility::ChunkEntry>* chunks;
   std::deque<LZInstruction> instructions;
 
   std::ostream* ostream;
@@ -1239,7 +1404,7 @@ class LZInstructionManager {
   uint64_t outputted_lz_instructions = 0;
 
 public:
-  explicit LZInstructionManager(std::vector<utility::ChunkEntry>* _chunks, bool _use_match_extension_backwards, bool _use_match_extension, std::ostream* _ostream)
+  explicit LZInstructionManager(circular_vector<utility::ChunkEntry>* _chunks, bool _use_match_extension_backwards, bool _use_match_extension, std::ostream* _ostream)
     : chunks(_chunks), ostream(_ostream), output_stream(_ostream), bit_output_stream(output_stream),
       use_match_extension_backwards(_use_match_extension_backwards), use_match_extension(_use_match_extension) {}
 
@@ -1835,7 +2000,7 @@ int main(int argc, char* argv[]) {
   uint64_t dictionary_size_used = 0;
   uint64_t first_non_out_of_range_chunk_i = 0;
 
-  std::vector<utility::ChunkEntry> chunks{};
+  circular_vector<utility::ChunkEntry> chunks{};
 
   auto file_stream = std::ifstream();
   if (file_path == "-") {
@@ -1949,6 +2114,7 @@ int main(int argc, char* argv[]) {
       for (uint64_t i = prev_first_non_out_of_range_chunk_i; i < first_non_out_of_range_chunk_i; i++) {
         // Delete its data
         chunks[i].chunk_data = nullptr;
+        //chunks.pop_front();
       }
     }
 
