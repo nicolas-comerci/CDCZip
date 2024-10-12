@@ -1257,17 +1257,106 @@ class circular_vector {
   private:
     const std::vector<value_type>* vec = nullptr;
     uint64_t index = 0;
+    const uint64_t* first_index = nullptr;
+    const std::optional<uint64_t>* last_index = nullptr;
+
+    uint64_t add_to_index(difference_type add) const {
+      const auto added_index = index + add;
+      const auto vec_size = vec->size();
+      const bool has_last_index = last_index != nullptr && last_index->has_value();
+      // We are already on an index that has wrapped around the circular vector
+      if (has_last_index && index < *first_index) {
+        // Given that we are wrapping around already, we don't allow wrapping around again,
+        // if we reach the end or exceed it, just point to the end
+        return added_index > **last_index ? **last_index + 1 : added_index;
+      }
+      // We have yet to wrap around (if that's even possible)
+      else {
+        // Wrapping around is not even needed
+        if (added_index < vec_size) return added_index;
+        // If the vector doesn't have circular wrapping around behavior then just return index for end of vec
+        if (!has_last_index) return vec_size;
+        // If we were to do a whole loop, stop at last_index + 1, as we need to stop at some point
+        if (add >= vec_size) return **last_index + 1;
+        const auto wrapped_index = added_index % vec_size;
+        // If even wrapping around we went too far we stop at the last_index + 1 as well
+        return wrapped_index > **last_index ? **last_index + 1 : wrapped_index;
+      }
+    }
+
+    uint64_t remove_from_index(difference_type substract) const {
+      const auto subtracted_index = static_cast<difference_type>(index) - substract;
+      const auto vec_size = vec->size();
+      const bool has_last_index = last_index != nullptr && last_index->has_value();
+      // We are already on an index that has wrapped around the circular vector
+      if (has_last_index && index < *first_index) {
+        // If it's not enough to wrap around in reverse, then just return the new index
+        if (subtracted_index >= 0) return subtracted_index;
+        // Wrap around in reverse, remember that subtracted_index is negative here,
+        // and we add +1 because is the subtracted_index is -1 then we need the last_index itself
+        const auto wrapped_index = **last_index + subtracted_index + 1;
+        // If wrapping in reverse gets us before the *first_index, we reversed back to the beginning, stop there
+        return wrapped_index >= *first_index ? wrapped_index : *first_index;
+      }
+      // We have yet to wrap around (if that's even possible)
+      else {
+        // As we can't wrap around in reverse, we simply reverse as far as the first_index if set, 0 otherwise
+        if (first_index != nullptr) {
+          return std::max<difference_type>(subtracted_index, *first_index);
+        }
+        else {
+          return std::max<difference_type>(subtracted_index, 0);
+        }
+      }
+    }
+
+    uint64_t shift_index(difference_type diff) const {
+      return diff >= 0 ? add_to_index(diff) : remove_from_index(diff);
+    }
+
+    bool index_pos_larger_than(difference_type other_index) const {
+      // Checks if this iterator's index position is larger than a given index, accounting for circular behavior
+      // Prerequisite: this->index != other_index
+
+      // If we enter here then it means this iterator's index is NOT from an element that has wrapped around the circular_vector
+      if (first_index == nullptr || index >= *first_index) {
+        const bool has_last_index = last_index != nullptr && !last_index->has_value();
+        // If the vector is not circular yet, the index must be numerically larger than the other one and that's it
+        if (!has_last_index && index > other_index) return true;
+
+        // If there is circular behavior, then other_index might be numerically smaller but refer to a later element.
+        // If the other_index is larger than the first_index but still smaller than this->index, then it's for a prior position,
+        // if it's larger than first_index and also larger than this->index then the other one is for a later position,
+        // otherwise despite other_index being numerically smaller its actually for a later position on the circular_index
+        // as it refers to an element after wrapping around circularly
+        if (other_index >= *first_index && index > other_index) return true;
+        return false;
+      }
+      // conversely, if we are here it's that this iterator's index is from an element that IS after wrapping around the circular_vector
+
+      // Now it's quite simple, if the other_index is from before wrapping around then it must be from a prior position,
+      // else then we just need to compare them numerically.
+      if (other_index >= *first_index) return true;
+      return index > other_index;
+    }
 
   public:
-    const_iterator(const std::vector<value_type>* _vec, uint64_t _index) : vec(_vec), index(_index) {}
+    const_iterator(const std::vector<value_type>* _vec, uint64_t _index, const uint64_t* _first_index, const std::optional<uint64_t>* _last_index)
+      : vec(_vec), index(_index), first_index(_first_index), last_index(_last_index) {
+      if ((first_index != nullptr || last_index != nullptr) && (first_index == nullptr || last_index == nullptr)) {
+        throw std::runtime_error("circular_vector::iterator: first_index and last_index need to be both set or unset, no mixing");
+      }
+    }
     const_iterator() = default;
+
+    uint64_t get_index() const { return index; }
 
     // Forward iterator requirements
     const value_type& operator*() const { return (*vec)[index]; }
     bool operator==(const const_iterator& other) const { return other.index == this->index && other.vec == this->vec; }
 
     const_iterator& operator++() {
-      index++;
+      index = shift_index(1);
       return *this;
     }
     const_iterator operator++(int) {
@@ -1285,48 +1374,78 @@ class circular_vector {
       auto tmp = *this;
       --*this;
       return tmp;
-    }    
+    }
 
     // Random access iterator requirements
-    const value_type& operator[](difference_type rhs) const { return (*vec)[index + rhs]; }
+    const value_type& operator[](difference_type rhs) const { return (*vec)[shift_index(rhs)]; }
 
-    const_iterator operator+(difference_type rhs) const { return { this->vec, this->index + rhs }; }
-    friend const_iterator operator+(difference_type lhs, const const_iterator& rhs) { return { rhs.vec, rhs.index + lhs }; }
-    const_iterator& operator+=(difference_type rhs) { index += rhs; return *this; }
+    const_iterator operator+(difference_type rhs) const { return { this->vec, shift_index(rhs) }; }
+    friend const_iterator operator+(difference_type lhs, const const_iterator& rhs) { return { rhs.vec, rhs.shift_index(lhs) }; }
+    const_iterator& operator+=(difference_type rhs) { index = shift_index(rhs); return *this; }
 
-    difference_type operator-(const const_iterator& rhs) const { return this->index - rhs.index; }
-    const_iterator operator-(difference_type rhs) const { return { this->vec, this->index - rhs }; }
-    friend const_iterator operator-(difference_type lhs, const const_iterator& rhs) { return { rhs.vec, rhs.index - lhs }; }
-    const_iterator& operator-=(difference_type rhs) { index -= rhs; return *this; }
+    difference_type operator-(const const_iterator& rhs) const { return shift_index(-rhs.index); }
+    const_iterator operator-(difference_type rhs) const { return { this->vec, shift_index(-rhs) }; }
+    friend const_iterator operator-(difference_type lhs, const const_iterator& rhs) { return { rhs.vec, shift_index(-lhs) }; }
+    const_iterator& operator-=(difference_type rhs) { index = shift_index(-rhs); return *this; }
 
-    bool operator>(const const_iterator& rhs) const { return this->index > rhs.index; }
-    bool operator>=(const const_iterator& rhs) const { return this->index >= rhs.index; }
-    bool operator<(const const_iterator& rhs) const { return this->index < rhs.index; }
-    bool operator<=(const const_iterator& rhs) const { return this->index <= rhs.index; }
+    bool operator>(const const_iterator& rhs) const { return this->index != rhs.index && index_pos_larger_than(rhs.index); }
+    bool operator>=(const const_iterator& rhs) const { return this->index == rhs.index || index_pos_larger_than(rhs.index); }
+    bool operator<(const const_iterator& rhs) const { return this->index != rhs.index && !index_pos_larger_than(rhs.index); }
+    bool operator<=(const const_iterator& rhs) const { return this->index == rhs.index || !index_pos_larger_than(rhs.index); }
   };
   static_assert(std::random_access_iterator<const_iterator<utility::ChunkEntry>>);
 
 public:
+  using size_type = typename std::vector<T>::size_type;
+
   explicit circular_vector() = default;
 
-  T& operator[](typename std::vector<T>::size_type pos) {
-    auto relative_pos = pos - first_index_num;
-    // TODO: make actual check we are not out of bounds, here we are assuming pos is not so large we are circling more than once
-    auto in_vec_index = (first_index_vec + relative_pos) % vec.size();
+  size_type get_last_index_vec() const { return last_index_vec.has_value() ? *last_index_vec : vec.size() - 1; }
+  size_type get_last_index_num() const {
+    // How many elements are in the vector that have wrapped around and are in indexes before the first_index_vec
+    const auto circular_element_count = last_index_vec.has_value() ? *last_index_vec + 1 : 0;
+    // How many elements are in the vector before wrapping around, including the one at first_index_vec
+    const auto tail_element_count = vec.size() - first_index_vec;
+    return first_index_num + tail_element_count + circular_element_count;
+  }
+  uint64_t get_index(const const_iterator<T>& iter) {
+    const auto iter_index = iter.get_index();
+    if (iter_index >= first_index_vec) {
+      const auto diff = iter_index - first_index_vec;
+      return first_index_num + diff;
+    }
+    const auto non_wrapped_element_count = vec.size() - first_index_vec;
+    return first_index_num + non_wrapped_element_count + iter_index;
+  }
+
+  T& operator[](size_type pos) {
+    // Check we are not trying to access out of bounds
+    const auto last_allowed_pos = get_last_index_num();
+    if (pos < first_index_num || pos > last_allowed_pos) {
+      throw std::runtime_error("Can't access out of bounds index on circular_vector");
+    }
+
+    // Finally, get the index, wrapping around if necessary, and return the element reference
+    const auto relative_pos = pos - first_index_num;
+    const auto in_vec_index = (first_index_vec + relative_pos) % vec.size();
     return vec[in_vec_index];
   }
 
-  //typename std::vector<T>::const_iterator begin() const { return vec.cbegin(); }
-  //typename std::vector<T>::const_iterator end() const { return vec.cend(); }
-  //typename std::vector<T>::const_iterator cbegin() const { return vec.cbegin(); }
-  //typename std::vector<T>::const_iterator cend() const { return vec.cend(); }
-  const_iterator<T> begin() const { return const_iterator<T>(&vec, 0); }
-  const_iterator<T> end() const { return const_iterator<T>(&vec, vec.size()); }
-  const_iterator<T> cbegin() const { return const_iterator<T>(&vec, 0); }
-  const_iterator<T> cend() const { return const_iterator<T>(&vec, vec.size()); }
+  const_iterator<T> begin() const { return const_iterator<T>(&vec, first_index_vec, &first_index_vec, &last_index_vec); }
+  const_iterator<T> end() const { return const_iterator<T>(&vec, get_last_index_vec() + 1, &first_index_vec, &last_index_vec); }
+  const_iterator<T> cbegin() const { return const_iterator<T>(&vec, first_index_vec, &first_index_vec, &last_index_vec); }
+  const_iterator<T> cend() const { return const_iterator<T>(&vec, get_last_index_vec() + 1, &first_index_vec, &last_index_vec); }
 
-  typename std::vector<T>::size_type size() { return vec.size(); }
+  size_type size() const {
+    const auto count_from_first_elem = vec.size() - first_index_vec;
+    return last_index_vec.has_value() ? count_from_first_elem + (*last_index_vec + 1) : count_from_first_elem;
+  }
   void pop_front() {
+    first_index_vec++;
+    if (first_index_vec == vec.size()) {
+      first_index_vec = 0;
+    }
+    first_index_num++;
     reclaimable_slots++;
   }
   void emplace_back(T&& chunk) {
@@ -1338,12 +1457,13 @@ public:
     else if (reclaimable_slots > 0) {
       if (last_index_vec.has_value()) {
         (*last_index_vec)++;
+        if (*last_index_vec == vec.size()) {
+          *last_index_vec = 0;
+        }
       }
       else {
         last_index_vec = 0;
       }
-      first_index_vec++;
-      first_index_num++;
       vec[*last_index_vec] = std::move(chunk);
       reclaimable_slots--;
     }
@@ -1358,7 +1478,8 @@ public:
       // If we had circular usage, ensure the last items, stored at the start of the now old vector,
       // are moved at the end of new_vec
       if (last_index_vec.has_value()) {
-        std::move(vec.begin(), vec.begin() + *last_index_vec + 1, new_vec.end());
+        const auto non_wrapped_element_count = vec.size() - first_index_vec;
+        std::move(vec.begin(), vec.begin() + *last_index_vec + 1, new_vec.begin() + non_wrapped_element_count);
       }
       new_vec.emplace_back(std::move(chunk));
 
@@ -1369,7 +1490,7 @@ public:
     }
   }
 
-  T& back() { return last_index_vec.has_value() ? vec[*last_index_vec] : vec.back(); }
+  T& back() { return vec[get_last_index_vec()]; }
 };
 static_assert(std::ranges::range<circular_vector<utility::ChunkEntry>>);
 
@@ -1377,11 +1498,18 @@ std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<ut
   static constexpr auto compare_offset = [](const utility::ChunkEntry& x, const utility::ChunkEntry& y) { return x.offset < y.offset; };
 
   const auto search_chunk = utility::ChunkEntry(offset);
-  auto chunk_iter = std::ranges::lower_bound(std::as_const(chunks), search_chunk, compare_offset);
-  uint64_t chunk_i = chunk_iter != chunks.cend() ? chunk_iter - chunks.cbegin() : chunks.size() - 1;
+  const auto chunk_iter = std::ranges::lower_bound(std::as_const(chunks), search_chunk, compare_offset);
+
+  //const auto end_iter = chunks.cend();
+  //const auto begin_iter = chunks.cbegin();
+  //const bool is_chunk_iter_at_end = chunk_iter == end_iter;
+  //uint64_t chunk_i = !is_chunk_iter_at_end ? chunk_iter - begin_iter : chunks.size() - 1;
+
+  uint64_t chunk_i = chunks.get_index(chunk_iter);
+
   if (chunks[chunk_i].offset > offset) chunk_i--;
-  utility::ChunkEntry* chunk = &chunks[chunk_i];
-  uint64_t chunk_pos = offset - chunk->offset;
+  const utility::ChunkEntry* chunk = &chunks[chunk_i];
+  const uint64_t chunk_pos = offset - chunk->offset;
   return { chunk_i, chunk_pos };
 }
 
@@ -1602,8 +1730,15 @@ public:
           auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_offset);
           utility::ChunkEntry* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
 
+          if (instruction.offset == 4724688350) {
+            print_to_console("HERE WE GOOOOOOOO!\n");
+          }
           auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
           utility::ChunkEntry* instruction_chunk = &(*chunks)[instruction_chunk_i];
+          if (instruction_chunk->offset + instruction_chunk_pos != instruction.offset || instruction_chunk_pos >= instruction_chunk->chunk_data->data.size()) {
+            print_to_console("HERE WE GO LA CAGAMOU!\n");
+            exit(1);
+          }
 
           while (instruction.size > 0) {
             const auto prevInstruction_extend_data = std::span(
@@ -2114,7 +2249,7 @@ int main(int argc, char* argv[]) {
       for (uint64_t i = prev_first_non_out_of_range_chunk_i; i < first_non_out_of_range_chunk_i; i++) {
         // Delete its data
         chunks[i].chunk_data = nullptr;
-        //chunks.pop_front();
+        chunks.pop_front();
       }
     }
 
