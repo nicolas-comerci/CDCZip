@@ -7,7 +7,6 @@
 #include <string>
 #include <random>
 #include <cstdio>
-#include <set>
 #include <chrono>
 #include <span>
 #include <array>
@@ -1401,13 +1400,7 @@ public:
   explicit circular_vector() = default;
 
   size_type get_last_index_vec() const { return last_index_vec.has_value() ? *last_index_vec : vec.size() - 1; }
-  size_type get_last_index_num() const {
-    // How many elements are in the vector that have wrapped around and are in indexes before the first_index_vec
-    const auto circular_element_count = last_index_vec.has_value() ? *last_index_vec + 1 : 0;
-    // How many elements are in the vector before wrapping around, including the one at first_index_vec
-    const auto tail_element_count = vec.size() - first_index_vec;
-    return first_index_num + tail_element_count + circular_element_count;
-  }
+  size_type get_last_index_num() const { return first_index_num + this->size() - 1; }
   uint64_t get_index(const const_iterator<T>& iter) {
     const auto iter_index = iter.get_index();
     if (iter_index >= first_index_vec) {
@@ -1499,17 +1492,19 @@ std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<ut
 
   const auto search_chunk = utility::ChunkEntry(offset);
   const auto chunk_iter = std::ranges::lower_bound(std::as_const(chunks), search_chunk, compare_offset);
-
-  //const auto end_iter = chunks.cend();
-  //const auto begin_iter = chunks.cbegin();
-  //const bool is_chunk_iter_at_end = chunk_iter == end_iter;
-  //uint64_t chunk_i = !is_chunk_iter_at_end ? chunk_iter - begin_iter : chunks.size() - 1;
-
   uint64_t chunk_i = chunks.get_index(chunk_iter);
 
-  if (chunks[chunk_i].offset > offset) chunk_i--;
+  if (chunk_iter == chunks.cend() || chunks[chunk_i].offset > offset) chunk_i--;
   const utility::ChunkEntry* chunk = &chunks[chunk_i];
   const uint64_t chunk_pos = offset - chunk->offset;
+
+#ifndef NDEBUG
+  if (chunk->offset + chunk_pos != offset || chunk_pos >= chunk->chunk_data->data.size()) {
+    print_to_console("get_chunk_i_and_pos_for_offset() found incorrect chunk_i and pos!\n");
+    exit(1);
+  }
+#endif
+
   return { chunk_i, chunk_pos };
 }
 
@@ -1730,15 +1725,14 @@ public:
           auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_offset);
           utility::ChunkEntry* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
 
-          if (instruction.offset == 4724688350) {
-            print_to_console("HERE WE GOOOOOOOO!\n");
-          }
           auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
           utility::ChunkEntry* instruction_chunk = &(*chunks)[instruction_chunk_i];
+#ifndef NDEBUG
           if (instruction_chunk->offset + instruction_chunk_pos != instruction.offset || instruction_chunk_pos >= instruction_chunk->chunk_data->data.size()) {
             print_to_console("HERE WE GO LA CAGAMOU!\n");
             exit(1);
           }
+#endif
 
           while (instruction.size > 0) {
             const auto prevInstruction_extend_data = std::span(
@@ -2087,9 +2081,6 @@ int main(int argc, char* argv[]) {
   const uint32_t simhash_chunk_size = 16;
   const uint32_t max_allowed_dist = 32;
   const uint32_t delta_mode = 2;
-  const bool only_try_best_delta_match = false;
-  const bool only_try_min_dist_delta_matches = false;
-  const bool keep_first_delta_match = false;
   // Don't even bother saving chunk as delta chunk if savings are too little and overhead will probably negate them
   const uint64_t min_delta_saving = std::min(min_size * 2, avg_size);
 
@@ -2113,20 +2104,26 @@ int main(int argc, char* argv[]) {
 
   const bool output_disabled = false;
 
-  const bool use_dupadj = false;
-  const bool use_dupadj_backwards = false;
-  const bool use_generalized_resemblance_detection = false;
-  const bool use_feature_extraction = false;
+  const bool use_dupadj = true;
+  const bool use_dupadj_backwards = true;
+  // If enabled then DupAdj will attempt other chunks with the same hashes as the adjacent ones in an attempt to find other possible similar chunks
+  const bool exhaustive_dupadj = false;
+  const bool use_generalized_resemblance_detection = true;
+  const bool use_feature_extraction = true;
   // Because of data locality, chunks close to the current one might be similar to it, we attempt to find the most similar out of the previous ones in this window,
   // and use it if it's good enough
-  const int resemblance_attempt_window = 0;
-  // if false, the first similar block found by any method will be used and other methods won't run, if true, all methods will run and the most similar block found will be used
-  const bool attempt_multiple_delta_methods = true;
-  const bool exhausive_delta_search = false;  // All delta matches with the best hamming distance will be tried
+  const int resemblance_attempt_window = 100;
   const bool use_match_extension = true;
   const bool use_match_extension_backwards = true;
-  const bool verify_delta_coding = false;
 
+  // if false, the first similar block found by any method will be used and other methods won't run, if true, all methods will run and the most similar block found will be used
+  const bool attempt_multiple_delta_methods = true;
+  // Only try to delta encode against the candidate chunk with the lesser hamming distance and closest to the current chunk
+  // (because of data locality it's likely to be the best)
+  const bool only_try_best_delta_match = false;
+  const bool only_try_min_dist_delta_matches = false;
+  const bool keep_first_delta_match = true;
+  const bool verify_delta_coding = false;
   const bool is_any_delta_on = use_dupadj || use_dupadj_backwards || use_feature_extraction || use_generalized_resemblance_detection || resemblance_attempt_window > 0;
 
   const std::optional<uint64_t> dictionary_size_limit = argc == 3
@@ -2302,12 +2299,12 @@ int main(int argc, char* argv[]) {
     std::vector<LZInstruction> new_instructions;
     if (!is_duplicate_chunk) {
       // Attempt resemblance detection and delta compression, first by using generalized resemblance detection
-      std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> similar_chunks{};
+      std::vector<std::tuple<uint64_t, uint64_t>> similar_chunks{};
       if (use_generalized_resemblance_detection) {
         calc_simhash_if_needed(chunk);
         const auto simhash_base = hamming_base(chunk.chunk_data->lsh);
         if (simhashes_dict.contains(simhash_base)) {
-          similar_chunks.emplace(0, simhashes_dict[simhash_base]);
+          similar_chunks.emplace_back(0, simhashes_dict[simhash_base]);
         }
         // If there is already a match via generalized resemblance detection, we still overwrite the index with this newer chunk.
         // Because of data locality, a more recent chunk on the data stream is more likely to yield good results
@@ -2318,7 +2315,7 @@ int main(int argc, char* argv[]) {
       // to the current chunk are fairly similar, just check distance for all chunks within the window
       if (resemblance_attempt_window > 0 && (similar_chunks.empty() || attempt_multiple_delta_methods)) {
         calc_simhash_if_needed(chunk);
-        std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> resemblance_attempt_window_similar_chunks{};
+        std::vector<std::tuple<uint64_t, uint64_t>> resemblance_attempt_window_similar_chunks{};
 
         std::optional<uint64_t> best_candidate_dist{};
         uint64_t best_candidate_i = 0;
@@ -2333,18 +2330,18 @@ int main(int argc, char* argv[]) {
             new_dist <= max_allowed_dist &&
             // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk
             // and data locality suggests it should be a better match
-            (exhausive_delta_search || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate_i)))
+            (!only_try_best_delta_match || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate_i)))
           ) {
-            if (!exhausive_delta_search || new_dist < *best_candidate_dist)  {
+            if (only_try_best_delta_match || new_dist < *best_candidate_dist)  {
               resemblance_attempt_window_similar_chunks.clear();
             }
             best_candidate_i = candidate_i;
             best_candidate_dist = new_dist;
-            resemblance_attempt_window_similar_chunks.emplace(new_dist, candidate_i);
+            resemblance_attempt_window_similar_chunks.emplace_back(new_dist, candidate_i);
           }
         }
         if (!resemblance_attempt_window_similar_chunks.empty()) {
-          similar_chunks.insert(resemblance_attempt_window_similar_chunks.begin(), resemblance_attempt_window_similar_chunks.end());
+          similar_chunks.insert(similar_chunks.end(), resemblance_attempt_window_similar_chunks.begin(), resemblance_attempt_window_similar_chunks.end());
         }
       }
 
@@ -2354,7 +2351,7 @@ int main(int argc, char* argv[]) {
         // If we don't have a similar chunk yet, attempt to find one by SuperFeature matching
         if (similar_chunks.empty() || attempt_multiple_delta_methods) {
           calc_simhash_if_needed(chunk);
-          std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> feature_extraction_similar_chunks{};
+          std::vector<std::tuple<uint64_t, uint64_t>> feature_extraction_similar_chunks{};
 
           std::optional<uint64_t> best_candidate_dist{};
           uint64_t best_candidate_i = 0;
@@ -2373,20 +2370,20 @@ int main(int argc, char* argv[]) {
                   new_dist <= max_allowed_dist &&
                   // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk
                   // and data locality suggests it should be a better match
-                  (exhausive_delta_search || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate_i)))
+                  (!only_try_best_delta_match || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate_i)))
                 ) {
-                  if (!exhausive_delta_search || new_dist < *best_candidate_dist) {
+                  if (only_try_best_delta_match || new_dist < *best_candidate_dist) {
                     feature_extraction_similar_chunks.clear();
                   }
                   best_candidate_i = candidate_i;
                   best_candidate_dist = new_dist;
-                  feature_extraction_similar_chunks.emplace(new_dist, candidate_i);
+                  feature_extraction_similar_chunks.emplace_back(new_dist, candidate_i);
                 }
               }
             }
           }
           if (!feature_extraction_similar_chunks.empty()) {
-            similar_chunks.insert(feature_extraction_similar_chunks.begin(), feature_extraction_similar_chunks.end());
+            similar_chunks.insert(similar_chunks.end(), feature_extraction_similar_chunks.begin(), feature_extraction_similar_chunks.end());
           }
 
           // If all SuperFeatures match, remove the previous chunk from the Index, prevents the index from getting pointlessly large, specially for some pathological cases
@@ -2418,12 +2415,21 @@ int main(int argc, char* argv[]) {
       // checking if the next chunk from the similarity locality anchor is similar to this one
       if (use_dupadj && (similar_chunks.empty() || attempt_multiple_delta_methods)) {
         calc_simhash_if_needed(chunk);
-        std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> dupadj_similar_chunks{};
+        std::vector<std::tuple<uint64_t, uint64_t>> dupadj_similar_chunks{};
 
         std::optional<uint64_t> best_candidate_dist{};
         uint64_t best_candidate_i = 0;
         if (prev_similarity_locality_anchor_i.has_value()) {
-          for (const auto& anchor_instance_chunk_i : known_hashes[chunks[*prev_similarity_locality_anchor_i].chunk_data->hash]) {
+          std::list<uint64_t> similarity_anchor_i_list;
+          std::list<uint64_t>* chunks_with_similarity_anchor_hash;
+          if (exhaustive_dupadj) {
+            chunks_with_similarity_anchor_hash = &known_hashes[chunks[*prev_similarity_locality_anchor_i].chunk_data->hash];
+          }
+          else {
+            similarity_anchor_i_list.emplace_back(*prev_similarity_locality_anchor_i);
+            chunks_with_similarity_anchor_hash = &similarity_anchor_i_list;
+          }
+          for (const auto& anchor_instance_chunk_i : *chunks_with_similarity_anchor_hash) {
             const auto similar_candidate_chunk_i = anchor_instance_chunk_i + 1;
             if (similar_candidate_chunk_i == chunk_i) continue;
 
@@ -2434,25 +2440,27 @@ int main(int argc, char* argv[]) {
               new_dist <= max_allowed_dist &&
               // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk
               // and data locality suggests it should be a better match
-              (exhausive_delta_search || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk_i > best_candidate_i)))
+              (!only_try_best_delta_match || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk_i > best_candidate_i)))
             ) {
-              if (!exhausive_delta_search || new_dist < *best_candidate_dist) {
+              if (only_try_best_delta_match || new_dist < *best_candidate_dist) {
                 dupadj_similar_chunks.clear();
               }
               best_candidate_i = similar_candidate_chunk_i;
               best_candidate_dist = new_dist;
-              dupadj_similar_chunks.emplace(new_dist, similar_candidate_chunk_i);
+              dupadj_similar_chunks.emplace_back(new_dist, similar_candidate_chunk_i);
             }
           }
         }
         if (!dupadj_similar_chunks.empty()) {
-          similar_chunks.insert(dupadj_similar_chunks.begin(), dupadj_similar_chunks.end());
+          similar_chunks.insert(similar_chunks.end(), dupadj_similar_chunks.begin(), dupadj_similar_chunks.end());
         }
       }
 
       // If any of the methods detected chunks that appear to be similar, attempt delta encoding
       DeltaEncodingResult best_encoding_result;
       if (!similar_chunks.empty()) {
+        std::ranges::sort(similar_chunks, similar_chunk_tuple_cmp);
+
         uint64_t best_saved_size = 0;
         uint64_t best_similar_chunk_i;
         uint64_t best_similar_chunk_dist = 999;
@@ -2552,15 +2560,25 @@ int main(int argc, char* argv[]) {
 
         for (; backtrack_chunk_i > prev_last_reduced_chunk_i; backtrack_chunk_i--) {
           auto& backtrack_chunk = chunks[backtrack_chunk_i];
-
-          std::set<std::tuple<uint64_t, uint64_t>, decltype(similar_chunk_tuple_cmp)> backwards_dupadj_similar_chunks{};
-
+          std::vector<std::tuple<uint64_t, uint64_t>> backwards_dupadj_similar_chunks{};
           std::optional<uint64_t> best_candidate_dist{};
           uint64_t best_candidate_i = 0;
-          for (const auto& anchor_instance_chunk_i : known_hashes[chunks[backtrack_similarity_anchor_i].chunk_data->hash]) {
+
+          std::list<uint64_t> backtrack_anchor_i_list;
+          std::list<uint64_t>* chunks_with_backtrack_anchor_hash;
+          if (exhaustive_dupadj) {
+            chunks_with_backtrack_anchor_hash = &known_hashes[chunks[backtrack_similarity_anchor_i].chunk_data->hash];
+          }
+          else {
+            backtrack_anchor_i_list.emplace_back(backtrack_similarity_anchor_i);
+            chunks_with_backtrack_anchor_hash = &backtrack_anchor_i_list;
+          }
+          for (const auto& anchor_instance_chunk_i : *chunks_with_backtrack_anchor_hash) {
+            // if anchor_instance_chunk_i is <= first_non_out_of_range_chunk_i then when we look at the previous one we are out of range
+            if (anchor_instance_chunk_i <= first_non_out_of_range_chunk_i /*|| anchor_instance_chunk_i == 0*/) continue;
+            // if anchor_instance_chunk_i is larger than backtrack_chunk_i then that chunk is in the future, so not really backtracking
+            if (anchor_instance_chunk_i > backtrack_chunk_i) break;
             const auto similar_candidate_chunk_i = anchor_instance_chunk_i - 1;
-            if (similar_candidate_chunk_i >= backtrack_chunk_i || anchor_instance_chunk_i == 0) continue;
-            if (similar_candidate_chunk_i < first_non_out_of_range_chunk_i) continue;
             auto& similar_chunk = chunks[similar_candidate_chunk_i];
 
             calc_simhash_if_needed(backtrack_chunk);
@@ -2570,18 +2588,19 @@ int main(int argc, char* argv[]) {
               new_dist <= max_allowed_dist &&
               // If new_dist is the same as the best so far, privilege chunks with higher index as they are closer to the current chunk
               // and data locality suggests it should be a better match
-              (exhausive_delta_search || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk_i > best_candidate_i)))
+              (!only_try_best_delta_match || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk_i > best_candidate_i)))
             ) {
-              if (!exhausive_delta_search || new_dist < *best_candidate_dist) {
+              if (only_try_best_delta_match || new_dist < *best_candidate_dist) {
                 backwards_dupadj_similar_chunks.clear();
               }
               best_candidate_i = similar_candidate_chunk_i;
               best_candidate_dist = new_dist;
-              backwards_dupadj_similar_chunks.emplace(new_dist, similar_candidate_chunk_i);
+              backwards_dupadj_similar_chunks.emplace_back(new_dist, similar_candidate_chunk_i);
             }
           }
 
           if (backwards_dupadj_similar_chunks.empty()) break;
+          std::ranges::sort(backwards_dupadj_similar_chunks, similar_chunk_tuple_cmp);
 
           uint64_t best_saved_size = 0;
           std::optional<uint64_t> best_similar_chunk_i;
