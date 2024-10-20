@@ -278,15 +278,17 @@ public:
 };
 
 namespace fastcdc {
-  uint32_t cdc_offset(
+  std::tuple<std::optional<uint32_t>, uint32_t> cdc_offset(
     const std::span<uint8_t> data,
     uint32_t min_size,
     uint32_t avg_size,
     uint32_t max_size,
     uint32_t mask_s,
-    uint32_t mask_l
+    uint32_t mask_l,
+    bool cut_at_data_end = true,
+    uint32_t initial_pattern = 0
   ) {
-    uint32_t pattern = 0;
+    uint32_t pattern = initial_pattern;
     uint32_t size = data.size();
     uint32_t barrier = std::min(avg_size, size);
     uint32_t i = std::min(barrier, min_size);
@@ -300,7 +302,7 @@ namespace fastcdc {
     // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
     // the content defined nature of the Hashes.
     // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
-    uint32_t remaining_minmax_adjustment = std::min<uint32_t>(i, 32);
+    uint32_t remaining_minmax_adjustment = std::min<uint32_t>(i, 31);
     i -= remaining_minmax_adjustment;
 
     while (i < barrier) {
@@ -310,17 +312,20 @@ namespace fastcdc {
         i++;
         continue;
       }
-      if (!(pattern & mask_s)) return i;
+      if (!(pattern & mask_s)) return { i, pattern };
       i++;
     }
     barrier = std::min(max_size, size);
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_l)) return i;
+      if (!(pattern & mask_l)) return { i, pattern };
       if (!backup_i.has_value() && !(pattern & mask_b)) backup_i = i;
       i++;
     }
-    return backup_i.has_value() ? *backup_i : i;
+    const auto result_i = backup_i.has_value()
+      ? backup_i
+      : cut_at_data_end ? std::optional(i) : std::nullopt;
+    return { result_i, pattern };
   }
 
   std::pair<uint32_t, std::vector<uint32_t>> cdc_offset_with_features(
@@ -405,6 +410,7 @@ namespace fastcdc {
     uint32_t mask_s;
     uint32_t mask_l;
     uint32_t read_size;
+    uint32_t pattern = 0;
 
     uint64_t offset = 0;
     std::vector<uint8_t> _blob{};
@@ -425,7 +431,7 @@ namespace fastcdc {
       blob = std::span(_blob.data(), blob_len);
       blob_it = blob.begin();
     }
-    ChunkGeneratorContext(std::span<uint8_t> _blob, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _fat, bool _extract_features = false)
+    ChunkGeneratorContext(std::span<uint8_t> _blob, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _extract_features = false)
       : min_size(_min_size), avg_size(_avg_size), max_size(_max_size), extract_features(_extract_features), blob(_blob) {
       bits = utility::logarithm2(avg_size);
       mask_s = utility::mask(bits + 1);
@@ -447,15 +453,21 @@ namespace fastcdc {
       context.blob_len += context.stream->gcount();
       context.blob_it = context.blob.begin();
     }
-    uint32_t cp;
+    std::optional<uint32_t> cp;
     std::vector<uint32_t> features{};
     if (context.extract_features) {
       std::tie(cp, features) = cdc_offset_with_features(std::span(context.blob_it, context.blob_len), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l);
     }
     else {
-      cp = cdc_offset(std::span(context.blob_it, context.blob_len), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l);
+      if (context.offset == 0) {
+        std::tie(cp, context.pattern) = fastcdc::cdc_offset(std::span(context.blob_it, context.blob_len), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l, true, 0);
+      }
+      else {
+        std::tie(cp, context.pattern) = fastcdc::cdc_offset(std::span(context.blob_it + 1, context.blob_len - 1), context.min_size - 1, context.avg_size - 1, context.max_size - 1, context.mask_s, context.mask_l, true, context.pattern);
+        cp = cp.has_value() ? *cp + 1 : 1;
+      }
     }
-    result.emplace(utility::ChunkEntry(context.offset), std::span(context.blob_it, cp));
+    result.emplace(utility::ChunkEntry(context.offset), std::span(context.blob_it, *cp));
     if (!features.empty()) {
       auto& chunk = std::get<0>(*result);
       for (uint64_t i = 0; i < 4; i++) {
@@ -464,11 +476,70 @@ namespace fastcdc {
       }
       chunk.chunk_data->feature_sampling_failure = false;
     }
-    context.offset += cp;
-    context.blob_it += cp;
-    context.blob_len -= cp;
+    context.offset += *cp;
+    context.blob_it += *cp;
+    context.blob_len -= *cp;
     return result;
   }
+}
+
+std::vector<uint32_t> find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool cut_at_data_end, bool is_first_segment = true) {
+  std::vector<uint32_t> candidates{};
+  if (data.empty()) return candidates;
+
+  const auto bits = utility::logarithm2(avg_size);
+  const auto mask_s = utility::mask(bits + 1);
+  const auto mask_l = utility::mask(bits - 1);
+
+  uint32_t base_offset = 0;
+  std::optional<uint32_t> cp;
+  uint32_t pattern = 0;
+
+  // If this is not the first segment then we need to deal with the previous segment extended data and attempt to recover chunk invariance
+  if (!is_first_segment) {
+    // Because this is not the first segment, then there is a previous segment that was extended 31 bytes as our GEAR window size is 32 bytes.
+    // Therefore, we do not accept any candidate in the first 31 bytes
+    std::tie(cp, pattern) = fastcdc::cdc_offset(data, 32, avg_size, max_size, mask_s, mask_l, cut_at_data_end);
+    if (!cp.has_value()) return candidates;
+    base_offset += *cp;
+    candidates.emplace_back(base_offset);
+    data = std::span(data.data() + *cp, data.size() - *cp);
+
+    // And now we need to recover chunk invariance in accordance to the chunk invariance recovery condition.
+    // We are guaranteed to be back in sync with what non-segmented CDC would have done as soon as we find a cut candidate with
+    // distance_w_prev_cut_candidate >= min_size and distance_w_prev_cut_candidate + min_size <= max_size.
+    // As soon as we find that we can break from here and keep processing as if we were processing without segments,
+    // which in particular means we can exploit jumps to min_size again.
+    while (!data.empty()) {
+      // TODO: max_size needs to also be disabled here
+      std::tie(cp, pattern) = fastcdc::cdc_offset(std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
+      if (!cp.has_value()) return candidates;
+      base_offset += *cp;
+      candidates.emplace_back(base_offset);
+      data = std::span(data.data() + *cp, data.size() - *cp);
+      if (cp >= min_size && (*cp + min_size <= max_size)) break;  // back in sync with non-segmented processing!
+    }
+  }
+
+  while (!data.empty()) {
+    //std::tie(cp, pattern) = fastcdc::cdc_offset(data, min_size, avg_size, max_size, mask_s, mask_l, cut_at_data_end, pattern);
+    //std::tie(cp, pattern) = fastcdc::cdc_offset(data, min_size, avg_size, max_size, mask_s, mask_l, cut_at_data_end, 0);
+    if (base_offset == 0) {
+      std::tie(cp, pattern) = fastcdc::cdc_offset(data, min_size, avg_size, max_size, mask_s, mask_l, cut_at_data_end, 0);
+    }
+    else {
+      //std::tie(cp, pattern) = fastcdc::cdc_offset(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, cut_at_data_end, constants::GEAR[data[0]]);
+      std::tie(cp, pattern) = fastcdc::cdc_offset(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, cut_at_data_end, pattern);
+      cp = cp.has_value() ? *cp + 1 : 1;
+    }
+
+    if (!cp.has_value()) return candidates;
+    base_offset += *cp;
+    candidates.emplace_back(base_offset);
+    data = std::span(data.data() + *cp, data.size() - *cp);
+  }
+
+  return candidates;
 }
 
 #include <immintrin.h>
@@ -538,12 +609,13 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
   auto* simhash = &std::get<0>(return_val);
   auto& minichunks_vec = std::get<1>(return_val);
 
-  // Iterate over the data in chunks
-  auto cdc_minichunk_result = fastcdc::chunk_generator(ctx);
-  while (cdc_minichunk_result.has_value()) {
-    auto& [chunk, chunk_data] = *cdc_minichunk_result;
+  // Find the CDC minichunks and update the SimHash with their data
+  auto cut_offsets = find_cdc_cut_candidates(std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2, true);
+  uint32_t previous_offset = 0;
+  for (const auto& cut_offset : cut_offsets) {
+    const auto minichunk_len = cut_offset - previous_offset;
     // Calculate hash for current chunk
-    const std::bitset<64> chunk_hash = XXH3_64bits(data + chunk.offset, chunk_data.size());
+    const std::bitset<64> chunk_hash = XXH3_64bits(data + previous_offset, minichunk_len);
 
     // Update SimHash vector with the hash of the chunk
     // Using AVX/2 we don't have enough vector size to handle the whole 64bit hash, we should be able to do it with AVX512,
@@ -553,8 +625,8 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
     const std::bitset<64> lower_chunk_hash = (chunk_hash << 32) >> 32;
     lower_counter_vector = add_32bit_hash_to_simhash_counter(lower_chunk_hash.to_ulong(), lower_counter_vector);
 
-    minichunks_vec.emplace_back(static_cast<uint32_t>(chunk_data.size()));
-    cdc_minichunk_result = fastcdc::chunk_generator(ctx);
+    minichunks_vec.emplace_back(minichunk_len);
+    previous_offset = cut_offset;
   }
 
   const uint32_t upper_chunk_hash = finalize_32bit_simhash_from_counter(upper_counter_vector);
@@ -2332,7 +2404,7 @@ int main(int argc, char* argv[]) {
             // and data locality suggests it should be a better match
             (!only_try_best_delta_match || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate_i)))
           ) {
-            if (only_try_best_delta_match || new_dist < *best_candidate_dist)  {
+            if (only_try_best_delta_match || best_candidate_dist.has_value() && new_dist < *best_candidate_dist)  {
               resemblance_attempt_window_similar_chunks.clear();
             }
             best_candidate_i = candidate_i;
@@ -2372,7 +2444,7 @@ int main(int argc, char* argv[]) {
                   // and data locality suggests it should be a better match
                   (!only_try_best_delta_match || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && candidate_i > best_candidate_i)))
                 ) {
-                  if (only_try_best_delta_match || new_dist < *best_candidate_dist) {
+                  if (only_try_best_delta_match || best_candidate_dist.has_value() && new_dist < *best_candidate_dist) {
                     feature_extraction_similar_chunks.clear();
                   }
                   best_candidate_i = candidate_i;
@@ -2442,7 +2514,7 @@ int main(int argc, char* argv[]) {
               // and data locality suggests it should be a better match
               (!only_try_best_delta_match || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk_i > best_candidate_i)))
             ) {
-              if (only_try_best_delta_match || new_dist < *best_candidate_dist) {
+              if (only_try_best_delta_match || best_candidate_dist.has_value() && new_dist < *best_candidate_dist) {
                 dupadj_similar_chunks.clear();
               }
               best_candidate_i = similar_candidate_chunk_i;
@@ -2590,7 +2662,7 @@ int main(int argc, char* argv[]) {
               // and data locality suggests it should be a better match
               (!only_try_best_delta_match || (!best_candidate_dist.has_value() || *best_candidate_dist > new_dist || (*best_candidate_dist == new_dist && similar_candidate_chunk_i > best_candidate_i)))
             ) {
-              if (only_try_best_delta_match || new_dist < *best_candidate_dist) {
+              if (only_try_best_delta_match || best_candidate_dist.has_value() && new_dist < *best_candidate_dist) {
                 backwards_dupadj_similar_chunks.clear();
               }
               best_candidate_i = similar_candidate_chunk_i;
