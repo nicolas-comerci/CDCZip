@@ -397,95 +397,11 @@ namespace fastcdc {
     }
     return return_val;
   }
-
-  class ChunkGeneratorContext {
-  public:
-    IStreamLike* stream = nullptr;
-    uint32_t min_size;
-    uint32_t avg_size;
-    uint32_t max_size;
-    bool extract_features;
-
-    uint32_t bits;
-    uint32_t mask_s;
-    uint32_t mask_l;
-    uint32_t read_size;
-    uint32_t pattern = 0;
-
-    uint64_t offset = 0;
-    std::vector<uint8_t> _blob{};
-    std::span<uint8_t> blob{};
-    uint32_t blob_len = 0;
-    std::span<unsigned char>::iterator blob_it;
-
-    ChunkGeneratorContext(IStreamLike* _stream, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _extract_features = false)
-      : stream(_stream), min_size(_min_size), avg_size(_avg_size), max_size(_max_size), extract_features(_extract_features) {
-      bits = utility::logarithm2(avg_size);
-      mask_s = utility::mask(bits + 1);
-      mask_l = utility::mask(bits - 1);
-      read_size = std::max<uint32_t>(1024 * 64, max_size);
-
-      _blob.resize(read_size);
-      stream->read(_blob.data(), read_size);
-      blob_len = stream->gcount();
-      blob = std::span(_blob.data(), blob_len);
-      blob_it = blob.begin();
-    }
-    ChunkGeneratorContext(std::span<uint8_t> _blob, uint32_t _min_size, uint32_t _avg_size, uint32_t _max_size, bool _extract_features = false)
-      : min_size(_min_size), avg_size(_avg_size), max_size(_max_size), extract_features(_extract_features), blob(_blob) {
-      bits = utility::logarithm2(avg_size);
-      mask_s = utility::mask(bits + 1);
-      mask_l = utility::mask(bits - 1);
-      read_size = std::max<uint32_t>(1024 * 64, max_size);
-
-      blob_len = blob.size();
-      blob_it = blob.begin();
-    }
-  };
-
-  std::optional<std::tuple<utility::ChunkEntry, std::span<uint8_t>>> chunk_generator(ChunkGeneratorContext& context) {
-    std::optional<std::tuple<utility::ChunkEntry, std::span<uint8_t>>> result{};
-    if (context.blob_len == 0) return result;
-
-    if (context.blob_len <= context.max_size && context.stream != nullptr) {
-      std::memmove(context.blob.data(), &*context.blob_it, context.blob_len);
-      context.stream->read(reinterpret_cast<char*>(context.blob.data()) + context.blob_len, context.read_size - context.blob_len);
-      context.blob_len += context.stream->gcount();
-      context.blob_it = context.blob.begin();
-    }
-    std::optional<uint32_t> cp;
-    std::vector<uint32_t> features{};
-    if (context.extract_features) {
-      std::tie(cp, features) = cdc_offset_with_features(std::span(context.blob_it, context.blob_len), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l);
-    }
-    else {
-      if (context.offset == 0) {
-        std::tie(cp, context.pattern) = fastcdc::cdc_offset(std::span(context.blob_it, context.blob_len), context.min_size, context.avg_size, context.max_size, context.mask_s, context.mask_l, true, 0);
-      }
-      else {
-        std::tie(cp, context.pattern) = fastcdc::cdc_offset(std::span(context.blob_it + 1, context.blob_len - 1), context.min_size - 1, context.avg_size - 1, context.max_size - 1, context.mask_s, context.mask_l, true, context.pattern);
-        cp = cp.has_value() ? *cp + 1 : 1;
-      }
-    }
-    result.emplace(utility::ChunkEntry(context.offset), std::span(context.blob_it, *cp));
-    if (!features.empty()) {
-      auto& chunk = std::get<0>(*result);
-      for (uint64_t i = 0; i < 4; i++) {
-        // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
-        chunk.chunk_data->super_features[i] = XXH32(features.data() + static_cast<ptrdiff_t>(i * 4), 16, constants::CDS_SAMPLING_MASK);
-      }
-      chunk.chunk_data->feature_sampling_failure = false;
-    }
-    context.offset += *cp;
-    context.blob_it += *cp;
-    context.blob_len -= *cp;
-    return result;
-  }
 }
 
-std::vector<uint32_t> find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool cut_at_data_end, bool is_first_segment = true) {
-  std::vector<uint32_t> candidates{};
-  if (data.empty()) return candidates;
+void find_cdc_cut_candidates(std::vector<uint32_t>& candidates, std::span<uint8_t> data, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool cut_at_data_end, bool is_first_segment = true) {
+  candidates.clear();
+  if (data.empty()) return;
 
   const auto bits = utility::logarithm2(avg_size);
   const auto mask_s = utility::mask(bits + 1);
@@ -497,10 +413,9 @@ std::vector<uint32_t> find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t 
 
   // If this is not the first segment then we need to deal with the previous segment extended data and attempt to recover chunk invariance
   if (!is_first_segment) {
-    // Because this is not the first segment, then there is a previous segment that was extended 31 bytes as our GEAR window size is 32 bytes.
-    // Therefore, we do not accept any candidate in the first 31 bytes
-    std::tie(cp, pattern) = fastcdc::cdc_offset(data, 32, avg_size, max_size, mask_s, mask_l, cut_at_data_end);
-    if (!cp.has_value()) return candidates;
+    std::tie(cp, pattern) = fastcdc::cdc_offset(data, 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
+
+    if (!cp.has_value()) return;
     base_offset += *cp;
     candidates.emplace_back(base_offset);
     data = std::span(data.data() + *cp, data.size() - *cp);
@@ -511,9 +426,10 @@ std::vector<uint32_t> find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t 
     // As soon as we find that we can break from here and keep processing as if we were processing without segments,
     // which in particular means we can exploit jumps to min_size again.
     while (!data.empty()) {
-      // TODO: max_size needs to also be disabled here
       std::tie(cp, pattern) = fastcdc::cdc_offset(std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
-      if (!cp.has_value()) return candidates;
+      cp = cp.has_value() ? *cp + 1 : 1;
+
+      if (!cp.has_value()) return;
       base_offset += *cp;
       candidates.emplace_back(base_offset);
       data = std::span(data.data() + *cp, data.size() - *cp);
@@ -522,24 +438,21 @@ std::vector<uint32_t> find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t 
   }
 
   while (!data.empty()) {
-    //std::tie(cp, pattern) = fastcdc::cdc_offset(data, min_size, avg_size, max_size, mask_s, mask_l, cut_at_data_end, pattern);
-    //std::tie(cp, pattern) = fastcdc::cdc_offset(data, min_size, avg_size, max_size, mask_s, mask_l, cut_at_data_end, 0);
     if (base_offset == 0) {
-      std::tie(cp, pattern) = fastcdc::cdc_offset(data, min_size, avg_size, max_size, mask_s, mask_l, cut_at_data_end, 0);
+      std::tie(cp, pattern) = fastcdc::cdc_offset(data, min_size, avg_size, max_size, mask_s, mask_l, cut_at_data_end, pattern);
     }
     else {
-      //std::tie(cp, pattern) = fastcdc::cdc_offset(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, cut_at_data_end, constants::GEAR[data[0]]);
       std::tie(cp, pattern) = fastcdc::cdc_offset(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, cut_at_data_end, pattern);
       cp = cp.has_value() ? *cp + 1 : 1;
     }
 
-    if (!cp.has_value()) return candidates;
+    if (!cp.has_value()) return;
     base_offset += *cp;
     candidates.emplace_back(base_offset);
     data = std::span(data.data() + *cp, data.size() - *cp);
   }
 
-  return candidates;
+  return;
 }
 
 #include <immintrin.h>
@@ -603,14 +516,13 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
   __m256i upper_counter_vector = _mm256_set1_epi8(0);
   __m256i lower_counter_vector = _mm256_set1_epi8(0);
 
-  auto ctx = fastcdc::ChunkGeneratorContext(std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2, false);
-
   std::tuple<std::bitset<64>, std::vector<uint32_t>> return_val{};
   auto* simhash = &std::get<0>(return_val);
   auto& minichunks_vec = std::get<1>(return_val);
 
   // Find the CDC minichunks and update the SimHash with their data
-  auto cut_offsets = find_cdc_cut_candidates(std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2, true);
+  std::vector<uint32_t> cut_offsets;
+  find_cdc_cut_candidates(cut_offsets, std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2, true);
   uint32_t previous_offset = 0;
   for (const auto& cut_offset : cut_offsets) {
     const auto minichunk_len = cut_offset - previous_offset;
@@ -1626,7 +1538,7 @@ public:
     return omitted_small_match_size;
   }
 
-  void addInstruction(LZInstruction&& instruction, uint64_t current_offset, bool verify = true, std::optional<uint64_t> _earliest_allowed_offset = std::nullopt) {
+  void addInstruction(LZInstruction&& instruction, uint64_t current_offset, bool verify, std::optional<uint64_t> _earliest_allowed_offset = std::nullopt) {
     uint64_t earliest_allowed_offset = _earliest_allowed_offset.has_value() ? *_earliest_allowed_offset : 0;
 #ifndef NDEBUG
     if (instruction.type == LZInstructionType::INSERT && instruction.offset != current_offset) {
@@ -1655,23 +1567,34 @@ public:
       std::vector<uint8_t> verify_buffer_instruction_data{};
       uint64_t verify_end_offset = current_offset + instruction.size;
       if (verify) {
-        verify_buffer_orig_data.resize(prevInstruction->size + instruction.size);
-        verify_buffer_instruction_data.resize(prevInstruction->size + instruction.size);
-
         std::fstream verify_file{};
-        verify_file.open("C:\\Users\\Administrator\\Desktop\\fastcdc_test\\sims.tar.pcf", std::ios_base::in | std::ios_base::binary);
-        const auto data_count = prevInstruction->size + instruction.size;
-        // Read original data
+        verify_file.open(R"(C:\Users\Administrator\Documents\dedup_proj\Datasets\LNX\LNX.tar)", std::ios_base::in | std::ios_base::binary);
+
+        verify_buffer_orig_data.resize(prevInstruction->size);
+        verify_buffer_instruction_data.resize(prevInstruction->size);
+        // Read prevInstruction original data
         verify_file.seekg(current_offset - prevInstruction->size);
-        verify_file.read(reinterpret_cast<char*>(verify_buffer_orig_data.data()), data_count);
-        // Read data according to the instructions
+        verify_file.read(reinterpret_cast<char*>(verify_buffer_orig_data.data()), prevInstruction->size);
+        // Read data according to prevInstruction
         verify_file.seekg(prevInstruction->offset);
         verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()), prevInstruction->size);
-        verify_file.seekg(instruction.offset);
-        verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()) + prevInstruction->size, instruction.size);
         // Ensure data matches
-        if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), data_count) != 0) {
-          print_to_console("Error while verifying addInstruction at offset " + std::to_string(current_offset) + "\n");
+        if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), prevInstruction->size) != 0) {
+          print_to_console("Error while verifying addInstruction prevInstruction at offset " + std::to_string(current_offset) + "\n");
+          exit(1);
+        }
+
+        verify_buffer_orig_data.resize(instruction.size);
+        verify_buffer_instruction_data.resize(instruction.size);
+        // Read instruction original data
+        verify_file.seekg(current_offset);
+        verify_file.read(reinterpret_cast<char*>(verify_buffer_orig_data.data()), instruction.size);
+        // Read data according to instruction
+        verify_file.seekg(instruction.offset);
+        verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()), instruction.size);
+        // Ensure data matches
+        if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), instruction.size) != 0) {
+          print_to_console("Error while verifying addInstruction instruction at offset " + std::to_string(current_offset) + "\n");
           exit(1);
         }
       }
@@ -1848,7 +1771,7 @@ public:
       prevInstruction = &instructions.back();
       if (verify) {
         std::fstream verify_file{};
-        verify_file.open("C:\\Users\\Administrator\\Desktop\\fastcdc_test\\sims.tar.pcf", std::ios_base::in | std::ios_base::binary);
+        verify_file.open(R"(C:\Users\Administrator\Documents\dedup_proj\Datasets\LNX\LNX.tar)", std::ios_base::in | std::ios_base::binary);
         const auto data_count = prevInstruction->size + instruction.size;
 
         verify_buffer_orig_data.resize(data_count);
@@ -2195,8 +2118,11 @@ int main(int argc, char* argv[]) {
   const bool only_try_best_delta_match = false;
   const bool only_try_min_dist_delta_matches = false;
   const bool keep_first_delta_match = true;
-  const bool verify_delta_coding = false;
   const bool is_any_delta_on = use_dupadj || use_dupadj_backwards || use_feature_extraction || use_generalized_resemblance_detection || resemblance_attempt_window > 0;
+
+  const bool verify_delta_coding = false;
+  const bool verify_dumps = false;
+  const bool verify_addInstruction = false;
 
   const std::optional<uint64_t> dictionary_size_limit = argc == 3
     ? std::optional(static_cast<uint64_t>(std::stoi(std::string(argv[2] + 3))) * 1024 * 1024)
@@ -2220,15 +2146,12 @@ int main(int argc, char* argv[]) {
   }
   
   auto wrapped_file = IStreamWrapper(&file_stream);
-  auto generator_ctx = fastcdc::ChunkGeneratorContext(&wrapped_file, min_size, avg_size, max_size, use_feature_extraction);
 
   std::optional<uint64_t> similarity_locality_anchor_i{};
 
   auto verify_file_stream = std::fstream();
-  bool verify_dumps = false;
   if (file_path != "-") {
     verify_file_stream.open(file_path, std::ios::in | std::ios::binary);
-    verify_dumps = true;
   }
   std::vector<uint8_t> verify_buffer{};
   std::vector<uint8_t> verify_buffer_delta{};
@@ -2257,14 +2180,42 @@ int main(int argc, char* argv[]) {
     simhashing_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(simhashing_end_time - simhashing_start_time).count();
   };
 
+  // SS-CDC style data segmenting to enable chunk invariant multithreading
+  std::vector<uint8_t> segment_data{};
+  const auto segment_size = 10 * 1024 * 1024;
+  segment_data.resize(segment_size + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
+  uint64_t segment_start_offset = 0;
+  std::deque<uint64_t> cut_points{};
+
   auto total_runtime_start_time = std::chrono::high_resolution_clock::now();
 
+  wrapped_file.read(segment_data.data(), segment_size + 31);
+  segment_data.resize(wrapped_file.gcount());
+  bool segments_eof = segment_data.size() != segment_size + 31;
+
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
-  auto generated_chunk = fastcdc::chunk_generator(generator_ctx);
+  std::vector<uint32_t> new_cut_point_candidates;
+  find_cdc_cut_candidates(new_cut_point_candidates, segment_data, min_size, avg_size, max_size, segments_eof, true);
   auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
   chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
 
-  while (generated_chunk.has_value()) {
+  for (auto& cut_point_candidate : new_cut_point_candidates) {
+    auto last_cut_point = cut_points.empty() ? segment_start_offset : segment_start_offset + cut_points.back();
+
+    const auto adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate;
+    while (adjusted_cut_point_candidate > last_cut_point + max_size) {
+      last_cut_point = last_cut_point + max_size;
+      cut_points.emplace_back(last_cut_point);
+    }
+    if (adjusted_cut_point_candidate < last_cut_point + min_size) {
+      continue;
+    }
+    cut_points.emplace_back(adjusted_cut_point_candidate);
+  }
+
+  uint64_t current_offset = 0;
+
+  while (!cut_points.empty()) {
     if (chunk_i > 0 && dictionary_size_limit.has_value() && dictionary_size_used > *dictionary_size_limit) {
       const auto prev_first_non_out_of_range_chunk_i = first_non_out_of_range_chunk_i;
     
@@ -2322,14 +2273,34 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    chunks.emplace_back(std::move(std::get<0>(*generated_chunk)));
+    const auto next_cut_point = cut_points.front();
+    cut_points.pop_front();
+    chunks.emplace_back(utility::ChunkEntry(current_offset));
     auto& chunk = chunks.back();
 
     std::optional<uint64_t> prev_similarity_locality_anchor_i = similarity_locality_anchor_i;
     similarity_locality_anchor_i = std::nullopt;
-    if (chunk_i % 50000 == 0) print_to_console("\n%" + std::to_string((static_cast<float>(generator_ctx.offset) / file_size) * 100) + "\n");
-    const auto& data_span = std::get<1>(*generated_chunk);
+    if (chunk_i % 50000 == 0) print_to_console("\n%" + std::to_string((static_cast<float>(current_offset) / file_size) * 100) + "\n");
+    const auto data_span = std::span<uint8_t>(segment_data.data() + current_offset - segment_start_offset, next_cut_point - current_offset);
     total_size += data_span.size();
+
+    /*
+    {
+      std::vector<uint8_t> verify_buffer_orig_data{};
+      std::fstream verify_file{};
+      verify_file.open(R"(C:\Users\Administrator\Documents\dedup_proj\Datasets\LNX\LNX.tar)", std::ios_base::in | std::ios_base::binary);
+
+      verify_buffer_orig_data.resize(data_span.size());
+      // Read original data
+      verify_file.seekg(current_offset);
+      verify_file.read(reinterpret_cast<char*>(verify_buffer_orig_data.data()), data_span.size());
+      // Ensure data matches
+      if (std::memcmp(verify_buffer_orig_data.data(), data_span.data(), data_span.size()) != 0) {
+        print_to_console("Error while verifying current_offset at offset " + std::to_string(current_offset) + "\n");
+        exit(1);
+      }
+    }
+    */
 
     // make hashes
     const auto hashing_start_time = std::chrono::high_resolution_clock::now();
@@ -2730,7 +2701,7 @@ int main(int argc, char* argv[]) {
               const auto instruction_size = instruction.size;
               const auto prev_estimated_savings = lz_manager.accumulatedSavings();
               const auto instruction_type = instruction.type;
-              lz_manager.addInstruction(std::move(instruction), lz_offset, false, chunks[first_non_out_of_range_chunk_i].offset);
+              lz_manager.addInstruction(std::move(instruction), lz_offset, verify_addInstruction, chunks[first_non_out_of_range_chunk_i].offset);
               lz_offset += instruction_size;
 
               if (instruction_type == LZInstructionType::COPY) {
@@ -2751,7 +2722,7 @@ int main(int argc, char* argv[]) {
         const auto instruction_size = instruction.size;
         const auto prev_estimated_savings = lz_manager.accumulatedSavings();
         const auto instruction_type = instruction.type;
-        lz_manager.addInstruction(std::move(instruction), lz_offset, false, chunks[first_non_out_of_range_chunk_i].offset);
+        lz_manager.addInstruction(std::move(instruction), lz_offset, verify_addInstruction, chunks[first_non_out_of_range_chunk_i].offset);
         lz_offset += instruction_size;
 
         if (instruction_type == LZInstructionType::COPY) {
@@ -2771,17 +2742,58 @@ int main(int argc, char* argv[]) {
       }
     }
     else {
-      lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = chunk.offset, .size = chunk.chunk_data->data.size() }, chunk.offset, false, chunks[first_non_out_of_range_chunk_i].offset);
+      lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = chunk.offset, .size = chunk.chunk_data->data.size() }, chunk.offset, verify_addInstruction, chunks[first_non_out_of_range_chunk_i].offset);
     }
 
     dictionary_size_used += is_duplicate_chunk ? 0 : chunk.chunk_data->data.size();
     chunk_i++;
+    current_offset += chunk.chunk_data->data.size();
 
-    chunk_generator_start_time = std::chrono::high_resolution_clock::now();
-    generated_chunk = fastcdc::chunk_generator(generator_ctx);
-    chunk_generator_end_time = std::chrono::high_resolution_clock::now();
-    chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
+    if (cut_points.empty() && !segments_eof) {
+      auto in_segment_pos = current_offset - segment_start_offset;
+      auto segment_data_tail_len = segment_data.size() - in_segment_pos;
+
+      if (segment_data_tail_len < 31) {
+        // We have to at least preserve the SS-CDC window size - 1 segment extension
+        in_segment_pos = segment_data.size() - 31;
+        segment_data_tail_len = 31;
+      }
+      segment_start_offset += in_segment_pos;
+
+      // We get the 31byte extension (plus any data after the last cut point on the prior segment) to be at the start of the new segment data
+      std::memmove(segment_data.data(), segment_data.data() + in_segment_pos, segment_data_tail_len);
+      // And attempt to load remaining data for the new segment including next segment extension
+      segment_data.resize(segment_size + segment_data_tail_len);
+      wrapped_file.read(segment_data.data() + segment_data_tail_len, segment_size);
+      segment_data.resize(segment_data_tail_len + wrapped_file.gcount());
+      segments_eof = segment_data.size() != segment_size + segment_data_tail_len;
+
+      chunk_generator_start_time = std::chrono::high_resolution_clock::now();
+      find_cdc_cut_candidates(new_cut_point_candidates, segment_data, min_size, avg_size, max_size, segments_eof, false);
+      chunk_generator_end_time = std::chrono::high_resolution_clock::now();
+      chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
+
+      for (auto& cut_point_candidate : new_cut_point_candidates) {
+        if (cut_point_candidate < segment_data_tail_len) continue;
+        auto last_cut_point = cut_points.empty() ? current_offset : cut_points.back();
+
+        const auto adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate;
+        while (adjusted_cut_point_candidate > last_cut_point + max_size) {
+          last_cut_point = last_cut_point + max_size;
+          cut_points.emplace_back(last_cut_point);
+        }
+        if (adjusted_cut_point_candidate < last_cut_point + min_size) continue;
+        cut_points.emplace_back(adjusted_cut_point_candidate);
+      }
+
+      // If we reached EOF, and we skipped the cut point at the end we add it here
+      if (segments_eof && cut_points.back() != segment_start_offset + segment_data.size()) {
+        cut_points.emplace_back(segment_start_offset + segment_data.size());
+      }
+    }
   }
+
+  print_to_console("Final offset: " + std::to_string(current_offset) + "\n");
 
   auto total_dedup_end_time = std::chrono::high_resolution_clock::now();
 
