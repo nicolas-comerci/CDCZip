@@ -51,7 +51,7 @@ typedef enum
   STDERR_HANDLE = 2,
 } StdHandles;
 #ifndef __unix
-void set_std_handle_binary_mode(StdHandles handle) { _setmode(handle, O_BINARY); }
+void set_std_handle_binary_mode(StdHandles handle) { std::ignore = _setmode(handle, O_BINARY); }
 #else
 void set_std_handle_binary_mode(StdHandles handle) {}
 #endif
@@ -214,7 +214,7 @@ namespace utility {
   };
   class ChunkEntry {
   public:
-    uint64_t offset;
+    uint64_t offset = 0;
     std::shared_ptr<ChunkData> chunk_data;
     explicit ChunkEntry() = default;
     explicit ChunkEntry(uint64_t _offset) : offset(_offset), chunk_data(std::make_shared<ChunkData>()) {}
@@ -591,7 +591,7 @@ struct LZInstruction {
 };
 
 struct DeltaEncodingResult {
-  uint64_t estimated_savings;
+  uint64_t estimated_savings = 0;
   std::vector<LZInstruction> instructions;
 };
 
@@ -1425,6 +1425,20 @@ public:
     first_index_num++;
     reclaimable_slots++;
   }
+  void pop_back() {
+    if (last_index_vec.has_value()) {
+      if (*last_index_vec == 0) {
+        last_index_vec = std::nullopt;
+      }
+      else {
+        (*last_index_vec)--;
+      }
+      reclaimable_slots++;
+    }
+    else {
+      vec.pop_back();
+    }
+  }
   void emplace_back(T&& chunk) {
     // If we can still expand without realloc just do it
     if (vec.empty() || vec.size() < vec.capacity()) {
@@ -1467,6 +1481,7 @@ public:
     }
   }
 
+  T& front() { return vec[first_index_vec]; }
   T& back() { return vec[get_last_index_vec()]; }
 };
 static_assert(std::ranges::range<circular_vector<utility::ChunkEntry>>);
@@ -1495,6 +1510,7 @@ std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<ut
 class LZInstructionManager {
   circular_vector<utility::ChunkEntry>* chunks;
   std::deque<LZInstruction> instructions;
+  //circular_vector<LZInstruction> instructions;
 
   std::ostream* ostream;
   WrappedOStreamOutputStream output_stream;
@@ -1509,6 +1525,191 @@ class LZInstructionManager {
   uint64_t omitted_small_match_size = 0;
   uint64_t outputted_up_to_offset = 0;
   uint64_t outputted_lz_instructions = 0;
+
+  uint64_t check_backwards_extend_size(const LZInstruction& instruction, uint64_t current_offset, uint64_t earliest_allowed_offset) const {
+    uint64_t extended_backwards_size = 0;
+    const bool can_backwards_extend_instruction = instruction.offset > earliest_allowed_offset;
+    if (!use_match_extension_backwards || instruction.type != LZInstructionType::COPY || instruction.size == 0 || !can_backwards_extend_instruction)
+      return extended_backwards_size;
+
+    auto prevInstruction_iter = instructions.rbegin();
+    const LZInstruction* prevInstruction = &*prevInstruction_iter;
+
+    auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset - 1);
+    utility::ChunkEntry* instruction_chunk = &(*chunks)[instruction_chunk_i];
+#ifndef NDEBUG
+    if (instruction_chunk->offset + instruction_chunk_pos != instruction.offset - 1) {
+      print_to_console("BACKWARD MATCH EXTENSION NEW INSTRUCTION OFFSET MISMATCH\n");
+      exit(1);
+    }
+#endif
+
+    uint64_t extended_instruction_offset = current_offset;
+    uint64_t prevInstruction_eaten_size = 0;
+    const bool can_backwards_extend_prevInstruction = extended_instruction_offset > earliest_allowed_offset;
+    while (prevInstruction_iter != instructions.rend() && can_backwards_extend_prevInstruction) {
+      // TODO: figure out why this happens, most likely some match extension is not properly cleaning up INSERTs that are shrunk into nothingness
+      if (prevInstruction->size == 0) {
+        ++prevInstruction_iter;
+        if (prevInstruction_iter == instructions.rend()) {
+          break;
+        }
+        prevInstruction_eaten_size = 0;
+        prevInstruction = &*prevInstruction_iter;
+        continue;
+      }
+
+      auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, extended_instruction_offset - 1);
+      utility::ChunkEntry* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
+#ifndef NDEBUG
+      if (prevInstruction_chunk->offset + prevInstruction_chunk_pos != extended_instruction_offset - 1) {
+        print_to_console("BACKWARD MATCH EXTENSION PREVIOUS INSTRUCTION OFFSET MISMATCH\n");
+        exit(1);
+      }
+#endif
+
+      bool stop_matching = false;
+      while (true) {
+        const auto bytes_remaining_for_prevInstruction_to_earliest_allowed_offset = extended_instruction_offset - earliest_allowed_offset;
+        // bytes_remaining_for_prevInstruction_backtrack is including the current byte, which is why we +1 to bytes_remaining_for_prevInstruction_to_earliest_allowed_offset,
+        // otherwise this would be 0 when we are on the actual earliest_allowed_offset
+        const auto bytes_remaining_for_prevInstruction_backtrack = std::min(
+          bytes_remaining_for_prevInstruction_to_earliest_allowed_offset + 1,
+          std::min(prevInstruction->size - prevInstruction_eaten_size, prevInstruction_chunk_pos + 1)
+        );
+
+        const auto prevInstruction_backtrack_data = std::span(
+          prevInstruction_chunk->chunk_data->data.data() + prevInstruction_chunk_pos - (bytes_remaining_for_prevInstruction_backtrack - 1),
+          bytes_remaining_for_prevInstruction_backtrack
+        );
+        const auto instruction_backtrack_data = std::span(instruction_chunk->chunk_data->data.data(), instruction_chunk_pos + 1);
+
+        uint64_t matched_amt = find_identical_suffix_byte_count(prevInstruction_backtrack_data, instruction_backtrack_data);
+        if (matched_amt == 0) {
+          stop_matching = true;
+          break;
+        }
+
+        extended_instruction_offset -= matched_amt;
+        prevInstruction_eaten_size += matched_amt;
+        extended_backwards_size += matched_amt;
+
+        // Can't keep extending backwards, any previous data is disallowed (presumably to accomodate max matching distance)
+        if (extended_instruction_offset < earliest_allowed_offset) {
+          stop_matching = true;
+          break;
+        }
+        if (extended_instruction_offset < earliest_allowed_offset) {
+          stop_matching = true;
+          break;
+        }
+
+        if (instruction_chunk_pos >= matched_amt) {
+          instruction_chunk_pos -= matched_amt;
+        }
+        else if (instruction_chunk_i == 0 || instruction_chunk->offset == earliest_allowed_offset) {
+          stop_matching = true;
+          break;
+        }
+        else {
+          instruction_chunk_i--;
+          instruction_chunk = &(*chunks)[instruction_chunk_i];
+          instruction_chunk_pos = instruction_chunk->chunk_data->data.size() - 1;
+        }
+
+        if (prevInstruction->size == prevInstruction_eaten_size) {
+          ++prevInstruction_iter;
+          if (prevInstruction_iter == instructions.rend()) {
+            stop_matching = true;
+            break;
+          }
+          prevInstruction_eaten_size = 0;
+          prevInstruction = &*prevInstruction_iter;
+          break;
+        }
+
+        if (prevInstruction_chunk_pos >= matched_amt) {
+          prevInstruction_chunk_pos -= matched_amt;
+        }
+        else if (prevInstruction_chunk_i == 0 || prevInstruction_chunk->offset == earliest_allowed_offset) {
+          stop_matching = true;
+          break;
+        }
+        else {
+          prevInstruction_chunk_i--;
+          prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
+          prevInstruction_chunk_pos = prevInstruction_chunk->chunk_data->data.size() - 1;
+        }
+      }
+      if (stop_matching) break;
+    }
+
+    return extended_backwards_size;
+  }
+
+  uint64_t check_forwards_extend_size(const LZInstruction& instruction, uint64_t earliest_allowed_offset) const {
+    uint64_t extended_forwards_savings = 0;
+    uint64_t extended_forwards_size = 0;
+    const LZInstruction& prevInstruction = instructions.back();
+    if (!use_match_extension || prevInstruction.type != LZInstructionType::COPY)
+      return extended_forwards_size;
+
+    uint64_t prevInstruction_offset = prevInstruction.offset + prevInstruction.size;
+
+    const bool can_forward_extend_prevInstruction = prevInstruction_offset >= earliest_allowed_offset;
+    if (can_forward_extend_prevInstruction) {
+      auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_offset);
+      utility::ChunkEntry* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
+
+      auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
+      utility::ChunkEntry* instruction_chunk = &(*chunks)[instruction_chunk_i];
+#ifndef NDEBUG
+      if (instruction_chunk->offset + instruction_chunk_pos != instruction.offset || instruction_chunk_pos >= instruction_chunk->chunk_data->data.size()) {
+        print_to_console("HERE WE GO LA CAGAMOU!\n");
+        exit(1);
+      }
+#endif
+
+      while (extended_forwards_size < instruction.size) {
+        const auto prevInstruction_extend_data = std::span(
+          prevInstruction_chunk->chunk_data->data.data() + prevInstruction_chunk_pos,
+          prevInstruction_chunk->chunk_data->data.size() - prevInstruction_chunk_pos
+        );
+        const auto instruction_extend_data = std::span(
+          instruction_chunk->chunk_data->data.data() + instruction_chunk_pos,
+          std::min(instruction_chunk->chunk_data->data.size() - instruction_chunk_pos, instruction.size - extended_forwards_size)
+        );
+
+        uint64_t matched_amt = find_identical_prefix_byte_count(prevInstruction_extend_data, instruction_extend_data);
+        if (matched_amt == 0) break;
+
+        extended_forwards_size += matched_amt;
+        //prevInstruction.size += matched_amt;
+        //instruction.offset += matched_amt;
+        //instruction.size -= matched_amt;
+        if (instruction.type == LZInstructionType::INSERT) extended_forwards_savings += matched_amt;
+
+        prevInstruction_chunk_pos += matched_amt;
+        if (prevInstruction_chunk_pos == prevInstruction_chunk->chunk_data->data.size()) {
+          prevInstruction_chunk_i++;
+          prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
+          prevInstruction_chunk_pos = 0;
+        }
+
+        if (instruction.size == extended_forwards_size) {
+          break;
+        }
+
+        instruction_chunk_pos += matched_amt;
+        if (instruction_chunk_pos == instruction_chunk->chunk_data->data.size()) {
+          instruction_chunk_i++;
+          instruction_chunk = &(*chunks)[instruction_chunk_i];
+          instruction_chunk_pos = 0;
+        }
+      }
+    }
+    return extended_forwards_size;
+  }
 
 public:
   explicit LZInstructionManager(circular_vector<utility::ChunkEntry>* _chunks, bool _use_match_extension_backwards, bool _use_match_extension, std::ostream* _ostream)
@@ -1546,8 +1747,8 @@ public:
       exit(1);
     }
 #endif
-    if (instructions.empty()) {
-      instructions.insert(instructions.end(), std::move(instruction));
+    if (instructions.size() == 0) {
+      instructions.emplace_back(std::move(instruction));
       return;
     }
 
@@ -1600,175 +1801,64 @@ public:
       }
 
       const uint64_t original_instruction_size = instruction.size;
-      uint64_t extended_backwards_savings = 0;
-      const bool can_backwards_extend_instruction = instruction.offset > earliest_allowed_offset;
-      if (use_match_extension_backwards && instruction.type == LZInstructionType::COPY && can_backwards_extend_instruction) {
-        auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset - 1);
-        utility::ChunkEntry* instruction_chunk = &(*chunks)[instruction_chunk_i];
-#ifndef NDEBUG
-        if (instruction_chunk->offset + instruction_chunk_pos != instruction.offset - 1) {
-          print_to_console("BACKWARD MATCH EXTENSION NEW INSTRUCTION OFFSET MISMATCH\n");
-          exit(1);
-        }
-#endif
-
-        uint64_t prevInstruction_end_offset = current_offset;
-        const bool can_backwards_extend_prevInstruction = prevInstruction_end_offset > earliest_allowed_offset;
-        while (!instructions.empty() && can_backwards_extend_prevInstruction) {
-          // TODO: figure out why this happens, most likely some match extension is not properly cleaning up INSERTs that are shrunk into nothingness
-          if (prevInstruction->size == 0) {
-            instructions.pop_back();
-            if (instructions.empty()) {
-              break;
-            }
-            prevInstruction = &instructions.back();
-            continue;
-          }
-
-          auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_end_offset - 1);
-          utility::ChunkEntry* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
-#ifndef NDEBUG
-          if (prevInstruction_chunk->offset + prevInstruction_chunk_pos != prevInstruction_end_offset - 1) {
-            print_to_console("BACKWARD MATCH EXTENSION PREVIOUS INSTRUCTION OFFSET MISMATCH\n");
-            exit(1);
-          }
-#endif
-
-          bool stop_matching = false;
-          while (true) {
-            const auto bytes_remaining_for_prevInstruction_to_earliest_allowed_offset = prevInstruction_end_offset - earliest_allowed_offset;
-            // bytes_remaining_for_prevInstruction_backtrack is including the current byte, which is why we +1 to bytes_remaining_for_prevInstruction_to_earliest_allowed_offset,
-            // otherwise this would be 0 when we are on the actual earliest_allowed_offset
-            const auto bytes_remaining_for_prevInstruction_backtrack = std::min(
-              bytes_remaining_for_prevInstruction_to_earliest_allowed_offset + 1,
-              std::min(prevInstruction->size, prevInstruction_chunk_pos + 1)
-            );
-
-            const auto prevInstruction_backtrack_data = std::span(
-              prevInstruction_chunk->chunk_data->data.data() + prevInstruction_chunk_pos - (bytes_remaining_for_prevInstruction_backtrack - 1),
-              bytes_remaining_for_prevInstruction_backtrack
-            );
-            const auto instruction_backtrack_data = std::span(instruction_chunk->chunk_data->data.data(),instruction_chunk_pos + 1);
-
-            uint64_t matched_amt = find_identical_suffix_byte_count(prevInstruction_backtrack_data, instruction_backtrack_data);
-            if (matched_amt == 0) {
-              stop_matching = true;
-              break;
-            }
-
-            prevInstruction_end_offset -= matched_amt;
-            prevInstruction->size -= matched_amt;
-            instruction.offset -= matched_amt;
-            instruction.size += matched_amt;
-            if (prevInstruction->type == LZInstructionType::INSERT) extended_backwards_savings += matched_amt;
-
-            // Can't keep extending backwards, any previous data is disallowed (presumably to accomodate max matching distance)
-            if (prevInstruction_end_offset < earliest_allowed_offset) {
-              stop_matching = true;
-              break;
-            }
-            if (instruction.offset < earliest_allowed_offset) {
-              stop_matching = true;
-              break;
-            }
-
-            if (instruction_chunk_pos >= matched_amt) {
-              instruction_chunk_pos -= matched_amt;
-            }
-            else if (instruction_chunk_i == 0 || instruction_chunk->offset == earliest_allowed_offset) {
-              stop_matching = true;
-              break;
-            }
-            else {
-              instruction_chunk_i--;
-              instruction_chunk = &(*chunks)[instruction_chunk_i];
-              instruction_chunk_pos = instruction_chunk->chunk_data->data.size() - 1;
-            }
-
-            if (prevInstruction->size == 0) {
-              instructions.pop_back();
-              if (instructions.empty()) {
-                stop_matching = true;
-                break;
-              }
-              prevInstruction = &instructions.back();
-              break;
-            }
-
-            if (prevInstruction_chunk_pos >= matched_amt) {
-              prevInstruction_chunk_pos -= matched_amt;
-            }
-            else if (prevInstruction_chunk_i == 0 || prevInstruction_chunk->offset == earliest_allowed_offset) {
-              stop_matching = true;
-              break;
-            }
-            else {
-              prevInstruction_chunk_i--;
-              prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
-              prevInstruction_chunk_pos = prevInstruction_chunk->chunk_data->data.size() - 1;
-            }
-          }
-          if (stop_matching) break;
-        }
-      }
       uint64_t extended_forwards_savings = 0;
-      if (use_match_extension && prevInstruction->type == LZInstructionType::COPY) {
-        uint64_t prevInstruction_offset = prevInstruction->offset + prevInstruction->size;
+      uint64_t extended_backwards_savings = 0;
 
-        const bool can_forward_extend_prevInstruction = prevInstruction_offset >= earliest_allowed_offset;
-        if (can_forward_extend_prevInstruction) {
-          auto [prevInstruction_chunk_i, prevInstruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, prevInstruction_offset);
-          utility::ChunkEntry* prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
+      uint64_t forwards_extend_possible_size = check_forwards_extend_size(instruction, earliest_allowed_offset);
+      const bool is_forwards_extend_eats_prevInstruction = forwards_extend_possible_size == instruction.size;
+      if (is_forwards_extend_eats_prevInstruction) {
+        prevInstruction->size += forwards_extend_possible_size;
+        instruction.offset += forwards_extend_possible_size;
+        instruction.size -= forwards_extend_possible_size;
+        if (instruction.type == LZInstructionType::INSERT) {
+          extended_forwards_savings += forwards_extend_possible_size;
+        }
+      }
+      else {
+        uint64_t backwards_extend_possible_size = check_backwards_extend_size(instruction, current_offset, earliest_allowed_offset);
+        const bool is_backwards_extend_eats_prevInstruction = backwards_extend_possible_size >= prevInstruction->size;
 
-          auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
-          utility::ChunkEntry* instruction_chunk = &(*chunks)[instruction_chunk_i];
-#ifndef NDEBUG
-          if (instruction_chunk->offset + instruction_chunk_pos != instruction.offset || instruction_chunk_pos >= instruction_chunk->chunk_data->data.size()) {
-            print_to_console("HERE WE GO LA CAGAMOU!\n");
-            exit(1);
-          }
-#endif
+        if (is_backwards_extend_eats_prevInstruction || prevInstruction->type == LZInstructionType::INSERT) {
+          while (backwards_extend_possible_size > 0) {
+            prevInstruction = &instructions.back();
 
-          while (instruction.size > 0) {
-            const auto prevInstruction_extend_data = std::span(
-              prevInstruction_chunk->chunk_data->data.data() + prevInstruction_chunk_pos,
-              prevInstruction_chunk->chunk_data->data.size() - prevInstruction_chunk_pos
-            );
-            const auto instruction_extend_data = std::span(
-              instruction_chunk->chunk_data->data.data() + instruction_chunk_pos,
-              std::min(instruction_chunk->chunk_data->data.size() - instruction_chunk_pos, instruction.size)
-            );
-
-            uint64_t matched_amt = find_identical_prefix_byte_count(prevInstruction_extend_data, instruction_extend_data);
-            if (matched_amt == 0) break;
-
-            prevInstruction->size += matched_amt;
-            instruction.offset += matched_amt;
-            instruction.size -= matched_amt;
-            if (instruction.type == LZInstructionType::INSERT) extended_forwards_savings += matched_amt;
-
-            prevInstruction_chunk_pos += matched_amt;
-            if (prevInstruction_chunk_pos == prevInstruction_chunk->chunk_data->data.size()) {
-              prevInstruction_chunk_i++;
-              prevInstruction_chunk = &(*chunks)[prevInstruction_chunk_i];
-              prevInstruction_chunk_pos = 0;
+            uint64_t prevInstruction_reduced_size = 0;
+            const bool is_prevInstruction_INSERT = prevInstruction->type == LZInstructionType::INSERT;
+            if (backwards_extend_possible_size >= prevInstruction->size) {
+              prevInstruction_reduced_size = prevInstruction->size;
+              instructions.pop_back();
             }
-
-            if (instruction.size == 0) {
+            else if (!is_prevInstruction_INSERT) {
+              // If prevInstruction is a COPY, but we can't eat it completely, we skip it.
+              // It's mostly pointless to reduce it, and that prior instruction is likely for data that is
+              // more distant, which might make it more compressible.
               break;
             }
-
-            instruction_chunk_pos += matched_amt;
-            if (instruction_chunk_pos == instruction_chunk->chunk_data->data.size()) {
-              instruction_chunk_i++;
-              instruction_chunk = &(*chunks)[instruction_chunk_i];
-              instruction_chunk_pos = 0;
+            else {
+              prevInstruction_reduced_size = backwards_extend_possible_size;
+              prevInstruction->size -= backwards_extend_possible_size;
             }
+
+            backwards_extend_possible_size -= prevInstruction_reduced_size;
+            if (is_prevInstruction_INSERT) {
+              extended_backwards_savings += prevInstruction_reduced_size;
+            }
+
+            instruction.offset -= prevInstruction_reduced_size;
+            instruction.size += prevInstruction_reduced_size;
+          }
+          prevInstruction = &instructions.back();
+        }
+        else if (forwards_extend_possible_size > 0) {
+          prevInstruction->size += forwards_extend_possible_size;
+          instruction.offset += forwards_extend_possible_size;
+          instruction.size -= forwards_extend_possible_size;
+          if (instruction.type == LZInstructionType::INSERT) {
+            extended_forwards_savings += forwards_extend_possible_size;
           }
         }
       }
 
-      prevInstruction = &instructions.back();
       if (verify) {
         std::fstream verify_file{};
         verify_file.open(R"(C:\Users\Administrator\Documents\dedup_proj\Datasets\LNX\LNX.tar)", std::ios_base::in | std::ios_base::binary);
@@ -1816,7 +1906,7 @@ public:
         prevInstruction->size = instruction.size + prevInstruction->size;
         return;
       }
-      instructions.insert(instructions.end(), std::move(instruction));
+      instructions.emplace_back(std::move(instruction));
     }
   }
 
@@ -1837,7 +1927,7 @@ public:
     std::vector<char> verify_buffer;
 
     auto prev_outputted_up_to_offset = outputted_up_to_offset;
-    while (!instructions.empty()) {
+    while (instructions.size() != 0) {
       if (up_to_offset.has_value() && outputted_up_to_offset > *up_to_offset) break;
       auto instruction = std::move(instructions.front());
       instructions.pop_front();
@@ -2123,6 +2213,7 @@ int main(int argc, char* argv[]) {
   const bool verify_delta_coding = false;
   const bool verify_dumps = false;
   const bool verify_addInstruction = false;
+  const bool verify_chunk_offsets = false;
 
   const std::optional<uint64_t> dictionary_size_limit = argc == 3
     ? std::optional(static_cast<uint64_t>(std::stoi(std::string(argv[2] + 3))) * 1024 * 1024)
@@ -2284,8 +2375,7 @@ int main(int argc, char* argv[]) {
     const auto data_span = std::span<uint8_t>(segment_data.data() + current_offset - segment_start_offset, next_cut_point - current_offset);
     total_size += data_span.size();
 
-    /*
-    {
+    if (verify_chunk_offsets) {
       std::vector<uint8_t> verify_buffer_orig_data{};
       std::fstream verify_file{};
       verify_file.open(R"(C:\Users\Administrator\Documents\dedup_proj\Datasets\LNX\LNX.tar)", std::ios_base::in | std::ios_base::binary);
@@ -2300,7 +2390,6 @@ int main(int argc, char* argv[]) {
         exit(1);
       }
     }
-    */
 
     // make hashes
     const auto hashing_start_time = std::chrono::high_resolution_clock::now();
