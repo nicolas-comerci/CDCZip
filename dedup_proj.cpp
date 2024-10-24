@@ -31,6 +31,7 @@
 // Resemblance detection support
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <ranges>
 #include <stack>
 #include <unordered_set>
@@ -278,7 +279,11 @@ public:
 };
 
 namespace fastcdc {
-  std::tuple<std::optional<uint32_t>, uint32_t> cdc_offset(
+  template<
+    bool compute_features,
+    typename ReturnType = std::conditional_t<compute_features, std::tuple<std::optional<uint32_t>, uint32_t, std::vector<uint32_t>>, std::tuple<std::optional<uint32_t>, uint32_t>>
+  >
+  ReturnType cdc_offset(
     const std::span<uint8_t> data,
     uint32_t min_size,
     uint32_t avg_size,
@@ -292,6 +297,8 @@ namespace fastcdc {
     uint32_t size = data.size();
     uint32_t barrier = std::min(avg_size, size);
     uint32_t i = std::min(barrier, min_size);
+
+    std::conditional_t<compute_features, std::vector<uint32_t>, std::monostate> features;
 
     // SuperCDC's even easier "backup mask" and backup result, if mask_l fails to find a cutoff point before the max_size we use the backup result
     // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
@@ -312,112 +319,93 @@ namespace fastcdc {
         i++;
         continue;
       }
-      if (!(pattern & mask_s)) return { i, pattern };
+      if (!(pattern & mask_s)) {
+        if constexpr (compute_features) {
+          return { i, pattern, features };
+        }
+        else {
+          return { i, pattern };
+        }
+      }
+      if constexpr (compute_features) {
+        if (!(pattern & constants::CDS_SAMPLING_MASK)) {
+          if (features.empty()) {
+            features.resize(16);
+          }
+          for (int feature_i = 0; feature_i < 16; feature_i++) {
+            const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
+            features[feature_i] = std::max<uint32_t>(features[feature_i], (mi * pattern + ai) % (1LL << 32));
+          }
+        }
+      }
       i++;
     }
     barrier = std::min(max_size, size);
     while (i < barrier) {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_l)) return { i, pattern };
+      if (!(pattern & mask_l)) {
+        if constexpr (compute_features) {
+          return { i, pattern, features };
+        }
+        else {
+          return { i, pattern };
+        }
+      }
       if (!backup_i.has_value() && !(pattern & mask_b)) backup_i = i;
+      if constexpr (compute_features) {
+        if (!(pattern & constants::CDS_SAMPLING_MASK)) {
+          if (features.empty()) {
+            features.resize(16);
+          }
+          for (int feature_i = 0; feature_i < 16; feature_i++) {
+            const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
+            features[feature_i] = std::max<uint32_t>(features[feature_i], (mi * pattern + ai) % (1LL << 32));
+          }
+        }
+      }
       i++;
     }
     const auto result_i = backup_i.has_value()
       ? backup_i
       : cut_at_data_end ? std::optional(i) : std::nullopt;
-    return { result_i, pattern };
-  }
-
-  std::pair<uint32_t, std::vector<uint32_t>> cdc_offset_with_features(
-    const std::span<uint8_t> data,
-    uint32_t min_size,
-    uint32_t avg_size,
-    uint32_t max_size,
-    uint32_t mask_s,
-    uint32_t mask_l
-  ) {
-    uint32_t pattern = 0;
-    uint32_t size = data.size();
-    uint32_t barrier = std::min(avg_size, size);
-
-    std::pair<uint32_t, std::vector<uint32_t>> return_val{};
-    uint32_t& i = std::get<0>(return_val);
-    i = std::min(barrier, min_size);
-    auto& features = std::get<1>(return_val);
-
-    // SuperCDC's even easier "backup mask" and backup result, if mask_l fails to find a cutoff point before the max_size we use the backup result
-    // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
-    // which helps better preserve the content defined nature of chunks and thus increase dedup ratios.
-    std::optional<uint32_t> backup_i{};
-    uint32_t mask_b = mask_l >> 1;
-
-    // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
-    // the content defined nature of the Hashes.
-    // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
-    uint32_t remaining_minmax_adjustment = std::min<uint32_t>(i, 32);
-    i -= remaining_minmax_adjustment;
-
-    while (i < barrier) {
-      pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (remaining_minmax_adjustment > 0) {
-        remaining_minmax_adjustment--;
-        i++;
-        continue;
-      }
-      if (!(pattern & mask_s)) return return_val;
-      if (!(pattern & constants::CDS_SAMPLING_MASK)) {
-        if (features.empty()) {
-          features.resize(16);
-        }
-        for (int feature_i = 0; feature_i < 16; feature_i++) {
-          const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
-          features[feature_i] = std::max<uint32_t>(features[feature_i], (mi * pattern + ai) % (1LL << 32));
-        }
-      }
-      i += 1;
+    if constexpr (compute_features) {
+      return { result_i, pattern, features };
     }
-    barrier = std::min(max_size, size);
-    while (i < barrier) {
-      pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_l)) return return_val;
-      if (!backup_i.has_value() && !(pattern & mask_b)) backup_i = i;
-      if (!(pattern & constants::CDS_SAMPLING_MASK)) {
-        if (features.empty()) {
-          features.resize(16);
-        }
-        for (int feature_i = 0; feature_i < 16; feature_i++) {
-          const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
-          features[feature_i] = std::max<uint32_t>(features[feature_i], (mi * pattern + ai) % (1LL << 32));
-        }
-      }
-      i += 1;
+    else {
+      return { result_i, pattern };
     }
-    if (backup_i.has_value()) {
-      return { *backup_i, std::move(std::get<1>(return_val)) };
-    }
-    return return_val;
   }
 }
 
-void find_cdc_cut_candidates(std::vector<uint32_t>& candidates, std::span<uint8_t> data, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool cut_at_data_end, bool is_first_segment = true) {
+template<bool compute_features>
+void find_cdc_cut_candidates(std::vector<uint32_t>& candidates, std::vector<std::vector<uint32_t>>& candidate_features, std::span<uint8_t> data, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool cut_at_data_end, bool is_first_segment = true) {
   candidates.clear();
+  if constexpr (compute_features) {
+    candidate_features.clear();
+  }
   if (data.empty()) return;
 
   const auto bits = utility::logarithm2(avg_size);
   const auto mask_s = utility::mask(bits + 1);
   const auto mask_l = utility::mask(bits - 1);
 
+  using cdc_offset_return_type = typename decltype(std::function{fastcdc::cdc_offset<compute_features>})::result_type;
+
+  cdc_offset_return_type cdc_return{};
   uint32_t base_offset = 0;
-  std::optional<uint32_t> cp;
-  uint32_t pattern = 0;
+  std::optional<uint32_t>& cp = std::get<0>(cdc_return);
+  uint32_t& pattern = std::get<1>(cdc_return);
 
   // If this is not the first segment then we need to deal with the previous segment extended data and attempt to recover chunk invariance
   if (!is_first_segment) {
-    std::tie(cp, pattern) = fastcdc::cdc_offset(data, 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
+    std::tie(cp, pattern) = fastcdc::cdc_offset<false>(data, 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
 
     if (!cp.has_value()) return;
     base_offset += *cp;
     candidates.emplace_back(base_offset);
+    if constexpr (compute_features) {
+      candidate_features.emplace_back();
+    }
     data = std::span(data.data() + *cp, data.size() - *cp);
 
     // And now we need to recover chunk invariance in accordance to the chunk invariance recovery condition.
@@ -426,12 +414,15 @@ void find_cdc_cut_candidates(std::vector<uint32_t>& candidates, std::span<uint8_
     // As soon as we find that we can break from here and keep processing as if we were processing without segments,
     // which in particular means we can exploit jumps to min_size again.
     while (!data.empty()) {
-      std::tie(cp, pattern) = fastcdc::cdc_offset(std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
+      std::tie(cp, pattern) = fastcdc::cdc_offset<false>(std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
       cp = cp.has_value() ? *cp + 1 : 1;
 
       if (!cp.has_value()) return;
       base_offset += *cp;
       candidates.emplace_back(base_offset);
+      if constexpr (compute_features) {
+        candidate_features.emplace_back();
+      }
       data = std::span(data.data() + *cp, data.size() - *cp);
       if (cp >= min_size && (*cp + min_size <= max_size)) break;  // back in sync with non-segmented processing!
     }
@@ -439,20 +430,21 @@ void find_cdc_cut_candidates(std::vector<uint32_t>& candidates, std::span<uint8_
 
   while (!data.empty()) {
     if (base_offset == 0) {
-      std::tie(cp, pattern) = fastcdc::cdc_offset(data, min_size, avg_size, max_size, mask_s, mask_l, cut_at_data_end, pattern);
+      cdc_return = fastcdc::cdc_offset<compute_features>(data, min_size, avg_size, max_size, mask_s, mask_l, cut_at_data_end, pattern);
     }
     else {
-      std::tie(cp, pattern) = fastcdc::cdc_offset(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, cut_at_data_end, pattern);
+      cdc_return = fastcdc::cdc_offset<compute_features>(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, cut_at_data_end, pattern);
       cp = cp.has_value() ? *cp + 1 : 1;
     }
 
     if (!cp.has_value()) return;
     base_offset += *cp;
     candidates.emplace_back(base_offset);
+    if constexpr (compute_features) {
+      candidate_features.emplace_back(std::move(std::get<2>(cdc_return)));
+    }
     data = std::span(data.data() + *cp, data.size() - *cp);
   }
-
-  return;
 }
 
 #include <immintrin.h>
@@ -522,7 +514,8 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
 
   // Find the CDC minichunks and update the SimHash with their data
   std::vector<uint32_t> cut_offsets;
-  find_cdc_cut_candidates(cut_offsets, std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2, true);
+  std::vector<std::vector<uint32_t>> cut_offsets_features;
+  find_cdc_cut_candidates<false>(cut_offsets, cut_offsets_features, std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2, true);
   uint32_t previous_offset = 0;
   for (const auto& cut_offset : cut_offsets) {
     const auto minichunk_len = cut_offset - previous_offset;
@@ -1194,6 +1187,10 @@ public:
   }
 
   ~WrappedOStreamOutputStream() override {
+    flush();
+  }
+
+  void flush() {
     if (buffer_used_len > 0) {
       write_with_thread();
       dump_thread.join();
@@ -1922,7 +1919,7 @@ public:
     if (prevInstruction->type == LZInstructionType::COPY) accumulated_savings -= size;
   }
 
-  void dump(std::istream& istream, bool verify_copies, std::optional<uint64_t> up_to_offset = std::nullopt) {
+  void dump(std::istream& istream, bool verify_copies, std::optional<uint64_t> up_to_offset = std::nullopt, bool flush = false) {
     std::vector<char> buffer;
     std::vector<char> verify_buffer;
 
@@ -2024,8 +2021,80 @@ public:
       outputted_up_to_offset += instruction.size;
       outputted_lz_instructions++;
     }
+
+    if (flush) {
+      bit_output_stream.flush();
+      output_stream.flush();
+    }
   }
 };
+
+void select_cut_point_candidates(
+  const std::vector<uint32_t>& new_cut_point_candidates,
+  const std::vector<std::vector<uint32_t>>& new_cut_point_candidates_features,
+  std::deque<uint64_t>& cut_points,
+  std::deque<std::optional<std::array<uint32_t, 4>>>& cut_points_features,
+  uint64_t current_offset,
+  uint64_t segment_start_offset,
+  std::size_t segment_data_size,
+  uint32_t min_size,
+  uint32_t max_size,
+  bool segments_eof,
+  bool use_feature_extraction,
+  std::optional<uint64_t> minimum_allowed_cut_point = std::nullopt
+) {
+  for (uint64_t i = 0; i < new_cut_point_candidates.size(); i++) {
+    auto& cut_point_candidate = new_cut_point_candidates[i];
+    if (minimum_allowed_cut_point.has_value() && cut_point_candidate < *minimum_allowed_cut_point) continue;
+    auto last_cut_point = cut_points.empty() ? current_offset : cut_points.back();
+
+    const auto adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate;
+    while (adjusted_cut_point_candidate > last_cut_point + max_size) {
+      last_cut_point = last_cut_point + max_size;
+      cut_points.emplace_back(last_cut_point);
+      if (use_feature_extraction) {
+        auto& cut_point_candidate_features = new_cut_point_candidates_features[i];
+        if (cut_point_candidate_features.empty()) {
+          cut_points_features.emplace_back();
+        }
+        else {
+          // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
+          std::array<uint32_t, 4> features = {
+            XXH32(cut_point_candidate_features.data(), 16, constants::CDS_SAMPLING_MASK),
+            XXH32(cut_point_candidate_features.data() + 4, 16, constants::CDS_SAMPLING_MASK),
+            XXH32(cut_point_candidate_features.data() + 8, 16, constants::CDS_SAMPLING_MASK),
+            XXH32(cut_point_candidate_features.data() + 12, 16, constants::CDS_SAMPLING_MASK)
+          };
+          cut_points_features.emplace_back(std::move(features));
+        }
+      }
+    }
+
+    if (adjusted_cut_point_candidate < last_cut_point + min_size) continue;
+
+    cut_points.emplace_back(adjusted_cut_point_candidate);
+    if (use_feature_extraction) {
+      auto& cut_point_candidate_features = new_cut_point_candidates_features[i];
+      if (cut_point_candidate_features.empty()) {
+        cut_points_features.emplace_back();
+      }
+      else {
+        // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
+        std::array<uint32_t, 4> features = {
+          XXH32(cut_point_candidate_features.data(), 16, constants::CDS_SAMPLING_MASK),
+          XXH32(cut_point_candidate_features.data() + 4, 16, constants::CDS_SAMPLING_MASK),
+          XXH32(cut_point_candidate_features.data() + 8, 16, constants::CDS_SAMPLING_MASK),
+          XXH32(cut_point_candidate_features.data() + 12, 16, constants::CDS_SAMPLING_MASK)
+        };
+        cut_points_features.emplace_back(std::move(features));
+      }
+    }
+  }
+  // If we reached EOF, and we skipped the cut point at the end we add it here
+  if (segments_eof && cut_points.back() != segment_start_offset + segment_data_size) {
+    cut_points.emplace_back(segment_start_offset + segment_data_size);
+  }
+}
 
 int main(int argc, char* argv[]) {
   //get_char_with_echo();
@@ -2277,6 +2346,7 @@ int main(int argc, char* argv[]) {
   segment_data.resize(segment_size + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
   uint64_t segment_start_offset = 0;
   std::deque<uint64_t> cut_points{};
+  std::deque<std::optional<std::array<uint32_t, 4>>> cut_points_features{};
 
   auto total_runtime_start_time = std::chrono::high_resolution_clock::now();
 
@@ -2286,25 +2356,31 @@ int main(int argc, char* argv[]) {
 
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
   std::vector<uint32_t> new_cut_point_candidates;
-  find_cdc_cut_candidates(new_cut_point_candidates, segment_data, min_size, avg_size, max_size, segments_eof, true);
+  std::vector<std::vector<uint32_t>> new_cut_point_candidates_features;
+  if (use_feature_extraction) {
+    find_cdc_cut_candidates<true>(new_cut_point_candidates, new_cut_point_candidates_features, segment_data, min_size, avg_size, max_size, segments_eof, true);
+  }
+  else {
+    find_cdc_cut_candidates<false>(new_cut_point_candidates, new_cut_point_candidates_features, segment_data, min_size, avg_size, max_size, segments_eof, true);
+  }
   auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
   chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
 
-  for (auto& cut_point_candidate : new_cut_point_candidates) {
-    auto last_cut_point = cut_points.empty() ? segment_start_offset : segment_start_offset + cut_points.back();
-
-    const auto adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate;
-    while (adjusted_cut_point_candidate > last_cut_point + max_size) {
-      last_cut_point = last_cut_point + max_size;
-      cut_points.emplace_back(last_cut_point);
-    }
-    if (adjusted_cut_point_candidate < last_cut_point + min_size) {
-      continue;
-    }
-    cut_points.emplace_back(adjusted_cut_point_candidate);
-  }
-
   uint64_t current_offset = 0;
+
+  select_cut_point_candidates(
+    new_cut_point_candidates,
+    new_cut_point_candidates_features,
+    cut_points,
+    cut_points_features,
+    current_offset,
+    segment_start_offset,
+    segment_data.size(),
+    min_size,
+    max_size,
+    segments_eof,
+    use_feature_extraction
+  );
 
   while (!cut_points.empty()) {
     if (chunk_i > 0 && dictionary_size_limit.has_value() && dictionary_size_used > *dictionary_size_limit) {
@@ -2368,6 +2444,15 @@ int main(int argc, char* argv[]) {
     cut_points.pop_front();
     chunks.emplace_back(utility::ChunkEntry(current_offset));
     auto& chunk = chunks.back();
+
+    if (use_feature_extraction) {
+      const auto chunk_features = std::move(cut_points_features.front());
+      cut_points_features.pop_front();
+      if (chunk_features.has_value()) {
+        chunk.chunk_data->feature_sampling_failure = false;
+        chunk.chunk_data->super_features = *chunk_features;
+      }
+    }
 
     std::optional<uint64_t> prev_similarity_locality_anchor_i = similarity_locality_anchor_i;
     similarity_locality_anchor_i = std::nullopt;
@@ -2858,27 +2943,29 @@ int main(int argc, char* argv[]) {
       segments_eof = segment_data.size() != segment_size + segment_data_tail_len;
 
       chunk_generator_start_time = std::chrono::high_resolution_clock::now();
-      find_cdc_cut_candidates(new_cut_point_candidates, segment_data, min_size, avg_size, max_size, segments_eof, false);
+      if (use_feature_extraction) {
+        find_cdc_cut_candidates<true>(new_cut_point_candidates, new_cut_point_candidates_features, segment_data, min_size, avg_size, max_size, segments_eof, false);
+      }
+      else {
+        find_cdc_cut_candidates<false>(new_cut_point_candidates, new_cut_point_candidates_features, segment_data, min_size, avg_size, max_size, segments_eof, false);
+      }
       chunk_generator_end_time = std::chrono::high_resolution_clock::now();
       chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
 
-      for (auto& cut_point_candidate : new_cut_point_candidates) {
-        if (cut_point_candidate < segment_data_tail_len) continue;
-        auto last_cut_point = cut_points.empty() ? current_offset : cut_points.back();
-
-        const auto adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate;
-        while (adjusted_cut_point_candidate > last_cut_point + max_size) {
-          last_cut_point = last_cut_point + max_size;
-          cut_points.emplace_back(last_cut_point);
-        }
-        if (adjusted_cut_point_candidate < last_cut_point + min_size) continue;
-        cut_points.emplace_back(adjusted_cut_point_candidate);
-      }
-
-      // If we reached EOF, and we skipped the cut point at the end we add it here
-      if (segments_eof && cut_points.back() != segment_start_offset + segment_data.size()) {
-        cut_points.emplace_back(segment_start_offset + segment_data.size());
-      }
+      select_cut_point_candidates(
+        new_cut_point_candidates,
+        new_cut_point_candidates_features,
+        cut_points,
+        cut_points_features,
+        current_offset,
+        segment_start_offset,
+        segment_data.size(),
+        min_size,
+        max_size,
+        segments_eof,
+        use_feature_extraction,
+        segment_data_tail_len
+      );
     }
   }
 
@@ -2889,7 +2976,7 @@ int main(int argc, char* argv[]) {
   print_to_console("Total dedup time:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(total_dedup_end_time - total_runtime_start_time).count()) + " seconds\n");
 
   // Dump any remaining data
-  if (!output_disabled) lz_manager.dump(verify_file_stream, verify_dumps);
+  if (!output_disabled) lz_manager.dump(verify_file_stream, verify_dumps, std::nullopt, true);
 
   auto dump_end_time = std::chrono::high_resolution_clock::now();
 
@@ -2936,5 +3023,6 @@ int main(int argc, char* argv[]) {
   print_to_console("Total runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_runtime_start_time).count()) + " seconds\n");
 
   //get_char_with_echo();
+  exit(0);  // Dirty, dirty, dirty, but should be fine as long all threads have finished, for exiting quickly until I refactor the codebase a little
   return 0;
 }
