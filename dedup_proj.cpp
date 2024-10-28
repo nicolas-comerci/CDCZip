@@ -38,6 +38,7 @@
 
 #include "contrib/bitstream.h"
 #include "contrib/stream.h"
+#include "contrib/task_pool.h"
 #include "contrib/embeddings.cpp/bert.h"
 //#include <faiss/IndexFlat.h>
 //#include <faiss/MetricType.h>
@@ -377,13 +378,19 @@ namespace fastcdc {
   }
 }
 
-template<bool compute_features>
-void find_cdc_cut_candidates(std::vector<uint32_t>& candidates, std::vector<std::vector<uint32_t>>& candidate_features, std::span<uint8_t> data, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool cut_at_data_end, bool is_first_segment = true) {
-  candidates.clear();
+template<
+  bool compute_features,
+  typename CandidateFeaturesResult = std::conditional_t<compute_features, std::vector<std::vector<uint32_t>>, std::monostate>,
+  typename CdcCandidatesResult = std::tuple<std::vector<uint32_t>, CandidateFeaturesResult>
+>
+CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool cut_at_data_end, bool is_first_segment = true) {
+  CdcCandidatesResult result;
+  std::vector<uint32_t>& candidates = std::get<0>(result);
+  CandidateFeaturesResult& candidate_features = std::get<1>(result);
   if constexpr (compute_features) {
     candidate_features.clear();
   }
-  if (data.empty()) return;
+  if (data.empty()) return result;
 
   const auto bits = utility::logarithm2(avg_size);
   const auto mask_s = utility::mask(bits + 1);
@@ -400,7 +407,7 @@ void find_cdc_cut_candidates(std::vector<uint32_t>& candidates, std::vector<std:
   if (!is_first_segment) {
     std::tie(cp, pattern) = fastcdc::cdc_offset<false>(data, 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
 
-    if (!cp.has_value()) return;
+    if (!cp.has_value()) return result;
     base_offset += *cp;
     candidates.emplace_back(base_offset);
     if constexpr (compute_features) {
@@ -417,7 +424,7 @@ void find_cdc_cut_candidates(std::vector<uint32_t>& candidates, std::vector<std:
       std::tie(cp, pattern) = fastcdc::cdc_offset<false>(std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
       cp = cp.has_value() ? *cp + 1 : 1;
 
-      if (!cp.has_value()) return;
+      if (!cp.has_value()) return result;
       base_offset += *cp;
       candidates.emplace_back(base_offset);
       if constexpr (compute_features) {
@@ -437,7 +444,7 @@ void find_cdc_cut_candidates(std::vector<uint32_t>& candidates, std::vector<std:
       cp = cp.has_value() ? *cp + 1 : 1;
     }
 
-    if (!cp.has_value()) return;
+    if (!cp.has_value()) return result;
     base_offset += *cp;
     candidates.emplace_back(base_offset);
     if constexpr (compute_features) {
@@ -445,6 +452,8 @@ void find_cdc_cut_candidates(std::vector<uint32_t>& candidates, std::vector<std:
     }
     data = std::span(data.data() + *cp, data.size() - *cp);
   }
+
+  return result;
 }
 
 #include <immintrin.h>
@@ -513,9 +522,7 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
   auto& minichunks_vec = std::get<1>(return_val);
 
   // Find the CDC minichunks and update the SimHash with their data
-  std::vector<uint32_t> cut_offsets;
-  std::vector<std::vector<uint32_t>> cut_offsets_features;
-  find_cdc_cut_candidates<false>(cut_offsets, cut_offsets_features, std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2, true);
+  auto [cut_offsets, cut_offsets_features] = find_cdc_cut_candidates<false>(std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2, true);
   uint32_t previous_offset = 0;
   for (const auto& cut_offset : cut_offsets) {
     const auto minichunk_len = cut_offset - previous_offset;
@@ -1411,8 +1418,7 @@ public:
   const_iterator<T> cend() const { return const_iterator<T>(&vec, get_last_index_vec() + 1, &first_index_vec, &last_index_vec); }
 
   size_type size() const {
-    const auto count_from_first_elem = vec.size() - first_index_vec;
-    return last_index_vec.has_value() ? count_from_first_elem + (*last_index_vec + 1) : count_from_first_elem;
+    return vec.size() - reclaimable_slots;
   }
   void pop_front() {
     first_index_vec++;
@@ -1766,7 +1772,7 @@ public:
       uint64_t verify_end_offset = current_offset + instruction.size;
       if (verify) {
         std::fstream verify_file{};
-        verify_file.open(R"(C:\Users\Administrator\Documents\dedup_proj\Datasets\LNX\LNX.tar)", std::ios_base::in | std::ios_base::binary);
+        verify_file.open(R"(C:\Users\Administrator\Documents\dedup_proj\Datasets\LNX-IMG\LNX-IMG.tar)", std::ios_base::in | std::ios_base::binary);
 
         verify_buffer_orig_data.resize(prevInstruction->size);
         verify_buffer_instruction_data.resize(prevInstruction->size);
@@ -1858,7 +1864,7 @@ public:
 
       if (verify) {
         std::fstream verify_file{};
-        verify_file.open(R"(C:\Users\Administrator\Documents\dedup_proj\Datasets\LNX\LNX.tar)", std::ios_base::in | std::ios_base::binary);
+        verify_file.open(R"(C:\Users\Administrator\Documents\dedup_proj\Datasets\LNX-IMG\LNX-IMG.tar)", std::ios_base::in | std::ios_base::binary);
         const auto data_count = prevInstruction->size + instruction.size;
 
         verify_buffer_orig_data.resize(data_count);
@@ -2032,28 +2038,39 @@ public:
 void select_cut_point_candidates(
   const std::vector<uint32_t>& new_cut_point_candidates,
   const std::vector<std::vector<uint32_t>>& new_cut_point_candidates_features,
-  std::deque<uint64_t>& cut_points,
+  std::deque<utility::ChunkEntry>& process_pending_chunks,
   std::deque<std::optional<std::array<uint32_t, 4>>>& cut_points_features,
-  uint64_t current_offset,
+  uint64_t last_used_cut_point,
   uint64_t segment_start_offset,
-  std::size_t segment_data_size,
+  std::vector<uint8_t>& segment_data,
+  std::vector<uint8_t>& prev_segment_remaining_data,
   uint32_t min_size,
   uint32_t max_size,
   bool segments_eof,
   bool use_feature_extraction,
   std::optional<uint64_t> minimum_allowed_cut_point = std::nullopt
 ) {
-  for (uint64_t i = 0; i < new_cut_point_candidates.size(); i++) {
-    auto& cut_point_candidate = new_cut_point_candidates[i];
-    if (minimum_allowed_cut_point.has_value() && cut_point_candidate < *minimum_allowed_cut_point) continue;
-    auto last_cut_point = cut_points.empty() ? current_offset : cut_points.back();
+  auto make_chunk = [&] (uint64_t candidate_pos, uint64_t prev_point_offset, uint64_t segment_data_pos, uint64_t cut_point_pos) {
+    process_pending_chunks.emplace_back(prev_point_offset);
+    auto& new_pending_chunk = process_pending_chunks.back();
 
-    const auto adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate;
-    while (adjusted_cut_point_candidate > last_cut_point + max_size) {
-      last_cut_point = last_cut_point + max_size;
-      cut_points.emplace_back(last_cut_point);
-      if (use_feature_extraction) {
-        auto& cut_point_candidate_features = new_cut_point_candidates_features[i];
+    if (!prev_segment_remaining_data.empty()) {
+      const auto chunk_size = prev_segment_remaining_data.size() + cut_point_pos - segment_data_pos;
+      new_pending_chunk.chunk_data->data.resize(chunk_size);
+      std::copy_n(prev_segment_remaining_data.data(), prev_segment_remaining_data.size(), new_pending_chunk.chunk_data->data.data());
+      std::copy_n(segment_data.data() + segment_data_pos, cut_point_pos - segment_data_pos, new_pending_chunk.chunk_data->data.data() + prev_segment_remaining_data.size());
+      prev_segment_remaining_data.clear();
+    }
+    else {
+      new_pending_chunk.chunk_data->data.resize(cut_point_pos - segment_data_pos);
+      std::copy_n(segment_data.data() + segment_data_pos, cut_point_pos - segment_data_pos, new_pending_chunk.chunk_data->data.data());
+    }
+    new_pending_chunk.chunk_data->data.shrink_to_fit();
+
+    if (use_feature_extraction) {
+      // TODO: fix this stupid shit
+      if (new_cut_point_candidates_features.size() >= candidate_pos + 1) {
+        auto& cut_point_candidate_features = new_cut_point_candidates_features[candidate_pos];
         if (cut_point_candidate_features.empty()) {
           cut_points_features.emplace_back();
         }
@@ -2068,31 +2085,72 @@ void select_cut_point_candidates(
           cut_points_features.emplace_back(std::move(features));
         }
       }
-    }
-
-    if (adjusted_cut_point_candidate < last_cut_point + min_size) continue;
-
-    cut_points.emplace_back(adjusted_cut_point_candidate);
-    if (use_feature_extraction) {
-      auto& cut_point_candidate_features = new_cut_point_candidates_features[i];
-      if (cut_point_candidate_features.empty()) {
+      else {
         cut_points_features.emplace_back();
       }
-      else {
-        // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
-        std::array<uint32_t, 4> features = {
-          XXH32(cut_point_candidate_features.data(), 16, constants::CDS_SAMPLING_MASK),
-          XXH32(cut_point_candidate_features.data() + 4, 16, constants::CDS_SAMPLING_MASK),
-          XXH32(cut_point_candidate_features.data() + 8, 16, constants::CDS_SAMPLING_MASK),
-          XXH32(cut_point_candidate_features.data() + 12, 16, constants::CDS_SAMPLING_MASK)
-        };
-        cut_points_features.emplace_back(std::move(features));
-      }
     }
+  };
+
+  uint64_t segment_data_pos = 0;
+  auto last_cut_point = process_pending_chunks.empty() ? last_used_cut_point : process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size();
+  // If the last used cut point is on data already on this segment (should be within the 31/window_size - 1 bytes extension of the previous segment)
+  // we start from that pos on this segment
+  if (last_cut_point > segment_start_offset) {
+    segment_data_pos = last_cut_point - segment_start_offset;
   }
-  // If we reached EOF, and we skipped the cut point at the end we add it here
-  if (segments_eof && cut_points.back() != segment_start_offset + segment_data_size) {
-    cut_points.emplace_back(segment_start_offset + segment_data_size);
+
+  for (uint64_t i = 0; i < new_cut_point_candidates.size(); i++) {
+    auto& cut_point_candidate = new_cut_point_candidates[i];
+    if (minimum_allowed_cut_point.has_value() && cut_point_candidate < *minimum_allowed_cut_point) continue;
+    last_cut_point = process_pending_chunks.empty() ? last_used_cut_point : process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size();
+
+    const auto adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate;
+    while (adjusted_cut_point_candidate > last_cut_point + max_size) {
+      // if the last_cut_point is on the previous segment some data might have come from the prev_segment_remaining_data so it's
+      // not counting towards our segment data position
+      const auto chunk_size_in_segment = last_cut_point < segment_start_offset ? max_size - (segment_start_offset - last_cut_point) : max_size;
+      // TODO: these chunks will share features, which is not right, need to figure out a solution
+      make_chunk(i, last_cut_point, segment_data_pos, segment_data_pos + chunk_size_in_segment);
+      last_cut_point = last_cut_point + max_size;
+      segment_data_pos += chunk_size_in_segment;
+    }
+
+    // TODO: we are discarding the features (if we are computing them) along with the rejected cut point candidate, we need to roll those over
+    if (
+      adjusted_cut_point_candidate < last_cut_point + min_size &&
+      // If this is the segment at EOF and also the last candidate, we can't skip it, as there won't be any future cut point to complete the chunk
+      !(segments_eof && i == new_cut_point_candidates.size() - 1)
+    ) {
+      continue;
+    }
+
+    make_chunk(i, last_cut_point, segment_data_pos, cut_point_candidate);
+    segment_data_pos = cut_point_candidate;
+  }
+
+  // We might have reached the end of the cut point candidates but there is enough data at the end of the segment that we need to enforce
+  // the max_size for chunks, as we did between cut point candidates, just between the actual last candidate and the end of the segment this time
+  last_cut_point = process_pending_chunks.empty() ? last_used_cut_point : process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size();
+  const auto segment_end_pos = segment_start_offset + segment_data.size();
+  while (segment_end_pos > last_cut_point + max_size) {
+    // if the last_cut_point is on the previous segment some data might have come from the prev_segment_remaining_data so it's
+    // not counting towards our segment data position
+    const auto chunk_size_in_segment = last_cut_point < segment_start_offset ? max_size - (segment_start_offset - last_cut_point) : max_size;
+    // TODO: these chunks will share features, which is not right, need to figure out a solution
+    make_chunk(0, last_cut_point, segment_data_pos, segment_data_pos + chunk_size_in_segment);
+    last_cut_point = last_cut_point + max_size;
+    segment_data_pos += chunk_size_in_segment;
+  }
+
+  // If there is more unused data at the end of the segment than the window_size - 1 bytes of the extension, we save that data
+  // as it will need to be used for the next chunk
+  {
+    const auto in_segment_pos = process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size() - segment_start_offset;
+    const auto segment_data_tail_len = segment_data.size() - in_segment_pos;
+    if (segment_data_tail_len > 31) {
+      prev_segment_remaining_data.resize(segment_data_tail_len - 31);
+      std::copy_n(segment_data.data() + in_segment_pos, segment_data_tail_len - 31, prev_segment_remaining_data.data());
+    }
   }
 }
 
@@ -2232,6 +2290,8 @@ int main(int argc, char* argv[]) {
   // Find chunk_i that has a given SuperFeature
   std::unordered_map<uint32_t, std::list<uint64_t>> superfeatures_dict{};
 
+  const auto cdc_thread_count = std::thread::hardware_concurrency();
+
   const uint32_t simhash_chunk_size = 16;
   const uint32_t max_allowed_dist = 32;
   const uint32_t delta_mode = 2;
@@ -2342,47 +2402,88 @@ int main(int argc, char* argv[]) {
 
   // SS-CDC style data segmenting to enable chunk invariant multithreading
   std::vector<uint8_t> segment_data{};
-  const auto segment_size = 10 * 1024 * 1024;
-  segment_data.resize(segment_size + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
+  const uint64_t segment_size = 10 * 1024 * 1024;
+  segment_data.resize(segment_size * cdc_thread_count + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
+  std::vector<uint8_t> prev_segment_remaining_data{};
   uint64_t segment_start_offset = 0;
-  std::deque<uint64_t> cut_points{};
+  std::deque<utility::ChunkEntry> process_pending_chunks{};
   std::deque<std::optional<std::array<uint32_t, 4>>> cut_points_features{};
+
+  std::vector<uint32_t> new_cut_point_candidates;
+  std::vector<std::vector<uint32_t>> new_cut_point_candidates_features;
+  bool segments_eof = false;
+
+  auto find_cdc_cut_candidates_in_thread = [&min_size, &avg_size, &max_size]
+  (std::vector<uint8_t>&& segment_data, bool is_eof_segment, bool is_first_segment) {
+    std::vector<uint32_t> cut_point_candidates;
+    std::vector<std::vector<uint32_t>> cut_point_candidates_features;
+    if (use_feature_extraction) {
+      std::tie(cut_point_candidates, cut_point_candidates_features) = find_cdc_cut_candidates<true>(segment_data, min_size, avg_size, max_size, is_eof_segment, is_first_segment);
+    }
+    else {
+      std::tie(cut_point_candidates, std::ignore) = find_cdc_cut_candidates<false>(segment_data, min_size, avg_size, max_size, is_eof_segment, is_first_segment);
+    }
+    return std::tuple(std::move(cut_point_candidates), std::move(cut_point_candidates_features), std::move(segment_data));
+  };
+
+  std::deque<std::future<decltype(std::function{find_cdc_cut_candidates_in_thread})::result_type>> cdc_candidates_futures;
+  bool is_first_segment = true;
 
   auto total_runtime_start_time = std::chrono::high_resolution_clock::now();
 
-  wrapped_file.read(segment_data.data(), segment_size + 31);
+  const auto segment_batch_size = segment_size * cdc_thread_count;
+  wrapped_file.read(segment_data.data(), segment_batch_size + 31);
   segment_data.resize(wrapped_file.gcount());
-  bool segments_eof = segment_data.size() != segment_size + 31;
+  auto segment_batch_data_span = std::span(segment_data);
+  segments_eof = segment_data.size() != segment_size + 31;
 
   auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
-  std::vector<uint32_t> new_cut_point_candidates;
-  std::vector<std::vector<uint32_t>> new_cut_point_candidates_features;
-  if (use_feature_extraction) {
-    find_cdc_cut_candidates<true>(new_cut_point_candidates, new_cut_point_candidates_features, segment_data, min_size, avg_size, max_size, segments_eof, true);
-  }
-  else {
-    find_cdc_cut_candidates<false>(new_cut_point_candidates, new_cut_point_candidates_features, segment_data, min_size, avg_size, max_size, segments_eof, true);
+  for (uint64_t i = 0; i < cdc_thread_count; i++) {
+    if (segment_batch_data_span.empty()) break;
+    auto current_segment_data = std::vector<uint8_t>();
+    current_segment_data.resize(std::min(segment_batch_data_span.size(), segment_size + 31));
+    std::copy_n(segment_batch_data_span.data(), current_segment_data.size(), current_segment_data.data());
+    segments_eof = current_segment_data.size() != segment_size + 31;
+
+    const auto span_advance_size = std::min(current_segment_data.size(), segment_size);
+
+    cdc_candidates_futures.emplace_back(
+      globalTaskPool.addTask(
+        [&find_cdc_cut_candidates_in_thread, current_segment_data = std::move(current_segment_data), &segments_eof, &is_first_segment]() mutable {
+          return find_cdc_cut_candidates_in_thread(std::move(current_segment_data), segments_eof, is_first_segment);
+        }
+      )
+    );
+    segment_batch_data_span = std::span(segment_batch_data_span.data() + span_advance_size, segment_batch_data_span.size() - span_advance_size);
   }
   auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
   chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
 
   uint64_t current_offset = 0;
 
-  select_cut_point_candidates(
-    new_cut_point_candidates,
-    new_cut_point_candidates_features,
-    cut_points,
-    cut_points_features,
-    current_offset,
-    segment_start_offset,
-    segment_data.size(),
-    min_size,
-    max_size,
-    segments_eof,
-    use_feature_extraction
-  );
+  while (cdc_candidates_futures.size() > 0) {
+    auto future = std::move(cdc_candidates_futures.front());
+    std::tie(new_cut_point_candidates, new_cut_point_candidates_features, segment_data) = future.get();
+    cdc_candidates_futures.pop_front();
 
-  while (!cut_points.empty()) {
+    select_cut_point_candidates(
+      new_cut_point_candidates,
+      new_cut_point_candidates_features,
+      process_pending_chunks,
+      cut_points_features,
+      current_offset,
+      segment_start_offset,
+      segment_data,
+      prev_segment_remaining_data,
+      min_size,
+      max_size,
+      segments_eof && cdc_candidates_futures.size() == 0,
+      use_feature_extraction
+    );
+    segment_start_offset += segment_size;
+  }
+
+  while (!process_pending_chunks.empty()) {
     if (chunk_i > 0 && dictionary_size_limit.has_value() && dictionary_size_used > *dictionary_size_limit) {
       const auto prev_first_non_out_of_range_chunk_i = first_non_out_of_range_chunk_i;
     
@@ -2440,9 +2541,8 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    const auto next_cut_point = cut_points.front();
-    cut_points.pop_front();
-    chunks.emplace_back(utility::ChunkEntry(current_offset));
+    chunks.emplace_back(std::move(process_pending_chunks.front()));
+    process_pending_chunks.pop_front();
     auto& chunk = chunks.back();
 
     if (use_feature_extraction) {
@@ -2457,13 +2557,14 @@ int main(int argc, char* argv[]) {
     std::optional<uint64_t> prev_similarity_locality_anchor_i = similarity_locality_anchor_i;
     similarity_locality_anchor_i = std::nullopt;
     if (chunk_i % 50000 == 0) print_to_console("\n%" + std::to_string((static_cast<float>(current_offset) / file_size) * 100) + "\n");
-    const auto data_span = std::span<uint8_t>(segment_data.data() + current_offset - segment_start_offset, next_cut_point - current_offset);
+
+    std::span<uint8_t> data_span = chunk.chunk_data->data;
     total_size += data_span.size();
 
     if (verify_chunk_offsets) {
       std::vector<uint8_t> verify_buffer_orig_data{};
       std::fstream verify_file{};
-      verify_file.open(R"(C:\Users\Administrator\Documents\dedup_proj\Datasets\LNX\LNX.tar)", std::ios_base::in | std::ios_base::binary);
+      verify_file.open(R"(C:\Users\Administrator\Documents\dedup_proj\Datasets\LNX-IMG\LNX-IMG.tar)", std::ios_base::in | std::ios_base::binary);
 
       verify_buffer_orig_data.resize(data_span.size());
       // Read original data
@@ -2507,11 +2608,6 @@ int main(int argc, char* argv[]) {
       duplicate_chunk_i = duplicate_chunk_i_candidate >= first_non_out_of_range_chunk_i ? std::optional{duplicate_chunk_i_candidate} : std::nullopt;
     }
     const bool is_duplicate_chunk = duplicate_chunk_i.has_value();
-
-    if (!is_duplicate_chunk) {
-      chunk.chunk_data->data = std::vector(data_span.data(), data_span.data() + data_span.size());
-      chunk.chunk_data->data.shrink_to_fit();
-    }
 
     std::vector<LZInstruction> new_instructions;
     if (!is_duplicate_chunk) {
@@ -2923,49 +3019,40 @@ int main(int argc, char* argv[]) {
     chunk_i++;
     current_offset += chunk.chunk_data->data.size();
 
-    if (cut_points.empty() && !segments_eof) {
-      auto in_segment_pos = current_offset - segment_start_offset;
-      auto segment_data_tail_len = segment_data.size() - in_segment_pos;
-
-      if (segment_data_tail_len < 31) {
-        // We have to at least preserve the SS-CDC window size - 1 segment extension
-        in_segment_pos = segment_data.size() - 31;
-        segment_data_tail_len = 31;
-      }
-      segment_start_offset += in_segment_pos;
-
-      // We get the 31byte extension (plus any data after the last cut point on the prior segment) to be at the start of the new segment data
-      std::memmove(segment_data.data(), segment_data.data() + in_segment_pos, segment_data_tail_len);
+    if (process_pending_chunks.empty() && !segments_eof) {
+      // We get the 31byte extension to be at the start of the new segment data
+      std::memmove(segment_data.data(), segment_data.data() + segment_size, 31);
       // And attempt to load remaining data for the new segment including next segment extension
-      segment_data.resize(segment_size + segment_data_tail_len);
-      wrapped_file.read(segment_data.data() + segment_data_tail_len, segment_size);
-      segment_data.resize(segment_data_tail_len + wrapped_file.gcount());
-      segments_eof = segment_data.size() != segment_size + segment_data_tail_len;
+      wrapped_file.read(segment_data.data() + 31, segment_size);
+      segment_data.resize(31 + wrapped_file.gcount());
+      segments_eof = segment_data.size() != segment_size + 31;
 
       chunk_generator_start_time = std::chrono::high_resolution_clock::now();
-      if (use_feature_extraction) {
-        find_cdc_cut_candidates<true>(new_cut_point_candidates, new_cut_point_candidates_features, segment_data, min_size, avg_size, max_size, segments_eof, false);
-      }
-      else {
-        find_cdc_cut_candidates<false>(new_cut_point_candidates, new_cut_point_candidates_features, segment_data, min_size, avg_size, max_size, segments_eof, false);
-      }
+      auto keke = globalTaskPool.addTask(
+        [&find_cdc_cut_candidates_in_thread, current_segment_data = std::move(segment_data), &segments_eof]() mutable {
+          return find_cdc_cut_candidates_in_thread(std::move(current_segment_data), segments_eof, false);
+        }
+      );
+      std::tie(new_cut_point_candidates, new_cut_point_candidates_features, segment_data) = keke.get();
       chunk_generator_end_time = std::chrono::high_resolution_clock::now();
       chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
 
       select_cut_point_candidates(
         new_cut_point_candidates,
         new_cut_point_candidates_features,
-        cut_points,
+        process_pending_chunks,
         cut_points_features,
         current_offset,
         segment_start_offset,
-        segment_data.size(),
+        segment_data,
+        prev_segment_remaining_data,
         min_size,
         max_size,
         segments_eof,
         use_feature_extraction,
-        segment_data_tail_len
+        31
       );
+      segment_start_offset += segment_size;
     }
   }
 

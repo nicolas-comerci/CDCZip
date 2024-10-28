@@ -112,9 +112,9 @@ set(XXHASH_SRC "${SRCDIR}/contrib/xxHash/xxhash.c")
 #add_subdirectory(contrib/faiss)
 
 set(BITSTREAM_HDR "")
-add_stem2file(BITSTREAM_HDR "${SRCDIR}/contrib/%STEM%.h" "stream;bit_helper;bitstream;")
+add_stem2file(BITSTREAM_HDR "${SRCDIR}/contrib/%STEM%.h" "stream;bit_helper;bitstream;task_pool;")
 set(BITSTREAM_SRC "")
-add_stem2file(BITSTREAM_SRC "${SRCDIR}/contrib/%STEM%.cpp" "bit_helper;bitstream;")
+add_stem2file(BITSTREAM_SRC "${SRCDIR}/contrib/%STEM%.cpp" "bit_helper;bitstream;task_pool;")
 
 set(DEDUP_PROJ_SRC "${SRCDIR}/dedup_proj.cpp")
 
