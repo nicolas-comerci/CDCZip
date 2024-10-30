@@ -396,7 +396,7 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
   const auto mask_s = utility::mask(bits + 1);
   const auto mask_l = utility::mask(bits - 1);
 
-  using cdc_offset_return_type = typename decltype(std::function{fastcdc::cdc_offset<compute_features>})::result_type;
+  using cdc_offset_return_type = typename decltype(std::function{ fastcdc::cdc_offset<compute_features> })::result_type;
 
   cdc_offset_return_type cdc_return{};
   uint32_t base_offset = 0;
@@ -406,8 +406,8 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
   // If this is not the first segment then we need to deal with the previous segment extended data and attempt to recover chunk invariance
   if (!is_first_segment) {
     std::tie(cp, pattern) = fastcdc::cdc_offset<false>(data, 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
-
     if (!cp.has_value()) return result;
+
     base_offset += *cp;
     candidates.emplace_back(base_offset);
     if constexpr (compute_features) {
@@ -422,9 +422,9 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
     // which in particular means we can exploit jumps to min_size again.
     while (!data.empty()) {
       std::tie(cp, pattern) = fastcdc::cdc_offset<false>(std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
-      cp = cp.has_value() ? *cp + 1 : 1;
-
       if (!cp.has_value()) return result;
+      cp = *cp + 1;
+
       base_offset += *cp;
       candidates.emplace_back(base_offset);
       if constexpr (compute_features) {
@@ -436,11 +436,16 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
   }
 
   while (!data.empty()) {
+    // Here we are in sync with non-segmented processing, which means we can make use of min/avg/max sizes again as we would in regular CDC.
+    // cut_at_data_end if false is only relevant for the last cut point, so the segment doesn't have an artificial cut point at the end,
+    // thus we override it to true if we still have more data than max_size, enforcing the max_size in a way that doesn't invalidate chunk invariance
+    bool override_cut_at_data_end = cut_at_data_end || data.size() >= max_size;
+
     if (base_offset == 0) {
-      cdc_return = fastcdc::cdc_offset<compute_features>(data, min_size, avg_size, max_size, mask_s, mask_l, cut_at_data_end, pattern);
+      cdc_return = fastcdc::cdc_offset<compute_features>(data, min_size, avg_size, max_size, mask_s, mask_l, override_cut_at_data_end, pattern);
     }
     else {
-      cdc_return = fastcdc::cdc_offset<compute_features>(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, cut_at_data_end, pattern);
+      cdc_return = fastcdc::cdc_offset<compute_features>(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, override_cut_at_data_end, pattern);
       cp = cp.has_value() ? *cp + 1 : 1;
     }
 
