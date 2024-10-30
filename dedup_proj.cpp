@@ -2426,10 +2426,9 @@ int main(int argc, char* argv[]) {
   std::deque<std::future<decltype(std::function{find_cdc_cut_candidates_in_thread})::result_type>> cdc_candidates_futures;
   bool is_first_segment = true;
 
-  uint64_t consumed_cdc_futures = 0;
-
   std::future<std::vector<uint8_t>> load_next_segment_batch_future;
-  auto load_next_segment_batch = [&wrapped_file, segment_batch_size](std::array<uint8_t, 31>&& _prev_segment_extend_data) {
+  auto load_next_segment_batch = [&wrapped_file, segment_batch_size]
+  (std::array<uint8_t, 31>&& _prev_segment_extend_data) -> std::vector<uint8_t> {
     std::array<uint8_t, 31> prev_segment_extend_data = std::move(_prev_segment_extend_data);
     std::vector<uint8_t> new_segment_batch_data;
     new_segment_batch_data.resize(segment_batch_size + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
@@ -2446,7 +2445,7 @@ int main(int argc, char* argv[]) {
 
   auto launch_cdc_threads =
   [&cdc_candidates_futures, &find_cdc_cut_candidates_in_thread, &load_next_segment_batch_future, &load_next_segment_batch,
-  cdc_thread_count, segment_size, &segment_start_offset, &is_first_segment, &chunk_generator_execution_time_ns]
+  cdc_thread_count, segment_size, segment_batch_size, &segment_start_offset, &is_first_segment, &chunk_generator_execution_time_ns]
   (const std::vector<uint8_t>& segment_batch_data) {
     auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
     auto segment_batch_data_span = std::span(segment_batch_data);
@@ -2474,7 +2473,6 @@ int main(int argc, char* argv[]) {
     chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
 
     // If not at EOF we already start loading the next segment batch data
-    const auto segment_batch_size = cdc_thread_count * segment_size;
     if (segment_batch_data.size() == segment_batch_size + 31) {
       std::array<uint8_t, 31> segment_extend_data;
       std::copy_n(segment_batch_data.data() + segment_batch_size, 31, segment_extend_data.data());
@@ -2487,9 +2485,9 @@ int main(int argc, char* argv[]) {
   };
 
   auto get_more_pending_chunks_from_cdc_futures =
-  [&cdc_candidates_futures, &consumed_cdc_futures, &process_pending_chunks, &cut_points_features, &prev_segment_remaining_data, &current_offset, min_size, max_size, cdc_thread_count]
+  [&cdc_candidates_futures, &process_pending_chunks, &cut_points_features, &prev_segment_remaining_data, &current_offset, min_size, max_size]
   (bool force_wait) {
-    if (consumed_cdc_futures < cdc_thread_count && cdc_candidates_futures.size() > 0) {
+    if (cdc_candidates_futures.size() > 0) {
       auto candidate_future_status = cdc_candidates_futures.front().wait_for(std::chrono::nanoseconds::zero());
       if (force_wait || candidate_future_status == std::future_status::ready || process_pending_chunks.empty()) {
         auto future = std::move(cdc_candidates_futures.front());
@@ -2501,7 +2499,6 @@ int main(int argc, char* argv[]) {
           segments_eof
         ] = future.get();
         cdc_candidates_futures.pop_front();
-        consumed_cdc_futures++;
 
         select_cut_point_candidates(
           new_cut_point_candidates,
@@ -2524,12 +2521,12 @@ int main(int argc, char* argv[]) {
   auto total_runtime_start_time = std::chrono::high_resolution_clock::now();
 
   {
-    std::vector<uint8_t> segment_data;
-    segment_data.resize(segment_size * cdc_thread_count + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
-    wrapped_file.read(segment_data.data(), segment_batch_size + 31);
-    segment_data.resize(wrapped_file.gcount());
+    std::vector<uint8_t> segment_batch_data;
+    segment_batch_data.resize(segment_size * cdc_thread_count + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
+    wrapped_file.read(segment_batch_data.data(), segment_batch_size + 31);
+    segment_batch_data.resize(wrapped_file.gcount());
 
-    launch_cdc_threads(segment_data);
+    launch_cdc_threads(segment_batch_data);
     get_more_pending_chunks_from_cdc_futures(true);
   }
 
@@ -3069,12 +3066,21 @@ int main(int argc, char* argv[]) {
     chunk_i++;
     current_offset += chunk.chunk_data->data.size();
 
-    get_more_pending_chunks_from_cdc_futures(false);
+    get_more_pending_chunks_from_cdc_futures(process_pending_chunks.empty());
+    // If we have a single batch or less worth of cdc futures and the future for loading the next batch is ready we already launch the loading of the new next batch
+    if (
+      cdc_candidates_futures.size() <= cdc_thread_count &&
+      process_pending_chunks.size() <= 1000 &&
+      load_next_segment_batch_future.valid() &&
+      load_next_segment_batch_future.wait_for(std::chrono::nanoseconds::zero()) == std::future_status::ready
+    ) {
+      auto segment_extend_data = load_next_segment_batch_future.get();
+      launch_cdc_threads(segment_extend_data);
+    }
+    // If we were to run out of pending chunks but the next segment batch is not ready yet, we wait for it and get some pending chunks so we can continue
     if (process_pending_chunks.empty() && load_next_segment_batch_future.valid()) {
-      auto new_segment_batch_data = load_next_segment_batch_future.get();
-      consumed_cdc_futures = 0;
-
-      launch_cdc_threads(new_segment_batch_data);
+      auto segment_extend_data = load_next_segment_batch_future.get();
+      launch_cdc_threads(segment_extend_data);
       get_more_pending_chunks_from_cdc_futures(true);
     }
   }
