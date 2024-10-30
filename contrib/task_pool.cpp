@@ -39,7 +39,9 @@ void TaskPool::_init() {
         task = std::move(this->_tasks.front());
         this->_tasks.pop();
       }
+      ++_activeWorkers;
       task();
+      --_activeWorkers;
     }
   };
   for (unsigned i = 0, n = std::max((size_t)1, _threadLimit); i < n; ++i) {

@@ -2401,20 +2401,17 @@ int main(int argc, char* argv[]) {
   };
 
   // SS-CDC style data segmenting to enable chunk invariant multithreading
-  std::vector<uint8_t> segment_data{};
   const uint64_t segment_size = 10 * 1024 * 1024;
-  segment_data.resize(segment_size * cdc_thread_count + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
+  const auto segment_batch_size = segment_size * cdc_thread_count;
   std::vector<uint8_t> prev_segment_remaining_data{};
   uint64_t segment_start_offset = 0;
   std::deque<utility::ChunkEntry> process_pending_chunks{};
   std::deque<std::optional<std::array<uint32_t, 4>>> cut_points_features{};
 
-  std::vector<uint32_t> new_cut_point_candidates;
-  std::vector<std::vector<uint32_t>> new_cut_point_candidates_features;
-  bool segments_eof = false;
+  uint64_t current_offset = 0;
 
-  auto find_cdc_cut_candidates_in_thread = [&min_size, &avg_size, &max_size]
-  (std::vector<uint8_t>&& segment_data, bool is_eof_segment, bool is_first_segment) {
+  auto find_cdc_cut_candidates_in_thread = [min_size, avg_size, max_size]
+  (std::vector<uint8_t>&& segment_data, uint64_t segment_start_offset, bool is_eof_segment, bool is_first_segment) {
     std::vector<uint32_t> cut_point_candidates;
     std::vector<std::vector<uint32_t>> cut_point_candidates_features;
     if (use_feature_extraction) {
@@ -2423,64 +2420,117 @@ int main(int argc, char* argv[]) {
     else {
       std::tie(cut_point_candidates, std::ignore) = find_cdc_cut_candidates<false>(segment_data, min_size, avg_size, max_size, is_eof_segment, is_first_segment);
     }
-    return std::tuple(std::move(cut_point_candidates), std::move(cut_point_candidates_features), std::move(segment_data));
+    return std::tuple(std::move(cut_point_candidates), std::move(cut_point_candidates_features), std::move(segment_data), segment_start_offset, is_eof_segment);
   };
 
   std::deque<std::future<decltype(std::function{find_cdc_cut_candidates_in_thread})::result_type>> cdc_candidates_futures;
   bool is_first_segment = true;
 
+  uint64_t consumed_cdc_futures = 0;
+
+  std::future<std::vector<uint8_t>> load_next_segment_batch_future;
+  auto load_next_segment_batch = [&wrapped_file, segment_batch_size](std::array<uint8_t, 31>&& _prev_segment_extend_data) {
+    std::array<uint8_t, 31> prev_segment_extend_data = std::move(_prev_segment_extend_data);
+    std::vector<uint8_t> new_segment_batch_data;
+    new_segment_batch_data.resize(segment_batch_size + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
+
+    // We get the 31byte extension to be at the start of the new segment data
+    std::copy_n(prev_segment_extend_data.data(), 31, new_segment_batch_data.data());
+
+    // And attempt to load remaining data for the new segments including next segment extension
+    wrapped_file.read(new_segment_batch_data.data() + 31, segment_batch_size);
+    new_segment_batch_data.resize(31 + wrapped_file.gcount());
+
+    return new_segment_batch_data;
+    };
+
+  auto launch_cdc_threads =
+  [&cdc_candidates_futures, &find_cdc_cut_candidates_in_thread, &load_next_segment_batch_future, &load_next_segment_batch,
+  cdc_thread_count, segment_size, &segment_start_offset, &is_first_segment, &chunk_generator_execution_time_ns]
+  (const std::vector<uint8_t>& segment_batch_data) {
+    auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
+    auto segment_batch_data_span = std::span(segment_batch_data);
+    for (uint64_t i = 0; i < cdc_thread_count; i++) {
+      if (segment_batch_data_span.empty()) break;
+      auto current_segment_data = std::vector<uint8_t>();
+      current_segment_data.resize(std::min(segment_batch_data_span.size(), segment_size + 31));
+      std::copy_n(segment_batch_data_span.data(), current_segment_data.size(), current_segment_data.data());
+      bool segments_eof = current_segment_data.size() != segment_size + 31;
+
+      const auto span_advance_size = std::min(current_segment_data.size(), segment_size);
+
+      cdc_candidates_futures.emplace_back(
+        globalTaskPool.addTask(
+          [&find_cdc_cut_candidates_in_thread, current_segment_data = std::move(current_segment_data), segments_eof, segment_start_offset, &is_first_segment]() mutable {
+            return find_cdc_cut_candidates_in_thread(std::move(current_segment_data), segment_start_offset, segments_eof, is_first_segment);
+          }
+        )
+      );
+      segment_start_offset += span_advance_size;
+      segment_batch_data_span = std::span(segment_batch_data_span.data() + span_advance_size, segment_batch_data_span.size() - span_advance_size);
+      is_first_segment = false;
+    }
+    auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
+    chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
+
+    // If not at EOF we already start loading the next segment batch data
+    const auto segment_batch_size = cdc_thread_count * segment_size;
+    if (segment_batch_data.size() == segment_batch_size + 31) {
+      std::array<uint8_t, 31> segment_extend_data;
+      std::copy_n(segment_batch_data.data() + segment_batch_size, 31, segment_extend_data.data());
+      load_next_segment_batch_future = globalTaskPool.addTask(
+        [segment_extend_data = std::move(segment_extend_data), &load_next_segment_batch]() mutable {
+          return load_next_segment_batch(std::move(segment_extend_data));
+        }
+      );
+    }
+  };
+
+  auto get_more_pending_chunks_from_cdc_futures =
+  [&cdc_candidates_futures, &consumed_cdc_futures, &process_pending_chunks, &cut_points_features, &prev_segment_remaining_data, &current_offset, min_size, max_size, cdc_thread_count]
+  (bool force_wait) {
+    if (consumed_cdc_futures < cdc_thread_count && cdc_candidates_futures.size() > 0) {
+      auto candidate_future_status = cdc_candidates_futures.front().wait_for(std::chrono::nanoseconds::zero());
+      if (force_wait || candidate_future_status == std::future_status::ready || process_pending_chunks.empty()) {
+        auto future = std::move(cdc_candidates_futures.front());
+        auto [
+          new_cut_point_candidates,
+          new_cut_point_candidates_features,
+          segment_data,
+          curr_segment_start_offset,
+          segments_eof
+        ] = future.get();
+        cdc_candidates_futures.pop_front();
+        consumed_cdc_futures++;
+
+        select_cut_point_candidates(
+          new_cut_point_candidates,
+          new_cut_point_candidates_features,
+          process_pending_chunks,
+          cut_points_features,
+          current_offset,
+          curr_segment_start_offset,
+          segment_data,
+          prev_segment_remaining_data,
+          min_size,
+          max_size,
+          segments_eof && cdc_candidates_futures.size() == 0,
+          use_feature_extraction
+        );
+      }
+    }
+  };
+
   auto total_runtime_start_time = std::chrono::high_resolution_clock::now();
 
-  const auto segment_batch_size = segment_size * cdc_thread_count;
-  wrapped_file.read(segment_data.data(), segment_batch_size + 31);
-  segment_data.resize(wrapped_file.gcount());
-  auto segment_batch_data_span = std::span(segment_data);
-  segments_eof = segment_data.size() != segment_size + 31;
+  {
+    std::vector<uint8_t> segment_data;
+    segment_data.resize(segment_size * cdc_thread_count + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
+    wrapped_file.read(segment_data.data(), segment_batch_size + 31);
+    segment_data.resize(wrapped_file.gcount());
 
-  auto chunk_generator_start_time = std::chrono::high_resolution_clock::now();
-  for (uint64_t i = 0; i < cdc_thread_count; i++) {
-    if (segment_batch_data_span.empty()) break;
-    auto current_segment_data = std::vector<uint8_t>();
-    current_segment_data.resize(std::min(segment_batch_data_span.size(), segment_size + 31));
-    std::copy_n(segment_batch_data_span.data(), current_segment_data.size(), current_segment_data.data());
-    segments_eof = current_segment_data.size() != segment_size + 31;
-
-    const auto span_advance_size = std::min(current_segment_data.size(), segment_size);
-
-    cdc_candidates_futures.emplace_back(
-      globalTaskPool.addTask(
-        [&find_cdc_cut_candidates_in_thread, current_segment_data = std::move(current_segment_data), &segments_eof, &is_first_segment]() mutable {
-          return find_cdc_cut_candidates_in_thread(std::move(current_segment_data), segments_eof, is_first_segment);
-        }
-      )
-    );
-    segment_batch_data_span = std::span(segment_batch_data_span.data() + span_advance_size, segment_batch_data_span.size() - span_advance_size);
-  }
-  auto chunk_generator_end_time = std::chrono::high_resolution_clock::now();
-  chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
-
-  uint64_t current_offset = 0;
-
-  while (cdc_candidates_futures.size() > 0) {
-    auto future = std::move(cdc_candidates_futures.front());
-    std::tie(new_cut_point_candidates, new_cut_point_candidates_features, segment_data) = future.get();
-    cdc_candidates_futures.pop_front();
-
-    select_cut_point_candidates(
-      new_cut_point_candidates,
-      new_cut_point_candidates_features,
-      process_pending_chunks,
-      cut_points_features,
-      current_offset,
-      segment_start_offset,
-      segment_data,
-      prev_segment_remaining_data,
-      min_size,
-      max_size,
-      segments_eof && cdc_candidates_futures.size() == 0,
-      use_feature_extraction
-    );
-    segment_start_offset += segment_size;
+    launch_cdc_threads(segment_data);
+    get_more_pending_chunks_from_cdc_futures(true);
   }
 
   while (!process_pending_chunks.empty()) {
@@ -3019,40 +3069,13 @@ int main(int argc, char* argv[]) {
     chunk_i++;
     current_offset += chunk.chunk_data->data.size();
 
-    if (process_pending_chunks.empty() && !segments_eof) {
-      // We get the 31byte extension to be at the start of the new segment data
-      std::memmove(segment_data.data(), segment_data.data() + segment_size, 31);
-      // And attempt to load remaining data for the new segment including next segment extension
-      wrapped_file.read(segment_data.data() + 31, segment_size);
-      segment_data.resize(31 + wrapped_file.gcount());
-      segments_eof = segment_data.size() != segment_size + 31;
+    get_more_pending_chunks_from_cdc_futures(false);
+    if (process_pending_chunks.empty() && load_next_segment_batch_future.valid()) {
+      auto new_segment_batch_data = load_next_segment_batch_future.get();
+      consumed_cdc_futures = 0;
 
-      chunk_generator_start_time = std::chrono::high_resolution_clock::now();
-      auto keke = globalTaskPool.addTask(
-        [&find_cdc_cut_candidates_in_thread, current_segment_data = std::move(segment_data), &segments_eof]() mutable {
-          return find_cdc_cut_candidates_in_thread(std::move(current_segment_data), segments_eof, false);
-        }
-      );
-      std::tie(new_cut_point_candidates, new_cut_point_candidates_features, segment_data) = keke.get();
-      chunk_generator_end_time = std::chrono::high_resolution_clock::now();
-      chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
-
-      select_cut_point_candidates(
-        new_cut_point_candidates,
-        new_cut_point_candidates_features,
-        process_pending_chunks,
-        cut_points_features,
-        current_offset,
-        segment_start_offset,
-        segment_data,
-        prev_segment_remaining_data,
-        min_size,
-        max_size,
-        segments_eof,
-        use_feature_extraction,
-        31
-      );
-      segment_start_offset += segment_size;
+      launch_cdc_threads(new_segment_batch_data);
+      get_more_pending_chunks_from_cdc_futures(true);
     }
   }
 

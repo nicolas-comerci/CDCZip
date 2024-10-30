@@ -52,6 +52,10 @@ public:
     return _threadLimit;
   }
 
+  size_t activeWorkerCount() const {
+    return _activeWorkers.load();
+  }
+
 private:
   enum State { INIT, RUN, FINISH };
 
@@ -63,6 +67,7 @@ private:
   std::mutex _mutex;
   std::condition_variable _condition;
   std::queue<std::function<void()>> _tasks;
+  std::atomic<size_t> _activeWorkers;
 };
 
 extern TaskPool globalTaskPool;
