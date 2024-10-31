@@ -1422,6 +1422,11 @@ public:
   const_iterator<T> cbegin() const { return const_iterator<T>(&vec, first_index_vec, &first_index_vec, &last_index_vec); }
   const_iterator<T> cend() const { return const_iterator<T>(&vec, get_last_index_vec() + 1, &first_index_vec, &last_index_vec); }
 
+  // The size including reclaimed/removed items, as it would have been in a regular vector
+  size_type fullSize() const {
+    return first_index_num + size();
+  }
+  size_type innerVecSize() const { return vec.size(); }
   size_type size() const {
     return vec.size() - reclaimable_slots;
   }
@@ -3103,8 +3108,10 @@ int main(int argc, char* argv[]) {
 
   // Chunk stats
   print_to_console(std::string("Chunk Sizes:    min ") + std::to_string(min_size) + " - avg " + std::to_string(avg_size) + " - max " + std::to_string(max_size) + "\n");
-  print_to_console("Total chunk count: " + std::to_string(chunks.size()) + "\n");
-  print_to_console("Real AVG chunk size: " + std::to_string(total_size / chunks.size()) + "\n");
+  print_to_console("Total chunk count: " + std::to_string(chunks.fullSize()) + "\n");
+  print_to_console("In dictionary chunk count: " + std::to_string(chunks.size()) + "\n");
+  print_to_console("In memory chunk count: " + std::to_string(chunks.innerVecSize()) + "\n");
+  print_to_console("Real AVG chunk size: " + std::to_string(total_size / chunks.fullSize()) + "\n");
   print_to_console("Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n");
   print_to_console("Total delta compressed chunk count: " + std::to_string(delta_compressed_chunk_count) + "\n");
 
