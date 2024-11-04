@@ -1248,7 +1248,7 @@ class circular_vector {
 
   private:
     const std::vector<value_type>* vec = nullptr;
-    uint64_t index = 0;
+    uint64_t index = 0;  // vec->size() on the index means end/cend
     const uint64_t* first_index = nullptr;
     const std::optional<uint64_t>* last_index = nullptr;
 
@@ -1260,35 +1260,43 @@ class circular_vector {
       if (has_last_index && index < *first_index) {
         // Given that we are wrapping around already, we don't allow wrapping around again,
         // if we reach the end or exceed it, just point to the end
-        return added_index > **last_index ? **last_index + 1 : added_index;
+        return added_index > **last_index ? vec_size : added_index;
       }
       // We have yet to wrap around (if that's even possible)
       else {
         // Wrapping around is not even needed
-        if (added_index < vec_size) return added_index;
+        if (added_index < vec_size) {
+          // Return the added index, unless we have a last_index not before the first_index and we would be going past that last_index,
+          // in which case we return the vec_size which will result in an end iterator
+          return (has_last_index && **last_index >= *first_index && added_index > **last_index) ? vec_size : added_index;
+        }
         // If the vector doesn't have circular wrapping around behavior then just return index for end of vec
         if (!has_last_index) return vec_size;
-        // If we were to do a whole loop, stop at last_index + 1, as we need to stop at some point
-        if (add >= vec_size) return **last_index + 1;
+        // If we were to do a whole loop, just return index for end/cend, as we need to stop at some point
+        if (add >= vec_size) return vec_size;
         const auto wrapped_index = added_index % vec_size;
         // If even wrapping around we went too far we stop at the last_index + 1 as well
-        return wrapped_index > **last_index ? **last_index + 1 : wrapped_index;
+        return wrapped_index > **last_index ? vec_size : wrapped_index;
       }
     }
 
     uint64_t remove_from_index(difference_type substract) const {
-      const auto subtracted_index = static_cast<difference_type>(index) - substract;
+      if (substract == 0) return index;
+
       const auto vec_size = vec->size();
       const bool has_last_index = last_index != nullptr && last_index->has_value();
+      const auto subtracted_index = static_cast<difference_type>(has_last_index && index == vec_size ? **last_index + 1 : index) + substract;
       // We are already on an index that has wrapped around the circular vector
       if (has_last_index && index < *first_index) {
         // If it's not enough to wrap around in reverse, then just return the new index
         if (subtracted_index >= 0) return subtracted_index;
-        // Wrap around in reverse, remember that subtracted_index is negative here,
-        // and we add +1 because is the subtracted_index is -1 then we need the last_index itself
-        const auto wrapped_index = **last_index + subtracted_index + 1;
+        // Wrap around in reverse, remember that subtracted_index is negative here
+        const auto wrapped_index = vec_size + subtracted_index;
         // If wrapping in reverse gets us before the *first_index, we reversed back to the beginning, stop there
         return wrapped_index >= *first_index ? wrapped_index : *first_index;
+      }
+      else if (index == vec_size) {
+        return has_last_index ? **last_index : vec_size - 1;
       }
       // We have yet to wrap around (if that's even possible)
       else {
@@ -1359,7 +1367,7 @@ class circular_vector {
 
     // Bidirectional iterator requirements
     const_iterator& operator--() {
-      index--;
+      index = shift_index(-1);
       return *this;
     }
     const_iterator operator--(int) {
@@ -1371,13 +1379,13 @@ class circular_vector {
     // Random access iterator requirements
     const value_type& operator[](difference_type rhs) const { return (*vec)[shift_index(rhs)]; }
 
-    const_iterator operator+(difference_type rhs) const { return { this->vec, shift_index(rhs) }; }
-    friend const_iterator operator+(difference_type lhs, const const_iterator& rhs) { return { rhs.vec, rhs.shift_index(lhs) }; }
+    const_iterator operator+(difference_type rhs) const { return const_iterator(this->vec, shift_index(rhs), first_index, last_index); }
+    friend const_iterator operator+(difference_type lhs, const const_iterator& rhs) { return const_iterator(rhs.vec, shift_index(lhs), rhs.first_index, rhs.last_index); }
     const_iterator& operator+=(difference_type rhs) { index = shift_index(rhs); return *this; }
 
     difference_type operator-(const const_iterator& rhs) const { return shift_index(-rhs.index); }
-    const_iterator operator-(difference_type rhs) const { return { this->vec, shift_index(-rhs) }; }
-    friend const_iterator operator-(difference_type lhs, const const_iterator& rhs) { return { rhs.vec, shift_index(-lhs) }; }
+    const_iterator operator-(difference_type rhs) const { return const_iterator(this->vec, shift_index(-rhs), first_index, last_index); }
+    friend const_iterator operator-(difference_type lhs, const const_iterator& rhs) { return const_iterator(rhs.vec, rhs.shift_index(-lhs), rhs.first_index, rhs.last_index); }
     const_iterator& operator-=(difference_type rhs) { index = shift_index(-rhs); return *this; }
 
     bool operator>(const const_iterator& rhs) const { return this->index != rhs.index && index_pos_larger_than(rhs.index); }
@@ -1386,6 +1394,24 @@ class circular_vector {
     bool operator<=(const const_iterator& rhs) const { return this->index == rhs.index || !index_pos_larger_than(rhs.index); }
   };
   static_assert(std::random_access_iterator<const_iterator<utility::ChunkEntry>>);
+
+  void realloc_vec(uint64_t new_capacity) {
+    const auto used_size = size();
+    if (new_capacity < used_size) return;
+    std::vector<T> new_vec{};
+
+    if (used_size > 0) {
+      new_vec.reserve(new_capacity);
+      new_vec.resize(used_size);
+      std::move(begin(), end(), new_vec.begin());
+    }
+
+    vec = std::move(new_vec);
+    // Reset everything so the new vec is now accessed in a non-circular way, at least until needed again
+    last_index_vec = std::nullopt;
+    first_index_vec = 0;
+    reclaimable_slots = 0;
+  }
 
 public:
   using size_type = typename std::vector<T>::size_type;
@@ -1418,9 +1444,9 @@ public:
   }
 
   const_iterator<T> begin() const { return const_iterator<T>(&vec, first_index_vec, &first_index_vec, &last_index_vec); }
-  const_iterator<T> end() const { return const_iterator<T>(&vec, get_last_index_vec() + 1, &first_index_vec, &last_index_vec); }
+  const_iterator<T> end() const { return const_iterator<T>(&vec, vec.size(), &first_index_vec, &last_index_vec); }
   const_iterator<T> cbegin() const { return const_iterator<T>(&vec, first_index_vec, &first_index_vec, &last_index_vec); }
-  const_iterator<T> cend() const { return const_iterator<T>(&vec, get_last_index_vec() + 1, &first_index_vec, &last_index_vec); }
+  const_iterator<T> cend() const { return const_iterator<T>(&vec, vec.size(), &first_index_vec, &last_index_vec); }
 
   // The size including reclaimed/removed items, as it would have been in a regular vector
   size_type fullSize() const {
@@ -1428,9 +1454,26 @@ public:
   }
   size_type innerVecSize() const { return vec.size(); }
   size_type size() const {
-    return vec.size() - reclaimable_slots;
+    if (!last_index_vec.has_value() || *last_index_vec < first_index_vec) {
+      return vec.size() - reclaimable_slots;
+    }
+    else {
+      return *last_index_vec - first_index_vec + 1;
+    }
   }
+  void clear() {
+    first_index_vec = 0;
+    last_index_vec = std::nullopt;
+    reclaimable_slots = 0;
+    vec = std::vector<T>();
+  }
+
   void pop_front() {
+    if (last_index_vec.has_value() && *last_index_vec == first_index_vec) {
+      // Popped the last element! reset all circular behavior stuff and quit
+      clear();
+      return;
+    }
     first_index_vec++;
     if (first_index_vec == vec.size()) {
       first_index_vec = 0;
@@ -1440,6 +1483,11 @@ public:
   }
   void pop_back() {
     if (last_index_vec.has_value()) {
+      if (*last_index_vec == first_index_vec) {
+        // Popped the last element! reset all circular behavior stuff and quit
+        clear();
+        return;
+      }
       if (*last_index_vec == 0) {
         last_index_vec = std::nullopt;
       }
@@ -1473,29 +1521,25 @@ public:
     }
     // max capacity and no reclaimable_slots, realloc unavoidable
     else {
-      std::vector<T> new_vec{};
-      new_vec.reserve(static_cast<uint64_t>(std::ceil(static_cast<double>(vec.capacity()) * 1.5)));
-      auto cap = new_vec.capacity();
-      new_vec.resize(vec.size());
-      
-      std::move(vec.begin() + first_index_vec, vec.end(), new_vec.begin());
-      // If we had circular usage, ensure the last items, stored at the start of the now old vector,
-      // are moved at the end of new_vec
-      if (last_index_vec.has_value()) {
-        const auto non_wrapped_element_count = vec.size() - first_index_vec;
-        std::move(vec.begin(), vec.begin() + *last_index_vec + 1, new_vec.begin() + non_wrapped_element_count);
-      }
-      new_vec.emplace_back(std::move(chunk));
+      realloc_vec(static_cast<uint64_t>(std::ceil(static_cast<double>(vec.capacity()) * 1.5)));
+      vec.emplace_back(std::move(chunk));
+    }
+  }
 
-      vec = std::move(new_vec);
-      // Reset everything so the new vec is now accessed in a non-circular way, at least until needed again
-      last_index_vec = std::nullopt;
-      first_index_vec = 0;
+  void shrink_to_fit() {
+    // we check that shrinking is worth it, at the very least we check that we shouldn't need to realloc again
+    // if a few elements are added
+    const auto current_capacity = vec.capacity();
+    const auto target_capacity = static_cast<uint64_t>(std::ceil(static_cast<double>(current_capacity) / 1.5));
+    if (target_capacity > size()) {
+      realloc_vec(target_capacity);
     }
   }
 
   T& front() { return vec[first_index_vec]; }
+  const T& front() const { return vec[first_index_vec]; }
   T& back() { return vec[get_last_index_vec()]; }
+  const T& back() const { return vec[get_last_index_vec()]; }
 };
 static_assert(std::ranges::range<circular_vector<utility::ChunkEntry>>);
 
@@ -1503,10 +1547,10 @@ std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<ut
   static constexpr auto compare_offset = [](const utility::ChunkEntry& x, const utility::ChunkEntry& y) { return x.offset < y.offset; };
 
   const auto search_chunk = utility::ChunkEntry(offset);
-  const auto chunk_iter = std::ranges::lower_bound(std::as_const(chunks), search_chunk, compare_offset);
-  uint64_t chunk_i = chunks.get_index(chunk_iter);
+  auto chunk_iter = std::ranges::lower_bound(std::as_const(chunks), search_chunk, compare_offset);
+  if (chunk_iter == chunks.cend() || (*chunk_iter).offset > offset) --chunk_iter;
 
-  if (chunk_iter == chunks.cend() || chunks[chunk_i].offset > offset) chunk_i--;
+  uint64_t chunk_i = chunks.get_index(chunk_iter);
   const utility::ChunkEntry* chunk = &chunks[chunk_i];
   const uint64_t chunk_pos = offset - chunk->offset;
 
@@ -1520,10 +1564,241 @@ std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<ut
   return { chunk_i, chunk_pos };
 }
 
+class circular_vector_debug {
+  std::deque<LZInstruction> instructions_deque;
+  circular_vector<LZInstruction*> instructions_vec;
+
+  void check_instructions_equal(const LZInstruction& instruction1, const LZInstruction& instruction2) const {
+    if (
+      instruction1.type != instruction2.type ||
+      instruction1.offset != instruction2.offset ||
+      instruction1.size != instruction2.size
+    ) {
+      print_to_console("CHORI\n");
+      exit(1);
+    }
+  }
+
+  void check_iterators_equal(auto& deque_iter1, auto& vec_iter2) const {
+    auto deque_begin = instructions_deque.begin();
+    auto deque_end = instructions_deque.end();
+    auto deque_cbegin = instructions_deque.cbegin();
+    auto deque_cend = instructions_deque.cend();
+    auto vec_begin = instructions_vec.begin();
+    auto vec_end = instructions_vec.end();
+    auto vec_cbegin = instructions_vec.cbegin();
+    auto vec_cend = instructions_vec.cend();
+
+    const bool deque_iter1_is_begin = deque_iter1 == deque_begin;
+    const bool deque_iter1_is_cbegin = deque_iter1 == deque_cbegin;
+    const bool deque_iter1_is_end = deque_iter1 == deque_end;
+    const bool deque_iter1_is_cend = deque_iter1 == deque_cend;
+    const bool vec_iter1_is_begin = vec_iter2 == vec_begin;
+    const bool vec_iter1_is_cbegin = vec_iter2 == vec_cbegin;
+    const bool vec_iter1_is_end = vec_iter2 == vec_end;
+    const bool vec_iter1_is_cend = vec_iter2 == vec_cend;
+    if (
+      deque_iter1_is_begin && !vec_iter1_is_begin ||
+      !deque_iter1_is_begin && vec_iter1_is_begin ||
+      deque_iter1_is_cbegin && !vec_iter1_is_cbegin ||
+      !deque_iter1_is_cbegin && vec_iter1_is_cbegin ||
+      deque_iter1_is_end && !vec_iter1_is_end ||
+      !deque_iter1_is_end && vec_iter1_is_end ||
+      deque_iter1_is_cend && !vec_iter1_is_cend ||
+      !deque_iter1_is_cend && vec_iter1_is_cend
+      ) {
+      print_to_console("CHORI\n");
+      exit(1);
+    }
+    if (deque_iter1 == deque_end || deque_iter1 == deque_cend) return;
+    auto& instruction1 = *deque_iter1;
+    auto& instruction2 = **vec_iter2;
+    check_instructions_equal(instruction1, instruction2);
+  }
+
+  void paranoid_check() const {
+    auto deque_size = instructions_deque.size();
+    auto vec_size = instructions_vec.size();
+    if (deque_size != vec_size) {
+      print_to_console("CHORI\n");
+      exit(1);
+    }
+
+    if (deque_size == 0) return;
+
+    {
+      auto& instruction1 = instructions_deque.front();
+      auto& instruction2 = *instructions_vec.front();
+      check_instructions_equal(instruction1, instruction2);
+    }
+    {
+      auto& instruction1 = instructions_deque.back();
+      auto& instruction2 = *instructions_vec.back();
+      check_instructions_equal(instruction1, instruction2);
+    }
+    {
+      auto deque_iter_begin = instructions_deque.begin();
+      auto vec_iter_begin = instructions_vec.begin();
+      check_iterators_equal(deque_iter_begin, vec_iter_begin);
+      check_instructions_equal(**vec_iter_begin, *instructions_vec.front());
+    }
+    {
+      auto deque_iter_cbegin = instructions_deque.cbegin();
+      auto vec_iter_cbegin = instructions_vec.cbegin();
+      check_iterators_equal(deque_iter_cbegin, vec_iter_cbegin);
+      check_instructions_equal(**vec_iter_cbegin, *instructions_vec.front());
+    }
+    {
+      auto deque_iter_end = instructions_deque.end();
+      auto vec_iter_end = instructions_vec.end();
+      check_iterators_equal(deque_iter_end, vec_iter_end);
+      check_instructions_equal(**(vec_iter_end - 1), *instructions_vec.back());
+    }
+    {
+      auto deque_iter_cend = instructions_deque.cend();
+      auto vec_iter_cend = instructions_vec.cend();
+      check_iterators_equal(deque_iter_cend, vec_iter_cend);
+      check_instructions_equal(**(vec_iter_cend - 1), *instructions_vec.back());
+    }
+  }
+
+public:
+  using size_type = std::vector<LZInstruction>::size_type;
+
+  explicit circular_vector_debug() = default;
+
+  LZInstruction& operator[](size_type pos) {
+    paranoid_check();
+    auto& instruction1 = instructions_deque[pos];
+    auto& instruction2 = *instructions_vec[pos];
+    check_instructions_equal(instruction1, instruction2);
+    paranoid_check();
+    return instruction1;
+  }
+
+  std::deque<LZInstruction>::iterator begin() {
+    paranoid_check();
+    std::deque<LZInstruction>::iterator deque_iter = instructions_deque.begin();
+    auto vec_iter = instructions_vec.begin();
+    check_iterators_equal(deque_iter, vec_iter);
+    paranoid_check();
+    return deque_iter;
+  }
+  std::deque<LZInstruction>::iterator end() {
+    paranoid_check();
+    std::deque<LZInstruction>::iterator deque_iter = instructions_deque.end();
+    auto vec_iter = instructions_vec.end();
+    check_iterators_equal(deque_iter, vec_iter);
+    paranoid_check();
+    return deque_iter;
+  }
+  std::deque<LZInstruction>::const_iterator cbegin() const {
+    paranoid_check();
+    std::deque<LZInstruction>::const_iterator deque_iter = instructions_deque.cbegin();
+    auto vec_iter = instructions_vec.cbegin();
+    check_iterators_equal(deque_iter, vec_iter);
+    paranoid_check();
+    return deque_iter;
+  }
+  std::deque<LZInstruction>::const_iterator cend() const {
+    paranoid_check();
+    std::deque<LZInstruction>::const_iterator deque_iter = instructions_deque.cend();
+    auto vec_iter = instructions_vec.cend();
+    check_iterators_equal(deque_iter, vec_iter);
+    paranoid_check();
+    return deque_iter;
+  }
+
+  size_type size() const {
+    paranoid_check();
+    auto deque_size = instructions_deque.size();
+    auto vec_size = instructions_vec.size();
+    if (deque_size != vec_size) {
+      print_to_console("CHORI\n");
+      exit(1);
+    }
+    paranoid_check();
+    return deque_size;
+  }
+  void pop_front() {
+    paranoid_check();
+    size();
+    auto& instruction1 = instructions_deque.front();
+    auto& instruction2 = *instructions_vec.front();
+    check_instructions_equal(instruction1, instruction2);
+    instructions_deque.pop_front();
+    instructions_vec.pop_front();
+    size();
+    paranoid_check();
+  }
+  void pop_back() {
+    paranoid_check();
+    size();
+    auto& instruction1 = instructions_deque.back();
+    auto& instruction2 = *instructions_vec.back();
+    check_instructions_equal(instruction1, instruction2);
+    instructions_deque.pop_back();
+    instructions_vec.pop_back();
+    size();
+    paranoid_check();
+  }
+  void emplace_back(LZInstruction&& instruction) {
+    paranoid_check();
+    size();
+    instructions_deque.emplace_back(std::move(instruction));
+    instructions_vec.emplace_back(&instructions_deque.back());
+    size();
+
+    back();
+    paranoid_check();
+  }
+
+  void shrink_to_fit() {
+    paranoid_check();
+    size();
+    instructions_deque.shrink_to_fit();
+    instructions_vec.shrink_to_fit();
+    size();
+    paranoid_check();
+  }
+
+  LZInstruction& front() {
+    paranoid_check();
+    auto& instruction1 = instructions_deque.front();
+    auto& instruction2 = *instructions_vec.front();
+    check_instructions_equal(instruction1, instruction2);
+    paranoid_check();
+    return instruction1;
+  }
+  const LZInstruction& front() const {
+    paranoid_check();
+    auto& instruction1 = instructions_deque.front();
+    auto& instruction2 = *instructions_vec.front();
+    check_instructions_equal(instruction1, instruction2);
+    paranoid_check();
+    return instruction1;
+  }
+  LZInstruction& back() {
+    paranoid_check();
+    auto& instruction1 = instructions_deque.back();
+    auto& instruction2 = instructions_vec.back();
+    check_instructions_equal(instruction1, *instruction2);
+    paranoid_check();
+    return instruction1;
+  }
+  const LZInstruction& back() const {
+    paranoid_check();
+    auto& instruction1 = instructions_deque.back();
+    auto& instruction2 = instructions_vec.back();
+    check_instructions_equal(instruction1, *instruction2);
+    paranoid_check();
+    return instruction1;
+  }
+};
+
 class LZInstructionManager {
   circular_vector<utility::ChunkEntry>* chunks;
-  std::deque<LZInstruction> instructions;
-  //circular_vector<LZInstruction> instructions;
+  circular_vector<LZInstruction> instructions;
 
   std::ostream* ostream;
   WrappedOStreamOutputStream output_stream;
@@ -1545,7 +1820,8 @@ class LZInstructionManager {
     if (!use_match_extension_backwards || instruction.type != LZInstructionType::COPY || instruction.size == 0 || !can_backwards_extend_instruction)
       return extended_backwards_size;
 
-    auto prevInstruction_iter = instructions.rbegin();
+    auto prevInstruction_iter = instructions.cend();
+    prevInstruction_iter = prevInstruction_iter - 1;
     const LZInstruction* prevInstruction = &*prevInstruction_iter;
 
     auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset - 1);
@@ -1560,13 +1836,13 @@ class LZInstructionManager {
     uint64_t extended_instruction_offset = current_offset;
     uint64_t prevInstruction_eaten_size = 0;
     const bool can_backwards_extend_prevInstruction = extended_instruction_offset > earliest_allowed_offset;
-    while (prevInstruction_iter != instructions.rend() && can_backwards_extend_prevInstruction) {
+    while (can_backwards_extend_prevInstruction) {
       // TODO: figure out why this happens, most likely some match extension is not properly cleaning up INSERTs that are shrunk into nothingness
       if (prevInstruction->size == 0) {
-        ++prevInstruction_iter;
-        if (prevInstruction_iter == instructions.rend()) {
+        if (prevInstruction_iter == instructions.cbegin()) {
           break;
         }
+        --prevInstruction_iter;
         prevInstruction_eaten_size = 0;
         prevInstruction = &*prevInstruction_iter;
         continue;
@@ -1631,11 +1907,11 @@ class LZInstructionManager {
         }
 
         if (prevInstruction->size == prevInstruction_eaten_size) {
-          ++prevInstruction_iter;
-          if (prevInstruction_iter == instructions.rend()) {
+          if (prevInstruction_iter == instructions.cbegin()) {
             stop_matching = true;
             break;
           }
+          --prevInstruction_iter;
           prevInstruction_eaten_size = 0;
           prevInstruction = &*prevInstruction_iter;
           break;
@@ -2038,6 +2314,7 @@ public:
       outputted_lz_instructions++;
     }
 
+    instructions.shrink_to_fit();
     if (flush) {
       bit_output_stream.flush();
       output_stream.flush();
@@ -2165,7 +2442,9 @@ void select_cut_point_candidates(
 }
 
 int main(int argc, char* argv[]) {
-  //get_char_with_echo();
+#ifndef NDEBUG
+  get_char_with_echo();
+#endif
   std::string file_path{ argv[1] };
   auto file_size = file_path == "-" ? 0 : std::filesystem::file_size(file_path);
   if (argc > 3) {
@@ -2451,7 +2730,7 @@ int main(int argc, char* argv[]) {
     new_segment_batch_data.resize(31 + wrapped_file.gcount());
 
     return new_segment_batch_data;
-    };
+  };
 
   auto launch_cdc_threads =
   [&cdc_candidates_futures, &find_cdc_cut_candidates_in_thread, &load_next_segment_batch_future, &load_next_segment_batch,
@@ -3150,7 +3429,8 @@ int main(int argc, char* argv[]) {
   print_to_console("Dump time:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_dedup_end_time).count()) + " seconds\n");
   print_to_console("Total runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_runtime_start_time).count()) + " seconds\n");
 
-  //get_char_with_echo();
+  print_to_console("Processing finished, press enter to quit.\n");
+  get_char_with_echo();
   exit(0);  // Dirty, dirty, dirty, but should be fine as long all threads have finished, for exiting quickly until I refactor the codebase a little
   return 0;
 }
