@@ -332,6 +332,7 @@ namespace fastcdc {
         if (!(pattern & constants::CDS_SAMPLING_MASK)) {
           if (features.empty()) {
             features.resize(16);
+            features.shrink_to_fit();
           }
           for (int feature_i = 0; feature_i < 16; feature_i++) {
             const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
@@ -357,6 +358,7 @@ namespace fastcdc {
         if (!(pattern & constants::CDS_SAMPLING_MASK)) {
           if (features.empty()) {
             features.resize(16);
+            features.shrink_to_fit();
           }
           for (int feature_i = 0; feature_i < 16; feature_i++) {
             const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
@@ -387,9 +389,6 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
   CdcCandidatesResult result;
   std::vector<uint32_t>& candidates = std::get<0>(result);
   CandidateFeaturesResult& candidate_features = std::get<1>(result);
-  if constexpr (compute_features) {
-    candidate_features.clear();
-  }
   if (data.empty()) return result;
 
   const auto bits = utility::logarithm2(avg_size);
@@ -458,6 +457,10 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
     data = std::span(data.data() + *cp, data.size() - *cp);
   }
 
+  if constexpr (compute_features) {
+    candidate_features.shrink_to_fit();
+  }
+  candidates.shrink_to_fit();
   return result;
 }
 
@@ -593,6 +596,8 @@ struct LZInstruction {
   LZInstructionType type;
   uint64_t offset;  // For COPY: previous offset; For INSERT: offset on the original stream; For Delta: previous offset of original data
   uint64_t size;  // How much data to be copied or inserted, or size of the delta original data
+
+  auto operator<=>(const LZInstruction&) const = default;
 };
 
 struct DeltaEncodingResult {
@@ -1191,11 +1196,13 @@ private:
     dump_thread = std::thread(dump_vector_to_ostream_with_guard, std::move(output_buffer), buffer_used_len, ostream);
     buffer_used_len = 0;
     output_buffer.resize(buffer_size);
+    output_buffer.shrink_to_fit();
   }
 
 public:
   explicit WrappedOStreamOutputStream(std::ostream* _ostream, uint64_t _buffer_size = 200ull * 1024 * 1024): ostream(_ostream), buffer_size(_buffer_size) {
     output_buffer.resize(buffer_size);
+    output_buffer.shrink_to_fit();
   }
 
   ~WrappedOStreamOutputStream() override {
@@ -1240,6 +1247,31 @@ class circular_vector {
 
   uint64_t reclaimable_slots = 0;
 
+  void realloc_vec(uint64_t new_capacity) {
+    const auto used_size = size();
+    if (new_capacity < used_size) return;
+    std::vector<T> new_vec{};
+
+    if (used_size > 0) {
+      new_vec.reserve(new_capacity);
+      new_vec.resize(used_size);
+      auto begin_iter = begin();
+      auto end_iter = end();
+      std::move(begin_iter, end_iter, new_vec.begin());
+    }
+
+    vec = std::move(new_vec);
+    // Reset everything so the new vec is now accessed in a non-circular way, at least until needed again
+    last_index_vec = std::nullopt;
+    first_index_vec = 0;
+    reclaimable_slots = 0;
+  }
+
+public:
+  using size_type = typename std::vector<T>::size_type;
+
+  explicit circular_vector() = default;
+
   template <class U>
   class const_iterator {
   public:
@@ -1266,14 +1298,22 @@ class circular_vector {
       else {
         // Wrapping around is not even needed
         if (added_index < vec_size) {
-          // Return the added index, unless we have a last_index not before the first_index and we would be going past that last_index,
+          // Return the added index, unless we have a last_index not before the first_index, and we would be going past that last_index,
           // in which case we return the vec_size which will result in an end iterator
           return (has_last_index && **last_index >= *first_index && added_index > **last_index) ? vec_size : added_index;
         }
-        // If the vector doesn't have circular wrapping around behavior then just return index for end of vec
-        if (!has_last_index) return vec_size;
-        // If we were to do a whole loop, just return index for end/cend, as we need to stop at some point
-        if (add >= vec_size) return vec_size;
+        
+        if (
+          // If the vector doesn't have circular wrapping around behavior then just return index for end of vec
+          !has_last_index ||
+          // If the last index we have is larger than the first_index then wrapping around is not even possible
+          **last_index >= *first_index ||
+          // If we were to do a whole loop, just return index for end/cend, as we need to stop at some point.
+          add >= vec_size
+          ) {
+          return vec_size;
+        }
+
         const auto wrapped_index = added_index % vec_size;
         // If even wrapping around we went too far we stop at the last_index + 1 as well
         return wrapped_index > **last_index ? vec_size : wrapped_index;
@@ -1380,7 +1420,7 @@ class circular_vector {
     const value_type& operator[](difference_type rhs) const { return (*vec)[shift_index(rhs)]; }
 
     const_iterator operator+(difference_type rhs) const { return const_iterator(this->vec, shift_index(rhs), first_index, last_index); }
-    friend const_iterator operator+(difference_type lhs, const const_iterator& rhs) { return const_iterator(rhs.vec, shift_index(lhs), rhs.first_index, rhs.last_index); }
+    friend const_iterator operator+(difference_type lhs, const const_iterator& rhs) { return const_iterator(rhs.vec, rhs.shift_index(lhs), rhs.first_index, rhs.last_index); }
     const_iterator& operator+=(difference_type rhs) { index = shift_index(rhs); return *this; }
 
     difference_type operator-(const const_iterator& rhs) const { return shift_index(-rhs.index); }
@@ -1394,29 +1434,6 @@ class circular_vector {
     bool operator<=(const const_iterator& rhs) const { return this->index == rhs.index || !index_pos_larger_than(rhs.index); }
   };
   static_assert(std::random_access_iterator<const_iterator<utility::ChunkEntry>>);
-
-  void realloc_vec(uint64_t new_capacity) {
-    const auto used_size = size();
-    if (new_capacity < used_size) return;
-    std::vector<T> new_vec{};
-
-    if (used_size > 0) {
-      new_vec.reserve(new_capacity);
-      new_vec.resize(used_size);
-      std::move(begin(), end(), new_vec.begin());
-    }
-
-    vec = std::move(new_vec);
-    // Reset everything so the new vec is now accessed in a non-circular way, at least until needed again
-    last_index_vec = std::nullopt;
-    first_index_vec = 0;
-    reclaimable_slots = 0;
-  }
-
-public:
-  using size_type = typename std::vector<T>::size_type;
-
-  explicit circular_vector() = default;
 
   size_type get_last_index_vec() const { return last_index_vec.has_value() ? *last_index_vec : vec.size() - 1; }
   size_type get_last_index_num() const { return first_index_num + this->size() - 1; }
@@ -1461,6 +1478,7 @@ public:
       return *last_index_vec - first_index_vec + 1;
     }
   }
+  bool empty() const { return size() == 0; }
   void clear() {
     first_index_vec = 0;
     last_index_vec = std::nullopt;
@@ -1525,6 +1543,10 @@ public:
       vec.emplace_back(std::move(chunk));
     }
   }
+  void emplace_back(T& chunk) {
+    T chunk_copy = chunk;
+    emplace_back(std::move(chunk_copy));
+  }
 
   void shrink_to_fit() {
     // we check that shrinking is worth it, at the very least we check that we shouldn't need to realloc again
@@ -1543,37 +1565,13 @@ public:
 };
 static_assert(std::ranges::range<circular_vector<utility::ChunkEntry>>);
 
-std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<utility::ChunkEntry>& chunks, uint64_t offset) {
-  static constexpr auto compare_offset = [](const utility::ChunkEntry& x, const utility::ChunkEntry& y) { return x.offset < y.offset; };
-
-  const auto search_chunk = utility::ChunkEntry(offset);
-  auto chunk_iter = std::ranges::lower_bound(std::as_const(chunks), search_chunk, compare_offset);
-  if (chunk_iter == chunks.cend() || (*chunk_iter).offset > offset) --chunk_iter;
-
-  uint64_t chunk_i = chunks.get_index(chunk_iter);
-  const utility::ChunkEntry* chunk = &chunks[chunk_i];
-  const uint64_t chunk_pos = offset - chunk->offset;
-
-#ifndef NDEBUG
-  if (chunk->offset + chunk_pos != offset || chunk_pos >= chunk->chunk_data->data.size()) {
-    print_to_console("get_chunk_i_and_pos_for_offset() found incorrect chunk_i and pos!\n");
-    exit(1);
-  }
-#endif
-
-  return { chunk_i, chunk_pos };
-}
-
+template <class T>
 class circular_vector_debug {
-  std::deque<LZInstruction> instructions_deque;
-  circular_vector<LZInstruction*> instructions_vec;
+  std::deque<T> instructions_deque;
+  circular_vector<T*> instructions_vec;
 
-  void check_instructions_equal(const LZInstruction& instruction1, const LZInstruction& instruction2) const {
-    if (
-      instruction1.type != instruction2.type ||
-      instruction1.offset != instruction2.offset ||
-      instruction1.size != instruction2.size
-    ) {
+  void check_instructions_equal(const T& instruction1, const T& instruction2) const {
+    if (instruction1 != instruction2) {
       print_to_console("CHORI\n");
       exit(1);
     }
@@ -1663,11 +1661,11 @@ class circular_vector_debug {
   }
 
 public:
-  using size_type = std::vector<LZInstruction>::size_type;
+  using size_type = typename std::vector<T>::size_type;
 
   explicit circular_vector_debug() = default;
 
-  LZInstruction& operator[](size_type pos) {
+  T& operator[](size_type pos) {
     paranoid_check();
     auto& instruction1 = instructions_deque[pos];
     auto& instruction2 = *instructions_vec[pos];
@@ -1676,33 +1674,33 @@ public:
     return instruction1;
   }
 
-  std::deque<LZInstruction>::iterator begin() {
+  typename std::deque<T>::iterator begin() {
     paranoid_check();
-    std::deque<LZInstruction>::iterator deque_iter = instructions_deque.begin();
+    typename std::deque<T>::iterator deque_iter = instructions_deque.begin();
     auto vec_iter = instructions_vec.begin();
     check_iterators_equal(deque_iter, vec_iter);
     paranoid_check();
     return deque_iter;
   }
-  std::deque<LZInstruction>::iterator end() {
+  typename std::deque<T>::iterator end() {
     paranoid_check();
-    std::deque<LZInstruction>::iterator deque_iter = instructions_deque.end();
+    typename std::deque<T>::iterator deque_iter = instructions_deque.end();
     auto vec_iter = instructions_vec.end();
     check_iterators_equal(deque_iter, vec_iter);
     paranoid_check();
     return deque_iter;
   }
-  std::deque<LZInstruction>::const_iterator cbegin() const {
+  typename std::deque<T>::const_iterator cbegin() const {
     paranoid_check();
-    std::deque<LZInstruction>::const_iterator deque_iter = instructions_deque.cbegin();
+    typename std::deque<T>::const_iterator deque_iter = instructions_deque.cbegin();
     auto vec_iter = instructions_vec.cbegin();
     check_iterators_equal(deque_iter, vec_iter);
     paranoid_check();
     return deque_iter;
   }
-  std::deque<LZInstruction>::const_iterator cend() const {
+  typename std::deque<T>::const_iterator cend() const {
     paranoid_check();
-    std::deque<LZInstruction>::const_iterator deque_iter = instructions_deque.cend();
+    typename std::deque<T>::const_iterator deque_iter = instructions_deque.cend();
     auto vec_iter = instructions_vec.cend();
     check_iterators_equal(deque_iter, vec_iter);
     paranoid_check();
@@ -1742,7 +1740,7 @@ public:
     size();
     paranoid_check();
   }
-  void emplace_back(LZInstruction&& instruction) {
+  void emplace_back(T&& instruction) {
     paranoid_check();
     size();
     instructions_deque.emplace_back(std::move(instruction));
@@ -1751,6 +1749,10 @@ public:
 
     back();
     paranoid_check();
+  }
+  void emplace_back(T& instruction) {
+    T copy = instruction;
+    emplace_back(std::move(copy));
   }
 
   void shrink_to_fit() {
@@ -1762,7 +1764,7 @@ public:
     paranoid_check();
   }
 
-  LZInstruction& front() {
+  T& front() {
     paranoid_check();
     auto& instruction1 = instructions_deque.front();
     auto& instruction2 = *instructions_vec.front();
@@ -1770,7 +1772,7 @@ public:
     paranoid_check();
     return instruction1;
   }
-  const LZInstruction& front() const {
+  const T& front() const {
     paranoid_check();
     auto& instruction1 = instructions_deque.front();
     auto& instruction2 = *instructions_vec.front();
@@ -1778,7 +1780,7 @@ public:
     paranoid_check();
     return instruction1;
   }
-  LZInstruction& back() {
+  T& back() {
     paranoid_check();
     auto& instruction1 = instructions_deque.back();
     auto& instruction2 = instructions_vec.back();
@@ -1786,7 +1788,7 @@ public:
     paranoid_check();
     return instruction1;
   }
-  const LZInstruction& back() const {
+  const T& back() const {
     paranoid_check();
     auto& instruction1 = instructions_deque.back();
     auto& instruction2 = instructions_vec.back();
@@ -1795,6 +1797,27 @@ public:
     return instruction1;
   }
 };
+
+std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<utility::ChunkEntry>& chunks, uint64_t offset) {
+  static constexpr auto compare_offset = [](const utility::ChunkEntry& x, const utility::ChunkEntry& y) { return x.offset < y.offset; };
+
+  const auto search_chunk = utility::ChunkEntry(offset);
+  auto chunk_iter = std::ranges::lower_bound(std::as_const(chunks), search_chunk, compare_offset);
+  if (chunk_iter == chunks.cend() || (*chunk_iter).offset > offset) --chunk_iter;
+
+  uint64_t chunk_i = chunks.get_index(chunk_iter);
+  const utility::ChunkEntry* chunk = &chunks[chunk_i];
+  const uint64_t chunk_pos = offset - chunk->offset;
+
+#ifndef NDEBUG
+  if (chunk->offset + chunk_pos != offset || chunk_pos >= chunk->chunk_data->data.size()) {
+    print_to_console("get_chunk_i_and_pos_for_offset() found incorrect chunk_i and pos at offset: " + std::to_string(offset) + "\n");
+    exit(1);
+  }
+#endif
+
+  return { chunk_i, chunk_pos };
+}
 
 class LZInstructionManager {
   circular_vector<utility::ChunkEntry>* chunks;
@@ -2326,7 +2349,6 @@ void select_cut_point_candidates(
   const std::vector<uint32_t>& new_cut_point_candidates,
   const std::vector<std::vector<uint32_t>>& new_cut_point_candidates_features,
   std::deque<utility::ChunkEntry>& process_pending_chunks,
-  std::deque<std::optional<std::array<uint32_t, 4>>>& cut_points_features,
   uint64_t last_used_cut_point,
   uint64_t segment_start_offset,
   std::vector<uint8_t>& segment_data,
@@ -2338,7 +2360,7 @@ void select_cut_point_candidates(
   std::optional<uint64_t> minimum_allowed_cut_point = std::nullopt
 ) {
   auto make_chunk = [&] (uint64_t candidate_pos, uint64_t prev_point_offset, uint64_t segment_data_pos, uint64_t cut_point_pos) {
-    process_pending_chunks.emplace_back(prev_point_offset);
+    process_pending_chunks.emplace_back(utility::ChunkEntry(prev_point_offset));
     auto& new_pending_chunk = process_pending_chunks.back();
 
     if (!prev_segment_remaining_data.empty()) {
@@ -2355,25 +2377,18 @@ void select_cut_point_candidates(
     new_pending_chunk.chunk_data->data.shrink_to_fit();
 
     if (use_feature_extraction) {
-      // TODO: fix this stupid shit
       if (new_cut_point_candidates_features.size() >= candidate_pos + 1) {
         auto& cut_point_candidate_features = new_cut_point_candidates_features[candidate_pos];
-        if (cut_point_candidate_features.empty()) {
-          cut_points_features.emplace_back();
-        }
-        else {
+        if (!cut_point_candidate_features.empty()) {
           // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
-          std::array<uint32_t, 4> features = {
+          new_pending_chunk.chunk_data->super_features = {
             XXH32(cut_point_candidate_features.data(), 16, constants::CDS_SAMPLING_MASK),
             XXH32(cut_point_candidate_features.data() + 4, 16, constants::CDS_SAMPLING_MASK),
             XXH32(cut_point_candidate_features.data() + 8, 16, constants::CDS_SAMPLING_MASK),
             XXH32(cut_point_candidate_features.data() + 12, 16, constants::CDS_SAMPLING_MASK)
           };
-          cut_points_features.emplace_back(std::move(features));
+          new_pending_chunk.chunk_data->feature_sampling_failure = false;
         }
-      }
-      else {
-        cut_points_features.emplace_back();
       }
     }
   };
@@ -2436,6 +2451,7 @@ void select_cut_point_candidates(
     const auto segment_data_tail_len = segment_data.size() - in_segment_pos;
     if (segment_data_tail_len > 31) {
       prev_segment_remaining_data.resize(segment_data_tail_len - 31);
+      prev_segment_remaining_data.shrink_to_fit();
       std::copy_n(segment_data.data() + in_segment_pos, segment_data_tail_len - 31, prev_segment_remaining_data.data());
     }
   }
@@ -2568,7 +2584,7 @@ int main(int argc, char* argv[]) {
   uint64_t delta_compressed_approx_size = 0;
   uint64_t delta_compressed_chunk_count = 0;
 
-  std::unordered_map<std::bitset<64>, std::list<uint64_t>> known_hashes{};  // Find chunk pos by hash
+  std::unordered_map<std::bitset<64>, circular_vector<uint64_t>> known_hashes{};  // Find chunk pos by hash
 
   uint64_t chunk_i = 0;
   uint64_t last_reduced_chunk_i = 0;
@@ -2695,7 +2711,6 @@ int main(int argc, char* argv[]) {
   std::vector<uint8_t> prev_segment_remaining_data{};
   uint64_t segment_start_offset = 0;
   std::deque<utility::ChunkEntry> process_pending_chunks{};
-  std::deque<std::optional<std::array<uint32_t, 4>>> cut_points_features{};
 
   uint64_t current_offset = 0;
 
@@ -2729,6 +2744,7 @@ int main(int argc, char* argv[]) {
     wrapped_file.read(new_segment_batch_data.data() + 31, segment_batch_size);
     new_segment_batch_data.resize(31 + wrapped_file.gcount());
 
+    new_segment_batch_data.shrink_to_fit();
     return new_segment_batch_data;
   };
 
@@ -2742,6 +2758,7 @@ int main(int argc, char* argv[]) {
       if (segment_batch_data_span.empty()) break;
       auto current_segment_data = std::vector<uint8_t>();
       current_segment_data.resize(std::min(segment_batch_data_span.size(), segment_size + 31));
+      current_segment_data.shrink_to_fit();
       std::copy_n(segment_batch_data_span.data(), current_segment_data.size(), current_segment_data.data());
       bool segments_eof = current_segment_data.size() != segment_size + 31;
 
@@ -2774,7 +2791,7 @@ int main(int argc, char* argv[]) {
   };
 
   auto get_more_pending_chunks_from_cdc_futures =
-  [&cdc_candidates_futures, &process_pending_chunks, &cut_points_features, &prev_segment_remaining_data, &current_offset, min_size, max_size]
+  [&cdc_candidates_futures, &process_pending_chunks, &prev_segment_remaining_data, &current_offset, min_size, max_size]
   (bool force_wait) {
     if (cdc_candidates_futures.size() > 0) {
       auto candidate_future_status = cdc_candidates_futures.front().wait_for(std::chrono::nanoseconds::zero());
@@ -2793,7 +2810,6 @@ int main(int argc, char* argv[]) {
           new_cut_point_candidates,
           new_cut_point_candidates_features,
           process_pending_chunks,
-          cut_points_features,
           current_offset,
           curr_segment_start_offset,
           segment_data,
@@ -2814,6 +2830,7 @@ int main(int argc, char* argv[]) {
     segment_batch_data.resize(segment_size * cdc_thread_count + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
     wrapped_file.read(segment_batch_data.data(), segment_batch_size + 31);
     segment_batch_data.resize(wrapped_file.gcount());
+    segment_batch_data.shrink_to_fit();
 
     launch_cdc_threads(segment_batch_data);
     get_more_pending_chunks_from_cdc_futures(true);
@@ -2836,6 +2853,7 @@ int main(int argc, char* argv[]) {
         }
         else {
           hash_list.pop_front();
+          hash_list.shrink_to_fit();
         }
 
         if (use_generalized_resemblance_detection) {
@@ -2875,20 +2893,13 @@ int main(int argc, char* argv[]) {
         chunks[i].chunk_data = nullptr;
         chunks.pop_front();
       }
+
+      chunks.shrink_to_fit();
     }
 
     chunks.emplace_back(std::move(process_pending_chunks.front()));
     process_pending_chunks.pop_front();
     auto& chunk = chunks.back();
-
-    if (use_feature_extraction) {
-      const auto chunk_features = std::move(cut_points_features.front());
-      cut_points_features.pop_front();
-      if (chunk_features.has_value()) {
-        chunk.chunk_data->feature_sampling_failure = false;
-        chunk.chunk_data->super_features = *chunk_features;
-      }
-    }
 
     std::optional<uint64_t> prev_similarity_locality_anchor_i = similarity_locality_anchor_i;
     similarity_locality_anchor_i = std::nullopt;
@@ -3069,8 +3080,8 @@ int main(int argc, char* argv[]) {
         std::optional<uint64_t> best_candidate_dist{};
         uint64_t best_candidate_i = 0;
         if (prev_similarity_locality_anchor_i.has_value()) {
-          std::list<uint64_t> similarity_anchor_i_list;
-          std::list<uint64_t>* chunks_with_similarity_anchor_hash;
+          circular_vector<uint64_t> similarity_anchor_i_list;
+          circular_vector<uint64_t>* chunks_with_similarity_anchor_hash;
           if (exhaustive_dupadj) {
             chunks_with_similarity_anchor_hash = &known_hashes[chunks[*prev_similarity_locality_anchor_i].chunk_data->hash];
           }
@@ -3213,8 +3224,8 @@ int main(int argc, char* argv[]) {
           std::optional<uint64_t> best_candidate_dist{};
           uint64_t best_candidate_i = 0;
 
-          std::list<uint64_t> backtrack_anchor_i_list;
-          std::list<uint64_t>* chunks_with_backtrack_anchor_hash;
+          circular_vector<uint64_t> backtrack_anchor_i_list;
+          circular_vector<uint64_t>* chunks_with_backtrack_anchor_hash;
           if (exhaustive_dupadj) {
             chunks_with_backtrack_anchor_hash = &known_hashes[chunks[backtrack_similarity_anchor_i].chunk_data->hash];
           }
@@ -3364,11 +3375,15 @@ int main(int argc, char* argv[]) {
       load_next_segment_batch_future.wait_for(std::chrono::nanoseconds::zero()) == std::future_status::ready
     ) {
       auto segment_extend_data = load_next_segment_batch_future.get();
+      process_pending_chunks.shrink_to_fit();
+      cdc_candidates_futures.shrink_to_fit();
       launch_cdc_threads(segment_extend_data);
     }
     // If we were to run out of pending chunks but the next segment batch is not ready yet, we wait for it and get some pending chunks so we can continue
     if (process_pending_chunks.empty() && load_next_segment_batch_future.valid()) {
       auto segment_extend_data = load_next_segment_batch_future.get();
+      process_pending_chunks.shrink_to_fit();
+      cdc_candidates_futures.shrink_to_fit();
       launch_cdc_threads(segment_extend_data);
       get_more_pending_chunks_from_cdc_futures(true);
     }
