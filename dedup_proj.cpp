@@ -279,10 +279,26 @@ public:
   }
 };
 
+enum CutPointCandidateType : uint8_t {
+  HARD_CUT_MASK,  // Satisfied harder mask before average size
+  EASY_CUT_MASK,  // Satisfied easier mask after average size
+  SUPERCDC_BACKUP_MASK,  // Satisfied SuperCDC backup mask because no other mask worked
+  EOF_CUT  // Forcibly cut because the data span reached its EOF
+};
+
+struct CutPointCandidate {
+  CutPointCandidateType type;
+  uint32_t offset;
+};
+
 namespace fastcdc {
   template<
     bool compute_features,
-    typename ReturnType = std::conditional_t<compute_features, std::tuple<std::optional<uint32_t>, uint32_t, std::vector<uint32_t>>, std::tuple<std::optional<uint32_t>, uint32_t>>
+    typename ReturnType = std::conditional_t<
+      compute_features,
+      std::tuple<CutPointCandidate, uint32_t, std::vector<uint32_t>>,
+      std::tuple<CutPointCandidate, uint32_t>
+    >
   >
   ReturnType cdc_offset(
     const std::span<uint8_t> data,
@@ -291,7 +307,6 @@ namespace fastcdc {
     uint32_t max_size,
     uint32_t mask_s,
     uint32_t mask_l,
-    bool cut_at_data_end = true,
     uint32_t initial_pattern = 0
   ) {
     uint32_t pattern = initial_pattern;
@@ -322,10 +337,10 @@ namespace fastcdc {
       }
       if (!(pattern & mask_s)) {
         if constexpr (compute_features) {
-          return { i, pattern, features };
+          return { {.type = CutPointCandidateType::HARD_CUT_MASK, .offset = i }, pattern, features };
         }
         else {
-          return { i, pattern };
+          return { {.type = CutPointCandidateType::HARD_CUT_MASK, .offset = i }, pattern };
         }
       }
       if constexpr (compute_features) {
@@ -347,10 +362,10 @@ namespace fastcdc {
       pattern = (pattern >> 1) + constants::GEAR[data[i]];
       if (!(pattern & mask_l)) {
         if constexpr (compute_features) {
-          return { i, pattern, features };
+          return { {.type = CutPointCandidateType::EASY_CUT_MASK, .offset = i }, pattern, features };
         }
         else {
-          return { i, pattern };
+          return { {.type = CutPointCandidateType::EASY_CUT_MASK, .offset = i }, pattern };
         }
       }
       if (!backup_i.has_value() && !(pattern & mask_b)) backup_i = i;
@@ -368,9 +383,13 @@ namespace fastcdc {
       }
       i++;
     }
-    const auto result_i = backup_i.has_value()
-      ? backup_i
-      : cut_at_data_end ? std::optional(i) : std::nullopt;
+    CutPointCandidate result_i;
+    if (backup_i.has_value()) {
+      result_i = { .type = CutPointCandidateType::SUPERCDC_BACKUP_MASK, .offset = *backup_i };
+    }
+    else {
+      result_i = { .type = CutPointCandidateType::EOF_CUT, .offset = i };
+    }
     if constexpr (compute_features) {
       return { result_i, pattern, features };
     }
@@ -383,11 +402,11 @@ namespace fastcdc {
 template<
   bool compute_features,
   typename CandidateFeaturesResult = std::conditional_t<compute_features, std::vector<std::vector<uint32_t>>, std::monostate>,
-  typename CdcCandidatesResult = std::tuple<std::vector<uint32_t>, CandidateFeaturesResult>
+  typename CdcCandidatesResult = std::tuple<std::vector<CutPointCandidate>, CandidateFeaturesResult>
 >
-CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool cut_at_data_end, bool is_first_segment = true) {
+CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t min_size, uint32_t avg_size, uint32_t max_size, bool is_first_segment = true) {
   CdcCandidatesResult result;
-  std::vector<uint32_t>& candidates = std::get<0>(result);
+  std::vector<CutPointCandidate>& candidates = std::get<0>(result);
   CandidateFeaturesResult& candidate_features = std::get<1>(result);
   if (data.empty()) return result;
 
@@ -399,20 +418,19 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
 
   cdc_offset_return_type cdc_return{};
   uint32_t base_offset = 0;
-  std::optional<uint32_t>& cp = std::get<0>(cdc_return);
+  CutPointCandidate& cp = std::get<0>(cdc_return);
   uint32_t& pattern = std::get<1>(cdc_return);
 
   // If this is not the first segment then we need to deal with the previous segment extended data and attempt to recover chunk invariance
   if (!is_first_segment) {
-    std::tie(cp, pattern) = fastcdc::cdc_offset<false>(data, 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
-    if (!cp.has_value()) return result;
+    std::tie(cp, pattern) = fastcdc::cdc_offset<false>(data, 0, avg_size - 1, 4294967295, mask_s, mask_l, pattern);
 
-    base_offset += *cp;
-    candidates.emplace_back(base_offset);
+    base_offset += cp.offset;
+    candidates.emplace_back(cp.type, base_offset);
     if constexpr (compute_features) {
       candidate_features.emplace_back();
     }
-    data = std::span(data.data() + *cp, data.size() - *cp);
+    data = std::span(data.data() + cp.offset, data.size() - cp.offset);
 
     // And now we need to recover chunk invariance in accordance to the chunk invariance recovery condition.
     // We are guaranteed to be back in sync with what non-segmented CDC would have done as soon as we find a cut candidate with
@@ -420,41 +438,34 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
     // As soon as we find that we can break from here and keep processing as if we were processing without segments,
     // which in particular means we can exploit jumps to min_size again.
     while (!data.empty()) {
-      std::tie(cp, pattern) = fastcdc::cdc_offset<false>(std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_s, mask_l, cut_at_data_end, pattern);
-      if (!cp.has_value()) return result;
-      cp = *cp + 1;
+      std::tie(cp, pattern) = fastcdc::cdc_offset<false>(std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_s, mask_l, pattern);
+      cp.offset = cp.offset + 1;
 
-      base_offset += *cp;
-      candidates.emplace_back(base_offset);
+      base_offset += cp.offset;
+      candidates.emplace_back(cp.type, base_offset);
       if constexpr (compute_features) {
         candidate_features.emplace_back();
       }
-      data = std::span(data.data() + *cp, data.size() - *cp);
-      if (cp >= min_size && (*cp + min_size <= max_size)) break;  // back in sync with non-segmented processing!
+      data = std::span(data.data() + cp.offset, data.size() - cp.offset);
+      if (cp.offset >= min_size && (cp.offset + min_size <= max_size)) break;  // back in sync with non-segmented processing!
     }
   }
 
   while (!data.empty()) {
-    // Here we are in sync with non-segmented processing, which means we can make use of min/avg/max sizes again as we would in regular CDC.
-    // cut_at_data_end if false is only relevant for the last cut point, so the segment doesn't have an artificial cut point at the end,
-    // thus we override it to true if we still have more data than max_size, enforcing the max_size in a way that doesn't invalidate chunk invariance
-    bool override_cut_at_data_end = cut_at_data_end || data.size() >= max_size;
-
     if (base_offset == 0) {
-      cdc_return = fastcdc::cdc_offset<compute_features>(data, min_size, avg_size, max_size, mask_s, mask_l, override_cut_at_data_end, pattern);
+      cdc_return = fastcdc::cdc_offset<compute_features>(data, min_size, avg_size, max_size, mask_s, mask_l, pattern);
     }
     else {
-      cdc_return = fastcdc::cdc_offset<compute_features>(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, override_cut_at_data_end, pattern);
-      cp = cp.has_value() ? *cp + 1 : 1;
+      cdc_return = fastcdc::cdc_offset<compute_features>(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, pattern);
+      cp.offset = cp.offset + 1;
     }
 
-    if (!cp.has_value()) return result;
-    base_offset += *cp;
-    candidates.emplace_back(base_offset);
+    base_offset += cp.offset;
+    candidates.emplace_back(cp.type, base_offset);
     if constexpr (compute_features) {
       candidate_features.emplace_back(std::move(std::get<2>(cdc_return)));
     }
-    data = std::span(data.data() + *cp, data.size() - *cp);
+    data = std::span(data.data() + cp.offset, data.size() - cp.offset);
   }
 
   if constexpr (compute_features) {
@@ -530,10 +541,10 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
   auto& minichunks_vec = std::get<1>(return_val);
 
   // Find the CDC minichunks and update the SimHash with their data
-  auto [cut_offsets, cut_offsets_features] = find_cdc_cut_candidates<false>(std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2, true);
+  auto [cut_offsets, cut_offsets_features] = find_cdc_cut_candidates<false>(std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2);
   uint32_t previous_offset = 0;
-  for (const auto& cut_offset : cut_offsets) {
-    const auto minichunk_len = cut_offset - previous_offset;
+  for (const auto& cut_point_candidate : cut_offsets) {
+    const auto minichunk_len = cut_point_candidate.offset - previous_offset;
     // Calculate hash for current chunk
     const std::bitset<64> chunk_hash = XXH3_64bits(data + previous_offset, minichunk_len);
 
@@ -546,7 +557,7 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
     lower_counter_vector = add_32bit_hash_to_simhash_counter(lower_chunk_hash.to_ulong(), lower_counter_vector);
 
     minichunks_vec.emplace_back(minichunk_len);
-    previous_offset = cut_offset;
+    previous_offset = cut_point_candidate.offset;
   }
 
   const uint32_t upper_chunk_hash = finalize_32bit_simhash_from_counter(upper_counter_vector);
@@ -586,7 +597,7 @@ std::bitset<bit_size> hamming_base(const std::bitset<bit_size>& data) {
   return base;
 }
 
-enum LZInstructionType {
+enum LZInstructionType : uint8_t {
   COPY,
   INSERT,
   DELTA
@@ -2346,8 +2357,8 @@ public:
 };
 
 void select_cut_point_candidates(
-  const std::vector<uint32_t>& new_cut_point_candidates,
-  const std::vector<std::vector<uint32_t>>& new_cut_point_candidates_features,
+  std::vector<CutPointCandidate>& new_cut_point_candidates,
+  std::vector<std::vector<uint32_t>>& new_cut_point_candidates_features,
   std::deque<utility::ChunkEntry>& process_pending_chunks,
   uint64_t last_used_cut_point,
   uint64_t segment_start_offset,
@@ -2359,6 +2370,13 @@ void select_cut_point_candidates(
   bool use_feature_extraction,
   std::optional<uint64_t> minimum_allowed_cut_point = std::nullopt
 ) {
+  if (!segments_eof && !new_cut_point_candidates.empty() && new_cut_point_candidates.back().type == CutPointCandidateType::EOF_CUT) {
+    new_cut_point_candidates.pop_back();
+    if (use_feature_extraction) {
+      new_cut_point_candidates_features.pop_back();
+    }
+  }
+
   auto make_chunk = [&] (uint64_t candidate_pos, uint64_t prev_point_offset, uint64_t segment_data_pos, uint64_t cut_point_pos) {
     process_pending_chunks.emplace_back(utility::ChunkEntry(prev_point_offset));
     auto& new_pending_chunk = process_pending_chunks.back();
@@ -2403,10 +2421,10 @@ void select_cut_point_candidates(
 
   for (uint64_t i = 0; i < new_cut_point_candidates.size(); i++) {
     auto& cut_point_candidate = new_cut_point_candidates[i];
-    if (minimum_allowed_cut_point.has_value() && cut_point_candidate < *minimum_allowed_cut_point) continue;
+    if (minimum_allowed_cut_point.has_value() && cut_point_candidate.offset < *minimum_allowed_cut_point) continue;
     last_cut_point = process_pending_chunks.empty() ? last_used_cut_point : process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size();
 
-    const auto adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate;
+    const auto adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate.offset;
     while (adjusted_cut_point_candidate > last_cut_point + max_size) {
       // if the last_cut_point is on the previous segment some data might have come from the prev_segment_remaining_data so it's
       // not counting towards our segment data position
@@ -2426,8 +2444,8 @@ void select_cut_point_candidates(
       continue;
     }
 
-    make_chunk(i, last_cut_point, segment_data_pos, cut_point_candidate);
-    segment_data_pos = cut_point_candidate;
+    make_chunk(i, last_cut_point, segment_data_pos, cut_point_candidate.offset);
+    segment_data_pos = cut_point_candidate.offset;
   }
 
   // We might have reached the end of the cut point candidates but there is enough data at the end of the segment that we need to enforce
@@ -2716,13 +2734,13 @@ int main(int argc, char* argv[]) {
 
   auto find_cdc_cut_candidates_in_thread = [min_size, avg_size, max_size]
   (std::vector<uint8_t>&& segment_data, uint64_t segment_start_offset, bool is_eof_segment, bool is_first_segment) {
-    std::vector<uint32_t> cut_point_candidates;
+    std::vector<CutPointCandidate> cut_point_candidates;
     std::vector<std::vector<uint32_t>> cut_point_candidates_features;
     if (use_feature_extraction) {
-      std::tie(cut_point_candidates, cut_point_candidates_features) = find_cdc_cut_candidates<true>(segment_data, min_size, avg_size, max_size, is_eof_segment, is_first_segment);
+      std::tie(cut_point_candidates, cut_point_candidates_features) = find_cdc_cut_candidates<true>(segment_data, min_size, avg_size, max_size, is_first_segment);
     }
     else {
-      std::tie(cut_point_candidates, std::ignore) = find_cdc_cut_candidates<false>(segment_data, min_size, avg_size, max_size, is_eof_segment, is_first_segment);
+      std::tie(cut_point_candidates, std::ignore) = find_cdc_cut_candidates<false>(segment_data, min_size, avg_size, max_size, is_first_segment);
     }
     return std::tuple(std::move(cut_point_candidates), std::move(cut_point_candidates_features), std::move(segment_data), segment_start_offset, is_eof_segment);
   };
