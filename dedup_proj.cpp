@@ -35,6 +35,9 @@
 #include <ranges>
 #include <stack>
 #include <unordered_set>
+#include <thread>
+
+#include <immintrin.h>
 
 #include "contrib/bitstream.h"
 #include "contrib/stream.h"
@@ -129,7 +132,7 @@ namespace constants {
   // Largest acceptable value for the maximum chunk size.
   static constexpr uint32_t MAXIMUM_MAX = 1'073'741'824;
 
-  static constexpr uint32_t GEAR[256] = {
+  static constexpr alignas(16) uint32_t GEAR[256] = {
     0,          574654857,  759734804,  310648967,  1393527547, 1195718329,
     694400241,  1154184075, 1319583805, 1298164590, 122602963,  989043992,
     1918895050, 933636724,  1369634190, 1963341198, 1565176104, 1296753019,
@@ -291,110 +294,396 @@ struct CutPointCandidate {
   uint32_t offset;
 };
 
-namespace fastcdc {
-  template<
-    bool compute_features,
-    typename ReturnType = std::conditional_t<
-      compute_features,
-      std::tuple<CutPointCandidate, uint32_t, std::vector<uint32_t>>,
-      std::tuple<CutPointCandidate, uint32_t>
-    >
+template<
+  bool compute_features,
+  typename ReturnType = std::conditional_t<
+    compute_features,
+    std::tuple<CutPointCandidate, uint32_t, std::vector<uint32_t>>,
+    std::tuple<CutPointCandidate, uint32_t>
   >
-  ReturnType cdc_offset(
-    const std::span<uint8_t> data,
-    uint32_t min_size,
-    uint32_t avg_size,
-    uint32_t max_size,
-    uint32_t mask_s,
-    uint32_t mask_l,
-    uint32_t initial_pattern = 0
-  ) {
-    uint32_t pattern = initial_pattern;
-    uint32_t size = data.size();
-    uint32_t barrier = std::min(avg_size, size);
-    uint32_t i = std::min(barrier, min_size);
+>
+ReturnType cdc_next_offset(
+  const std::span<uint8_t> data,
+  uint32_t min_size,
+  uint32_t avg_size,
+  uint32_t max_size,
+  uint32_t mask_s,
+  uint32_t mask_l,
+  uint32_t initial_pattern = 0
+) {
+  uint32_t pattern = initial_pattern;
+  uint32_t size = data.size();
+  uint32_t barrier = std::min(avg_size, size);
+  uint32_t i = std::min(barrier, min_size);
 
-    std::conditional_t<compute_features, std::vector<uint32_t>, std::monostate> features;
+  std::conditional_t<compute_features, std::vector<uint32_t>, std::monostate> features;
 
-    // SuperCDC's even easier "backup mask" and backup result, if mask_l fails to find a cutoff point before the max_size we use the backup result
-    // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
-    // which helps better preserve the content defined nature of chunks and thus increase dedup ratios.
-    std::optional<uint32_t> backup_i{};
-    uint32_t mask_b = mask_l >> 1;
+  // SuperCDC's even easier "backup mask" and backup result, if mask_l fails to find a cutoff point before the max_size we use the backup result
+  // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
+  // which helps better preserve the content defined nature of chunks and thus increase dedup ratios.
+  std::optional<uint32_t> backup_i{};
+  uint32_t mask_b = mask_l >> 1;
 
-    // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
-    // the content defined nature of the Hashes.
-    // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
-    uint32_t remaining_minmax_adjustment = std::min<uint32_t>(i, 31);
-    i -= remaining_minmax_adjustment;
+  // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
+  // the content defined nature of the Hashes.
+  // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
+  uint32_t remaining_minmax_adjustment = std::min<uint32_t>(i, 31);
+  i -= remaining_minmax_adjustment;
 
-    while (i < barrier) {
-      pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (remaining_minmax_adjustment > 0) {
-        remaining_minmax_adjustment--;
-        i++;
-        continue;
-      }
-      if (!(pattern & mask_s)) {
-        if constexpr (compute_features) {
-          return { {.type = CutPointCandidateType::HARD_CUT_MASK, .offset = i }, pattern, features };
-        }
-        else {
-          return { {.type = CutPointCandidateType::HARD_CUT_MASK, .offset = i }, pattern };
-        }
-      }
-      if constexpr (compute_features) {
-        if (!(pattern & constants::CDS_SAMPLING_MASK)) {
-          if (features.empty()) {
-            features.resize(16);
-            features.shrink_to_fit();
-          }
-          for (int feature_i = 0; feature_i < 16; feature_i++) {
-            const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
-            features[feature_i] = std::max<uint32_t>(features[feature_i], (mi * pattern + ai) % (1LL << 32));
-          }
-        }
-      }
+  while (i < barrier) {
+    pattern = (pattern >> 1) + constants::GEAR[data[i]];
+    if (remaining_minmax_adjustment > 0) {
+      remaining_minmax_adjustment--;
       i++;
+      continue;
     }
-    barrier = std::min(max_size, size);
-    while (i < barrier) {
-      pattern = (pattern >> 1) + constants::GEAR[data[i]];
-      if (!(pattern & mask_l)) {
-        if constexpr (compute_features) {
-          return { {.type = CutPointCandidateType::EASY_CUT_MASK, .offset = i }, pattern, features };
-        }
-        else {
-          return { {.type = CutPointCandidateType::EASY_CUT_MASK, .offset = i }, pattern };
-        }
-      }
-      if (!backup_i.has_value() && !(pattern & mask_b)) backup_i = i;
+    if (!(pattern & mask_s)) {
       if constexpr (compute_features) {
-        if (!(pattern & constants::CDS_SAMPLING_MASK)) {
-          if (features.empty()) {
-            features.resize(16);
-            features.shrink_to_fit();
-          }
-          for (int feature_i = 0; feature_i < 16; feature_i++) {
-            const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
-            features[feature_i] = std::max<uint32_t>(features[feature_i], (mi * pattern + ai) % (1LL << 32));
-          }
-        }
+        return { {.type = CutPointCandidateType::HARD_CUT_MASK, .offset = i }, pattern, features };
       }
-      i++;
-    }
-    CutPointCandidate result_i;
-    if (backup_i.has_value()) {
-      result_i = { .type = CutPointCandidateType::SUPERCDC_BACKUP_MASK, .offset = *backup_i };
-    }
-    else {
-      result_i = { .type = CutPointCandidateType::EOF_CUT, .offset = i };
+      else {
+        return { {.type = CutPointCandidateType::HARD_CUT_MASK, .offset = i }, pattern };
+      }
     }
     if constexpr (compute_features) {
-      return { result_i, pattern, features };
+      if (!(pattern & constants::CDS_SAMPLING_MASK)) {
+        if (features.empty()) {
+          features.resize(16);
+          features.shrink_to_fit();
+        }
+        for (int feature_i = 0; feature_i < 16; feature_i++) {
+          const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
+          features[feature_i] = std::max<uint32_t>(features[feature_i], (mi * pattern + ai) % (1LL << 32));
+        }
+      }
+    }
+    i++;
+  }
+  barrier = std::min(max_size, size);
+  while (i < barrier) {
+    pattern = (pattern >> 1) + constants::GEAR[data[i]];
+    if (!(pattern & mask_l)) {
+      if constexpr (compute_features) {
+        return { {.type = CutPointCandidateType::EASY_CUT_MASK, .offset = i }, pattern, features };
+      }
+      else {
+        return { {.type = CutPointCandidateType::EASY_CUT_MASK, .offset = i }, pattern };
+      }
+    }
+    if (!backup_i.has_value() && !(pattern & mask_b)) backup_i = i;
+    if constexpr (compute_features) {
+      if (!(pattern & constants::CDS_SAMPLING_MASK)) {
+        if (features.empty()) {
+          features.resize(16);
+          features.shrink_to_fit();
+        }
+        for (int feature_i = 0; feature_i < 16; feature_i++) {
+          const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
+          features[feature_i] = std::max<uint32_t>(features[feature_i], (mi * pattern + ai) % (1LL << 32));
+        }
+      }
+    }
+    i++;
+  }
+  CutPointCandidate result_i;
+  if (backup_i.has_value()) {
+    result_i = { .type = CutPointCandidateType::SUPERCDC_BACKUP_MASK, .offset = *backup_i };
+  }
+  else {
+    result_i = { .type = CutPointCandidateType::EOF_CUT, .offset = i };
+  }
+  if constexpr (compute_features) {
+    return { result_i, pattern, features };
+  }
+  else {
+    return { result_i, pattern };
+  }
+}
+
+// Precondition: Chunk invariance condition satisfied
+template<
+  bool compute_features,
+  typename CandidateFeaturesResult = std::conditional_t<compute_features, std::vector<std::vector<uint32_t>>, std::monostate>
+>
+void cdc_find_cut_points_with_invariance(
+  std::vector<CutPointCandidate>& candidates,
+  CandidateFeaturesResult& candidate_features,
+  std::span<uint8_t> data,
+  uint64_t base_offset,
+  uint32_t min_size,
+  uint32_t avg_size,
+  uint32_t max_size,
+  uint32_t mask_s,
+  uint32_t mask_l,
+  uint32_t initial_pattern = 0
+) {
+  std::array<std::vector<uint32_t>, 8> lane_results{};
+  std::array<CandidateFeaturesResult, 8> lane_features_results{};
+  std::array<std::vector<uint32_t>, 8> lane_current_features{};
+
+  std::array<bool, 8> lane_achieved_chunk_invariance { true, false, false, false, false, false, false, false};
+  __m256i mask_s_vec = _mm256_set1_epi32(static_cast<int>(mask_s));
+  __m256i mask_l_vec = _mm256_set1_epi32(static_cast<int>(mask_l));
+  __m256i cmask = _mm256_set1_epi32(0xff);
+  __m256i hash = _mm256_set1_epi32(0);
+  const __m256i zero_vec = _mm256_set1_epi32(0);
+  const __m256i ones_vec = _mm256_set1_epi32(1);
+  const __m256i window_size_minus_one_vec = _mm256_set1_epi32(31);
+
+  uint32_t bytes_per_lane = data.size() / 8;
+  __m256i vindex = _mm256_setr_epi32(0, bytes_per_lane, 2 * bytes_per_lane, 3 * bytes_per_lane, 4 * bytes_per_lane, 5 * bytes_per_lane, 6 * bytes_per_lane, 7 * bytes_per_lane);
+
+  // This vector has the max allowed size for each lane's current chunk, we start at the maximum int to essentially disable max size chunks, they are set as soon
+  // as chunk invariant condition is satisfied, and from then on after starting a new chunk
+  __m256i max_size_vec = _mm256_set1_epi32(std::numeric_limits<int>::max());
+  __m256i avg_size_vec = _mm256_set1_epi32(std::numeric_limits<int>::max());
+
+  vindex.m256i_i32[0] = min_size;
+
+  // For each lane, the last index they are allowed to access
+  __m256i vindex_max = _mm256_add_epi32(vindex, _mm256_set1_epi32(bytes_per_lane));
+  vindex_max.m256i_i32[7] = data.size();
+  // Because we read 4bytes at a time we need to ensure we are not reading past the data end
+  __m256i vindex_max_avx2 = vindex_max;
+  vindex_max_avx2.m256i_i32[7] -= 4;
+
+  // SuperCDC's even easier "backup mask" and backup result, if mask_l fails to find a cutoff point before the max_size we use the backup result
+  // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
+  // which helps better preserve the content defined nature of chunks and thus increase dedup ratios.
+  __m256i mask_b_vec = _mm256_set1_epi32(static_cast<int>(mask_l >> 1));
+  __m256i backup_cut_vec = max_size_vec;
+
+  // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
+  // the content defined nature of the Hashes.
+  // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
+  __m256i minmax_adjustment_vec = window_size_minus_one_vec;
+  vindex = _mm256_sub_epi32(vindex, window_size_minus_one_vec);
+  // HACK FOR REALLY LOW min_size
+  if (vindex.m256i_i32[0] < 0) {
+    vindex.m256i_i32[0] = 0;
+    minmax_adjustment_vec.m256i_i32[0] = 0;
+  }
+
+  __m256i cds_mask_vec = _mm256_set1_epi32(constants::CDS_SAMPLING_MASK);
+
+  uint32_t pattern = 0;
+
+  int lane_not_marked_for_jump = 0b11111111;
+  __m256i jump_vec = zero_vec;
+
+  auto process_lane = [&lane_results, &lane_achieved_chunk_invariance, &min_size, &avg_size, &max_size, &bytes_per_lane, &vindex, &vindex_max,
+  &lane_not_marked_for_jump, &jump_vec, &avg_size_vec, &max_size_vec, &backup_cut_vec, &lane_features_results, &lane_current_features]
+  (uint32_t lane_i, uint32_t pos) {
+    // Lane already finished, and we are on a pos for another lane (or after data end)!
+    if (pos >= static_cast<uint32_t>(vindex_max.m256i_i32[lane_i])) return;
+      
+    if (lane_achieved_chunk_invariance[lane_i]) {
+      if (lane_results[lane_i].empty()) {
+        if (pos >= lane_i * bytes_per_lane + min_size) {
+          if (pos == max_size_vec.m256i_i32[lane_i] && pos > backup_cut_vec.m256i_i32[lane_i]) {
+            pos = backup_cut_vec.m256i_i32[lane_i];
+            vindex.m256i_i32[lane_i] = 0;  // We jump to a prior position so we set a lower idx such that _mm256_max_epi32 is able to use it for jump
+          }
+          lane_results[lane_i].emplace_back(pos);
+          if constexpr (compute_features) {
+            lane_features_results[lane_i].emplace_back(std::move(lane_current_features[lane_i]));
+            lane_current_features[lane_i] = std::vector<uint32_t>();
+          }
+          max_size_vec.m256i_i32[lane_i] = pos + max_size;
+          avg_size_vec.m256i_i32[lane_i] = pos + avg_size;
+          lane_not_marked_for_jump ^= (0b1 << lane_i);
+          jump_vec.m256i_i32[lane_i] = pos + min_size - 31;
+        }
+      }
+      else {
+        const auto dist_with_prev = pos - lane_results[lane_i].back();
+        if (dist_with_prev >= min_size) {
+          if (pos == max_size_vec.m256i_i32[lane_i] && pos > backup_cut_vec.m256i_i32[lane_i]) {
+            pos = backup_cut_vec.m256i_i32[lane_i];
+            vindex.m256i_i32[lane_i] = 0;  // We jump to a prior position so we set a lower idx such that _mm256_max_epi32 is able to use it for jump
+          }
+          lane_results[lane_i].emplace_back(pos);
+          if constexpr (compute_features) {
+            lane_features_results[lane_i].emplace_back(std::move(lane_current_features[lane_i]));
+            lane_current_features[lane_i] = std::vector<uint32_t>();
+          }
+          max_size_vec.m256i_i32[lane_i] = pos + max_size;
+          avg_size_vec.m256i_i32[lane_i] = pos + avg_size;
+          lane_not_marked_for_jump ^= (0b1 << lane_i);
+          jump_vec.m256i_i32[lane_i] = pos + min_size - 31;
+        }
+      }
     }
     else {
-      return { result_i, pattern };
+      if (!lane_results[lane_i].empty()) {
+        // if this happens this lane is back in sync with non-segmented processing!
+        const auto dist_with_prev = pos - lane_results[lane_i].back();
+        if (dist_with_prev >= min_size && (dist_with_prev + min_size <= max_size)) {
+          lane_achieved_chunk_invariance[lane_i] = true;
+          max_size_vec.m256i_i32[lane_i] = pos + max_size;
+          avg_size_vec.m256i_i32[lane_i] = pos + avg_size;
+          lane_not_marked_for_jump ^= (0b1 << lane_i);
+          jump_vec.m256i_i32[lane_i] = pos + min_size - 31;
+        }
+      }
+      lane_results[lane_i].emplace_back(pos);
+      if constexpr (compute_features) {
+        lane_features_results[lane_i].emplace_back(std::move(lane_current_features[lane_i]));
+        lane_current_features[lane_i] = std::vector<uint32_t>();
+      }
+    }
+  };
+
+  auto sample_feature_value = [&lane_current_features](uint32_t lane_i, uint32_t pattern) {
+    if (lane_current_features[lane_i].empty()) {
+      lane_current_features[lane_i].resize(16);
+      lane_current_features[lane_i].shrink_to_fit();
+    }
+    for (int feature_i = 0; feature_i < 16; feature_i++) {
+      const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
+      lane_current_features[lane_i][feature_i] = std::max<uint32_t>(lane_current_features[lane_i][feature_i], (mi * pattern + ai) % (1LL << 32));
+    }
+  };
+
+  while (true) {
+    vindex = _mm256_min_epi32(vindex, vindex_max_avx2);
+    __m256i is_finish_vec = _mm256_cmpgt_epi32(vindex_max_avx2, vindex);
+    __m256 is_finish_vec_ps = _mm256_castsi256_ps(is_finish_vec);
+    int is_lane_not_finished = _mm256_movemask_ps(is_finish_vec_ps);
+    // If all lanes are finished we break, else we continue and lanes that are already finished will ignore results
+    if (is_lane_not_finished == 0) break;
+
+    __m256i cbytes = _mm256_i32gather_epi32(reinterpret_cast<int const*>(data.data()), vindex, 1);
+
+    uint32_t j = 0;
+    while (j < 4) {
+      hash = _mm256_srli_epi32(hash, 1);  // Shift all the hash values for each lane at the same time
+      __m256i idx = _mm256_and_epi32(cbytes, cmask);  // Get byte on the lower bits of the packed 32bit lanes
+      cbytes = _mm256_srli_epi32(cbytes, 8);  // We already got the byte on the lower bits, we can shift right to later get the next byte
+      // This gives us the GEAR hash values for each of the bytes we just got, scale by 4 because 32bits=4bytes
+      __m256i tentry = _mm256_i32gather_epi32(reinterpret_cast<int const*>(constants::GEAR), idx, 4);
+      hash = _mm256_add_epi32(hash, tentry);  // Add the values we got from the GEAR hash values to the values on the hash
+
+      // For each lane if we are at avg_size or higher we use the easier mask_l condition
+      __m256i avg_size_hit = _mm256_cmpgt_epi32(vindex, avg_size_vec);
+      __m256 mask_vec = _mm256_blendv_ps(_mm256_castsi256_ps(mask_s_vec), _mm256_castsi256_ps(mask_l_vec), _mm256_castsi256_ps(avg_size_hit));
+
+      // Compare each packed int by bitwise AND with the mask and checking that its 0
+      __m256i hash_masked = _mm256_and_epi32(hash, _mm256_castps_si256(mask_vec));
+      __m256i hash_eq_mask = _mm256_cmpeq_epi32(hash_masked, zero_vec);
+      __m256 hash_eq_mask_ps = _mm256_castsi256_ps(hash_eq_mask);
+
+      // For the lanes that the backup cut condition is satisfied, update it if there is not a prior backup already
+      __m256i hash_backup_masked = _mm256_and_epi32(hash, mask_b_vec);
+      __m256i hash_backup_eq_mask = _mm256_cmpeq_epi32(hash_backup_masked, zero_vec);
+      // If the lane is marked for jump then the backup cut point has been updated for the new maximum after the jump, don't touch it
+      auto lane_not_marked_for_jump_vec = _mm256_setr_epi32(
+        lane_not_marked_for_jump & 0b00000001 ? 0xFFFFFFFF : 0,
+        lane_not_marked_for_jump & 0b00000010 ? 0xFFFFFFFF : 0,
+        lane_not_marked_for_jump & 0b00000100 ? 0xFFFFFFFF : 0,
+        lane_not_marked_for_jump & 0b00001000 ? 0xFFFFFFFF : 0,
+        lane_not_marked_for_jump & 0b00010000 ? 0xFFFFFFFF : 0,
+        lane_not_marked_for_jump & 0b00100000 ? 0xFFFFFFFF : 0,
+        lane_not_marked_for_jump & 0b01000000 ? 0xFFFFFFFF : 0,
+        lane_not_marked_for_jump & 0b10000000 ? 0xFFFFFFFF : 0
+      );
+      hash_backup_eq_mask = _mm256_and_epi32(hash_backup_eq_mask, lane_not_marked_for_jump_vec);
+      // Backup mask should not be used until after avg_size is hit
+      hash_backup_eq_mask = _mm256_and_epi32(hash_backup_eq_mask, avg_size_hit);
+      __m256 new_backup_cut_vec_ps = _mm256_blendv_ps(_mm256_castsi256_ps(backup_cut_vec), _mm256_castsi256_ps(vindex), _mm256_castsi256_ps(hash_backup_eq_mask));
+      backup_cut_vec = _mm256_min_epi32(backup_cut_vec, _mm256_castps_si256(new_backup_cut_vec_ps));
+
+      __m256i minmax_adjustment_ready = _mm256_cmpgt_epi32(ones_vec, minmax_adjustment_vec);
+      __m256 minmax_adjustment_ready_mask_ps = _mm256_castsi256_ps(minmax_adjustment_ready);
+
+      __m256i max_size_hit = _mm256_cmpeq_epi32(max_size_vec, vindex);
+      __m256 max_size_hit_mask_ps = _mm256_castsi256_ps(max_size_hit);
+
+      if constexpr (compute_features) {
+        // Check if content defined sampling condition is satisfied and we should sample feature values for some lane
+        __m256i hash_cds_masked = _mm256_and_epi32(hash, cds_mask_vec);
+        __m256i hash_cds_eq_vmask = _mm256_cmpeq_epi32(hash_cds_masked, zero_vec);
+        // Ensure lane is not ready for jump or still doing min-max adjustment, in any of those cases we shouldn't sample
+        hash_cds_eq_vmask = _mm256_and_epi32(hash_cds_eq_vmask, lane_not_marked_for_jump_vec);
+        hash_cds_eq_vmask = _mm256_and_epi32(hash_cds_eq_vmask, minmax_adjustment_ready);
+        int hash_cds_eq_mask = _mm256_movemask_ps(_mm256_castsi256_ps(hash_cds_eq_vmask));
+
+        if (hash_cds_eq_mask != 0) {
+          if (hash_cds_eq_mask & 0b00000001) sample_feature_value(0, hash.m256i_i32[0]);
+          if (hash_cds_eq_mask & 0b00000010) sample_feature_value(1, hash.m256i_i32[1]);
+          if (hash_cds_eq_mask & 0b00000100) sample_feature_value(2, hash.m256i_i32[2]);
+          if (hash_cds_eq_mask & 0b00001000) sample_feature_value(3, hash.m256i_i32[3]);
+          if (hash_cds_eq_mask & 0b00010000) sample_feature_value(4, hash.m256i_i32[4]);
+          if (hash_cds_eq_mask & 0b00100000) sample_feature_value(5, hash.m256i_i32[5]);
+          if (hash_cds_eq_mask & 0b01000000) sample_feature_value(6, hash.m256i_i32[6]);
+          if (hash_cds_eq_mask & 0b10000000) sample_feature_value(7, hash.m256i_i32[7]);
+        }
+      }
+
+      int lane_has_result = is_lane_not_finished &
+        lane_not_marked_for_jump &
+        _mm256_movemask_ps(minmax_adjustment_ready_mask_ps) &
+        (_mm256_movemask_ps(hash_eq_mask_ps) | _mm256_movemask_ps(max_size_hit_mask_ps));
+
+      if (lane_has_result != 0) {
+        if (lane_has_result & 0b00000001) process_lane(0, vindex.m256i_i32[0]);
+        if (lane_has_result & 0b00000010) process_lane(1, vindex.m256i_i32[1]);
+        if (lane_has_result & 0b00000100) process_lane(2, vindex.m256i_i32[2]);
+        if (lane_has_result & 0b00001000) process_lane(3, vindex.m256i_i32[3]);
+        if (lane_has_result & 0b00010000) process_lane(4, vindex.m256i_i32[4]);
+        if (lane_has_result & 0b00100000) process_lane(5, vindex.m256i_i32[5]);
+        if (lane_has_result & 0b01000000) process_lane(6, vindex.m256i_i32[6]);
+        if (lane_has_result & 0b10000000) process_lane(7, vindex.m256i_i32[7]);
+      }
+
+      minmax_adjustment_vec = _mm256_sub_epi32(minmax_adjustment_vec, ones_vec);
+
+      ++j;
+      vindex = _mm256_add_epi32(vindex, ones_vec);  // advance 1 byte in the data for each lane
+    }
+
+    if (lane_not_marked_for_jump != 0b11111111) {
+      vindex = _mm256_max_epi32(vindex, jump_vec);
+
+      if (!(lane_not_marked_for_jump & 0b00000001)) { minmax_adjustment_vec.m256i_i32[0] = 31; backup_cut_vec.m256i_i32[0] = max_size_vec.m256i_i32[0]; }
+      if (!(lane_not_marked_for_jump & 0b00000010)) { minmax_adjustment_vec.m256i_i32[1] = 31; backup_cut_vec.m256i_i32[1] = max_size_vec.m256i_i32[1]; }
+      if (!(lane_not_marked_for_jump & 0b00000100)) { minmax_adjustment_vec.m256i_i32[2] = 31; backup_cut_vec.m256i_i32[2] = max_size_vec.m256i_i32[2]; }
+      if (!(lane_not_marked_for_jump & 0b00001000)) { minmax_adjustment_vec.m256i_i32[3] = 31; backup_cut_vec.m256i_i32[3] = max_size_vec.m256i_i32[3]; }
+      if (!(lane_not_marked_for_jump & 0b00010000)) { minmax_adjustment_vec.m256i_i32[4] = 31; backup_cut_vec.m256i_i32[4] = max_size_vec.m256i_i32[4]; }
+      if (!(lane_not_marked_for_jump & 0b00100000)) { minmax_adjustment_vec.m256i_i32[5] = 31; backup_cut_vec.m256i_i32[5] = max_size_vec.m256i_i32[5]; }
+      if (!(lane_not_marked_for_jump & 0b01000000)) { minmax_adjustment_vec.m256i_i32[6] = 31; backup_cut_vec.m256i_i32[6] = max_size_vec.m256i_i32[6]; }
+      if (!(lane_not_marked_for_jump & 0b10000000)) { minmax_adjustment_vec.m256i_i32[7] = 31; backup_cut_vec.m256i_i32[7] = max_size_vec.m256i_i32[7]; }
+
+      jump_vec = zero_vec;
+      lane_not_marked_for_jump = 0b11111111;
+    }
+  }
+
+  auto i = vindex.m256i_i32[7];
+  pattern = hash.m256i_i32[7];  // Recover hash value from last lane
+  // Deal with any trailing data sequentially
+  while (i < data.size()) {
+    pattern = (pattern >> 1) + constants::GEAR[data[i]];
+    if (!(pattern & mask_l)) process_lane(7, i);
+    ++i;
+  }
+
+  for (uint64_t lane = 0; lane < 8; lane++) {
+    auto& cut_points_list = lane_results[lane];
+    for (uint64_t n = 0; n < cut_points_list.size(); n++) {
+      auto& cut_point_offset = cut_points_list[n];
+      candidates.emplace_back(CutPointCandidateType::EASY_CUT_MASK, base_offset + cut_point_offset);
+      if constexpr (compute_features) {
+        candidate_features.emplace_back(std::move(lane_features_results[lane][n]));
+      }
+    }
+  }
+
+  if (candidates.empty() || candidates.back().offset != base_offset + data.size()) {
+    // TODO: EOF_CUT and MAX_SIZE_CUT ARE THE SAME? SHOULDNT THEY BE DIFFERENT?
+    candidates.emplace_back(CutPointCandidateType::EOF_CUT, base_offset + data.size());
+    if constexpr (compute_features) {
+      candidate_features.emplace_back();
     }
   }
 }
@@ -414,7 +703,7 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
   const auto mask_s = utility::mask(bits + 1);
   const auto mask_l = utility::mask(bits - 1);
 
-  using cdc_offset_return_type = typename decltype(std::function{ fastcdc::cdc_offset<compute_features> })::result_type;
+  using cdc_offset_return_type = typename decltype(std::function{ cdc_next_offset<compute_features> })::result_type;
 
   cdc_offset_return_type cdc_return{};
   uint32_t base_offset = 0;
@@ -423,7 +712,7 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
 
   // If this is not the first segment then we need to deal with the previous segment extended data and attempt to recover chunk invariance
   if (!is_first_segment) {
-    std::tie(cp, pattern) = fastcdc::cdc_offset<false>(data, 0, avg_size - 1, 4294967295, mask_s, mask_l, pattern);
+    std::tie(cp, pattern) = cdc_next_offset<false>(data, 0, avg_size - 1, 4294967295, mask_s, mask_l, pattern);
 
     base_offset += cp.offset;
     candidates.emplace_back(cp.type, base_offset);
@@ -438,7 +727,7 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
     // As soon as we find that we can break from here and keep processing as if we were processing without segments,
     // which in particular means we can exploit jumps to min_size again.
     while (!data.empty()) {
-      std::tie(cp, pattern) = fastcdc::cdc_offset<false>(std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_s, mask_l, pattern);
+      std::tie(cp, pattern) = cdc_next_offset<false>(std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_s, mask_l, pattern);
       cp.offset = cp.offset + 1;
 
       base_offset += cp.offset;
@@ -451,21 +740,26 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
     }
   }
 
-  while (!data.empty()) {
-    if (base_offset == 0) {
-      cdc_return = fastcdc::cdc_offset<compute_features>(data, min_size, avg_size, max_size, mask_s, mask_l, pattern);
-    }
-    else {
-      cdc_return = fastcdc::cdc_offset<compute_features>(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, pattern);
-      cp.offset = cp.offset + 1;
-    }
+  if (data.size() < 1024) {
+    while (!data.empty()) {
+      if (base_offset == 0) {
+        cdc_return = cdc_next_offset<compute_features>(data, min_size, avg_size, max_size, mask_s, mask_l, pattern);
+      }
+      else {
+        cdc_return = cdc_next_offset<compute_features>(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, pattern);
+        cp.offset = cp.offset + 1;
+      }
 
-    base_offset += cp.offset;
-    candidates.emplace_back(cp.type, base_offset);
-    if constexpr (compute_features) {
-      candidate_features.emplace_back(std::move(std::get<2>(cdc_return)));
+      base_offset += cp.offset;
+      candidates.emplace_back(cp.type, base_offset);
+      if constexpr (compute_features) {
+        candidate_features.emplace_back(std::move(std::get<2>(cdc_return)));
+      }
+      data = std::span(data.data() + cp.offset, data.size() - cp.offset);
     }
-    data = std::span(data.data() + cp.offset, data.size() - cp.offset);
+  }
+  else {
+    cdc_find_cut_points_with_invariance<compute_features>(candidates, candidate_features, data, base_offset, min_size, avg_size, max_size, mask_s, mask_l, pattern);
   }
 
   if constexpr (compute_features) {
@@ -474,9 +768,6 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
   candidates.shrink_to_fit();
   return result;
 }
-
-#include <immintrin.h>
-#include <thread>
 
 __m256i movemask_inverse_epi8(const uint32_t mask) {
   __m256i vmask(_mm256_set1_epi32(mask));
@@ -541,9 +832,12 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
   auto& minichunks_vec = std::get<1>(return_val);
 
   // Find the CDC minichunks and update the SimHash with their data
-  auto [cut_offsets, cut_offsets_features] = find_cdc_cut_candidates<false>(std::span(data, data_len), chunk_size / 2, chunk_size, chunk_size * 2);
+  const auto min_chunk_size = chunk_size / 2;
+  auto [cut_offsets, cut_offsets_features] = find_cdc_cut_candidates<false>(std::span(data, data_len), min_chunk_size, chunk_size, chunk_size * 2);
   uint32_t previous_offset = 0;
   for (const auto& cut_point_candidate : cut_offsets) {
+    if (cut_point_candidate.offset <= previous_offset) continue;
+    if (cut_point_candidate.offset < previous_offset + min_chunk_size && cut_point_candidate.offset != data_len) continue;
     const auto minichunk_len = cut_point_candidate.offset - previous_offset;
     // Calculate hash for current chunk
     const std::bitset<64> chunk_hash = XXH3_64bits(data + previous_offset, minichunk_len);
@@ -1584,7 +1878,7 @@ class circular_vector_debug {
   void check_instructions_equal(const T& instruction1, const T& instruction2) const {
     if (instruction1 != instruction2) {
       print_to_console("CHORI\n");
-      exit(1);
+      throw std::runtime_error("La chorificacion");
     }
   }
 
@@ -1617,7 +1911,7 @@ class circular_vector_debug {
       !deque_iter1_is_cend && vec_iter1_is_cend
       ) {
       print_to_console("CHORI\n");
-      exit(1);
+      throw std::runtime_error("La chorificacion");
     }
     if (deque_iter1 == deque_end || deque_iter1 == deque_cend) return;
     auto& instruction1 = *deque_iter1;
@@ -1630,7 +1924,7 @@ class circular_vector_debug {
     auto vec_size = instructions_vec.size();
     if (deque_size != vec_size) {
       print_to_console("CHORI\n");
-      exit(1);
+      throw std::runtime_error("La chorificacion");
     }
 
     if (deque_size == 0) return;
@@ -1724,7 +2018,7 @@ public:
     auto vec_size = instructions_vec.size();
     if (deque_size != vec_size) {
       print_to_console("CHORI\n");
-      exit(1);
+      throw std::runtime_error("La chorificacion");
     }
     paranoid_check();
     return deque_size;
@@ -1823,7 +2117,7 @@ std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<ut
 #ifndef NDEBUG
   if (chunk->offset + chunk_pos != offset || chunk_pos >= chunk->chunk_data->data.size()) {
     print_to_console("get_chunk_i_and_pos_for_offset() found incorrect chunk_i and pos at offset: " + std::to_string(offset) + "\n");
-    exit(1);
+    throw std::runtime_error("La chorificacion");
   }
 #endif
 
@@ -1863,7 +2157,7 @@ class LZInstructionManager {
 #ifndef NDEBUG
     if (instruction_chunk->offset + instruction_chunk_pos != instruction.offset - 1) {
       print_to_console("BACKWARD MATCH EXTENSION NEW INSTRUCTION OFFSET MISMATCH\n");
-      exit(1);
+      throw std::runtime_error("La chorificacion");
     }
 #endif
 
@@ -1887,7 +2181,7 @@ class LZInstructionManager {
 #ifndef NDEBUG
       if (prevInstruction_chunk->offset + prevInstruction_chunk_pos != extended_instruction_offset - 1) {
         print_to_console("BACKWARD MATCH EXTENSION PREVIOUS INSTRUCTION OFFSET MISMATCH\n");
-        exit(1);
+        throw std::runtime_error("La chorificacion");
       }
 #endif
 
@@ -1989,7 +2283,7 @@ class LZInstructionManager {
 #ifndef NDEBUG
       if (instruction_chunk->offset + instruction_chunk_pos != instruction.offset || instruction_chunk_pos >= instruction_chunk->chunk_data->data.size()) {
         print_to_console("HERE WE GO LA CAGAMOU!\n");
-        exit(1);
+        throw std::runtime_error("La chorificacion");
       }
 #endif
 
@@ -2067,7 +2361,7 @@ public:
 #ifndef NDEBUG
     if (instruction.type == LZInstructionType::INSERT && instruction.offset != current_offset) {
       print_to_console("INSERT LZInstruction added is not at current offset!");
-      exit(1);
+      throw std::runtime_error("La chorificacion");
     }
 #endif
     if (instructions.size() == 0) {
@@ -2105,7 +2399,7 @@ public:
         // Ensure data matches
         if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), prevInstruction->size) != 0) {
           print_to_console("Error while verifying addInstruction prevInstruction at offset " + std::to_string(current_offset) + "\n");
-          exit(1);
+          throw std::runtime_error("La chorificacion");
         }
 
         verify_buffer_orig_data.resize(instruction.size);
@@ -2119,7 +2413,7 @@ public:
         // Ensure data matches
         if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), instruction.size) != 0) {
           print_to_console("Error while verifying addInstruction instruction at offset " + std::to_string(current_offset) + "\n");
-          exit(1);
+          throw std::runtime_error("La chorificacion");
         }
       }
 
@@ -2203,7 +2497,7 @@ public:
         // Ensure data matches
         if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), data_count) != 0) {
           print_to_console("Error while verifying addInstruction at offset " + std::to_string(current_offset) + "\n");
-          exit(1);
+          throw std::runtime_error("La chorificacion");
         }
       }
 
@@ -2286,7 +2580,7 @@ public:
           if (std::memcmp(verify_buffer.data(), buffer.data(), instruction.size) != 0) {
             print_to_console("Error while verifying outputted match at offset " + std::to_string(outputted_up_to_offset) + "\n");
             print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
-            exit(1);
+            throw std::runtime_error("La chorificacion");
           }
 
           /*
@@ -2321,20 +2615,20 @@ public:
             if (std::memcmp(curr_chunk_data, verify_buffer_ptr, cmp_size) != 0) {
               print_to_console("ERROR ON CURR CHUNK DATA!\n");
               print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
-              exit(1);
+              throw std::runtime_error("La chorificacion");
             }
             verify_buffer_ptr += cmp_size;
             if (std::memcmp(copy_chunk_data, buffer_ptr, cmp_size) != 0) {
               print_to_console("ERROR ON COPY CHUNK DATA!\n");
               print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
-              exit(1);
+              throw std::runtime_error("La chorificacion");
             }
             buffer_ptr += cmp_size;
 
             if (std::memcmp(copy_chunk_data, curr_chunk_data, cmp_size) != 0) {
               print_to_console("Error while verifying outputted match with chunk data at offset " + std::to_string(outputted_up_to_offset) + "\n");
               print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
-              exit(1);
+              throw std::runtime_error("La chorificacion");
             }
             remaining_size -= cmp_size;
             copy_instruction_chunk_pos += cmp_size;
@@ -2367,8 +2661,7 @@ void select_cut_point_candidates(
   uint32_t min_size,
   uint32_t max_size,
   bool segments_eof,
-  bool use_feature_extraction,
-  std::optional<uint64_t> minimum_allowed_cut_point = std::nullopt
+  bool use_feature_extraction
 ) {
   if (!segments_eof && !new_cut_point_candidates.empty() && new_cut_point_candidates.back().type == CutPointCandidateType::EOF_CUT) {
     new_cut_point_candidates.pop_back();
@@ -2421,7 +2714,6 @@ void select_cut_point_candidates(
 
   for (uint64_t i = 0; i < new_cut_point_candidates.size(); i++) {
     auto& cut_point_candidate = new_cut_point_candidates[i];
-    if (minimum_allowed_cut_point.has_value() && cut_point_candidate.offset < *minimum_allowed_cut_point) continue;
     last_cut_point = process_pending_chunks.empty() ? last_used_cut_point : process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size();
 
     const auto adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate.offset;
@@ -2568,17 +2860,13 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  uint32_t avg_size = 8192;
+  uint32_t avg_size = 512;
   uint32_t min_size = avg_size / 4;
   uint32_t max_size = avg_size * 8;
 
-  if (constants::MINIMUM_MIN >= min_size || min_size >= constants::MINIMUM_MAX) throw std::runtime_error("Bad minimum size");
-  if (constants::AVERAGE_MIN >= avg_size || avg_size >= constants::AVERAGE_MAX) throw std::runtime_error("Bad average size");
-  if (constants::MAXIMUM_MIN >= max_size || max_size >= constants::MAXIMUM_MAX) throw std::runtime_error("Bad maximum size");
-
-  min_size = 128;
-  avg_size = 384;
-  max_size = 1024;
+  if (constants::MINIMUM_MIN > min_size || min_size > constants::MINIMUM_MAX) throw std::runtime_error("Bad minimum size");
+  if (constants::AVERAGE_MIN > avg_size || avg_size > constants::AVERAGE_MAX) throw std::runtime_error("Bad average size");
+  if (constants::MAXIMUM_MIN > max_size || max_size > constants::MAXIMUM_MAX) throw std::runtime_error("Bad maximum size");
 
   //bert_params params;
   //params.model = R"(C:\Users\Administrator\Desktop\fastcdc_test\paraphrase-MiniLM-L3-v2-GGML-q4_0.bin)";
@@ -2615,7 +2903,7 @@ int main(int argc, char* argv[]) {
 
   const auto cdc_thread_count = std::thread::hardware_concurrency();
 
-  const uint32_t simhash_chunk_size = 16;
+  const uint32_t simhash_chunk_size = std::max<uint32_t>(16, min_size / 8);
   const uint32_t max_allowed_dist = 32;
   const uint32_t delta_mode = 2;
   // Don't even bother saving chunk as delta chunk if savings are too little and overhead will probably negate them
@@ -2715,7 +3003,7 @@ int main(int argc, char* argv[]) {
   uint64_t hashing_execution_time_ns = 0;
   uint64_t simhashing_execution_time_ns = 0;
 
-  const auto calc_simhash_if_needed = [&simhash_func, &simhashing_execution_time_ns](utility::ChunkEntry& chunk) {
+  const auto calc_simhash_if_needed = [&simhash_func, &simhashing_execution_time_ns, &simhash_chunk_size](utility::ChunkEntry& chunk) {
     if (!chunk.chunk_data->minichunks.empty()) return;
     const auto simhashing_start_time = std::chrono::high_resolution_clock::now();
     std::tie(chunk.chunk_data->lsh, chunk.chunk_data->minichunks) = simhash_func(chunk.chunk_data->data.data(), chunk.chunk_data->data.size(), simhash_chunk_size);
@@ -2938,7 +3226,7 @@ int main(int argc, char* argv[]) {
       // Ensure data matches
       if (std::memcmp(verify_buffer_orig_data.data(), data_span.data(), data_span.size()) != 0) {
         print_to_console("Error while verifying current_offset at offset " + std::to_string(current_offset) + "\n");
-        exit(1);
+        throw std::runtime_error("La chorificacion");
       }
     }
 
@@ -3191,14 +3479,14 @@ int main(int argc, char* argv[]) {
 
             if (std::memcmp(verify_buffer_delta.data() + chunk_offset_pos, verify_buffer.data() + chunk_offset_pos, instruction.size) != 0) {
               print_to_console("Delta coding data verification mismatch!\n");
-              exit(1);
+              throw std::runtime_error("La chorificacion");
             }
           }
           chunk_offset_pos += instruction.size;
         }
         if (chunk_offset_pos != chunk.chunk_data->data.size()) {
           print_to_console("Delta coding size mismatch: chunk_size/delta size " + std::to_string(chunk.chunk_data->data.size()) + "/" + std::to_string(chunk_offset_pos) + "\n");
-          exit(1);
+          throw std::runtime_error("La chorificacion");
         }
       }
     }
@@ -3393,15 +3681,15 @@ int main(int argc, char* argv[]) {
       load_next_segment_batch_future.wait_for(std::chrono::nanoseconds::zero()) == std::future_status::ready
     ) {
       auto segment_extend_data = load_next_segment_batch_future.get();
-      process_pending_chunks.shrink_to_fit();
-      cdc_candidates_futures.shrink_to_fit();
+      //process_pending_chunks.shrink_to_fit();
+      //cdc_candidates_futures.shrink_to_fit();
       launch_cdc_threads(segment_extend_data);
     }
     // If we were to run out of pending chunks but the next segment batch is not ready yet, we wait for it and get some pending chunks so we can continue
     if (process_pending_chunks.empty() && load_next_segment_batch_future.valid()) {
       auto segment_extend_data = load_next_segment_batch_future.get();
-      process_pending_chunks.shrink_to_fit();
-      cdc_candidates_futures.shrink_to_fit();
+      //process_pending_chunks.shrink_to_fit();
+      //cdc_candidates_futures.shrink_to_fit();
       launch_cdc_threads(segment_extend_data);
       get_more_pending_chunks_from_cdc_futures(true);
     }
