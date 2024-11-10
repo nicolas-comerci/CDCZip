@@ -15,6 +15,7 @@
 #include <bitset>
 #include <cassert>
 #include <cstdarg>
+#include <cstdlib>
 
 #ifndef __unix
 //#include <windows.h>
@@ -296,6 +297,10 @@ struct CutPointCandidate {
 
 template<
   bool compute_features,
+  bool use_fastcdc_subminimum_skipping = true,
+  bool use_fastcdc_normalized_chunking = true,
+  bool use_supercdc_minmax_adjustment = true,
+  bool use_supercdc_backup_mask = true,
   typename ReturnType = std::conditional_t<
     compute_features,
     std::tuple<CutPointCandidate, uint32_t, std::vector<uint32_t>>,
@@ -307,37 +312,66 @@ ReturnType cdc_next_offset(
   uint32_t min_size,
   uint32_t avg_size,
   uint32_t max_size,
-  uint32_t mask_s,
-  uint32_t mask_l,
+  uint32_t mask_hard,
+  uint32_t mask_medium,
+  uint32_t mask_easy,
   uint32_t initial_pattern = 0
 ) {
   uint32_t pattern = initial_pattern;
   uint32_t size = data.size();
-  uint32_t barrier = std::min(avg_size, size);
-  uint32_t i = std::min(barrier, min_size);
+  uint32_t barrier;
+  uint32_t i;
+  if constexpr (use_fastcdc_subminimum_skipping) {
+    barrier = std::min(avg_size, size);
+    i = std::min(barrier, min_size);
+  }
+  else {
+    barrier = std::min(min_size, size);
+    i = 0;
+  }
 
   std::conditional_t<compute_features, std::vector<uint32_t>, std::monostate> features;
+
+  if constexpr (!use_fastcdc_normalized_chunking) {
+    mask_hard = mask_medium;
+    mask_easy = mask_medium;
+  }
 
   // SuperCDC's even easier "backup mask" and backup result, if mask_l fails to find a cutoff point before the max_size we use the backup result
   // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
   // which helps better preserve the content defined nature of chunks and thus increase dedup ratios.
   std::optional<uint32_t> backup_i{};
-  uint32_t mask_b = mask_l >> 1;
+  uint32_t mask_backup;
+  if constexpr (use_supercdc_backup_mask) {
+    mask_backup = mask_easy >> 1;
+  }
 
   // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
   // the content defined nature of the Hashes.
   // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
-  uint32_t remaining_minmax_adjustment = std::min<uint32_t>(i, 31);
-  i -= remaining_minmax_adjustment;
+  uint32_t remaining_minmax_adjustment;
+  if constexpr (use_supercdc_minmax_adjustment) {
+    remaining_minmax_adjustment = std::min<uint32_t>(i, 31);
+    i -= remaining_minmax_adjustment;
+  }
 
+  if constexpr (!use_fastcdc_subminimum_skipping) {
+    while (i < barrier) {
+      pattern = (pattern >> 1) + constants::GEAR[data[i]];
+      i++;
+    }
+    barrier = std::min(avg_size, size);
+  }
   while (i < barrier) {
     pattern = (pattern >> 1) + constants::GEAR[data[i]];
-    if (remaining_minmax_adjustment > 0) {
-      remaining_minmax_adjustment--;
-      i++;
-      continue;
+    if constexpr (use_supercdc_minmax_adjustment) {
+      if (remaining_minmax_adjustment > 0) {
+        remaining_minmax_adjustment--;
+        i++;
+        continue;
+      }
     }
-    if (!(pattern & mask_s)) {
+    if (!(pattern & mask_hard)) {
       if constexpr (compute_features) {
         return { {.type = CutPointCandidateType::HARD_CUT_MASK, .offset = i }, pattern, features };
       }
@@ -362,7 +396,7 @@ ReturnType cdc_next_offset(
   barrier = std::min(max_size, size);
   while (i < barrier) {
     pattern = (pattern >> 1) + constants::GEAR[data[i]];
-    if (!(pattern & mask_l)) {
+    if (!(pattern & mask_easy)) {
       if constexpr (compute_features) {
         return { {.type = CutPointCandidateType::EASY_CUT_MASK, .offset = i }, pattern, features };
       }
@@ -370,7 +404,9 @@ ReturnType cdc_next_offset(
         return { {.type = CutPointCandidateType::EASY_CUT_MASK, .offset = i }, pattern };
       }
     }
-    if (!backup_i.has_value() && !(pattern & mask_b)) backup_i = i;
+    if constexpr (use_supercdc_backup_mask) {
+      if (!backup_i.has_value() && !(pattern & mask_backup)) backup_i = i;
+    }
     if constexpr (compute_features) {
       if (!(pattern & constants::CDS_SAMPLING_MASK)) {
         if (features.empty()) {
@@ -386,7 +422,7 @@ ReturnType cdc_next_offset(
     i++;
   }
   CutPointCandidate result_i;
-  if (backup_i.has_value()) {
+  if (use_supercdc_backup_mask && backup_i.has_value()) {
     result_i = { .type = CutPointCandidateType::SUPERCDC_BACKUP_MASK, .offset = *backup_i };
   }
   else {
@@ -403,6 +439,10 @@ ReturnType cdc_next_offset(
 // Precondition: Chunk invariance condition satisfied
 template<
   bool compute_features,
+  bool use_fastcdc_subminimum_skipping,
+  bool use_fastcdc_normalized_chunking,
+  bool use_supercdc_minmax_adjustment,
+  bool use_supercdc_backup_mask,
   typename CandidateFeaturesResult = std::conditional_t<compute_features, std::vector<std::vector<uint32_t>>, std::monostate>
 >
 void cdc_find_cut_points_with_invariance(
@@ -413,17 +453,21 @@ void cdc_find_cut_points_with_invariance(
   uint32_t min_size,
   uint32_t avg_size,
   uint32_t max_size,
-  uint32_t mask_s,
-  uint32_t mask_l,
-  uint32_t initial_pattern = 0
+  uint32_t mask_hard,
+  uint32_t mask_medium,
+  uint32_t mask_easy
 ) {
   std::array<std::vector<uint32_t>, 8> lane_results{};
   std::array<CandidateFeaturesResult, 8> lane_features_results{};
   std::array<std::vector<uint32_t>, 8> lane_current_features{};
 
-  std::array<bool, 8> lane_achieved_chunk_invariance { true, false, false, false, false, false, false, false};
-  __m256i mask_s_vec = _mm256_set1_epi32(static_cast<int>(mask_s));
-  __m256i mask_l_vec = _mm256_set1_epi32(static_cast<int>(mask_l));
+  std::array<bool, 8> lane_achieved_chunk_invariance{ true, false, false, false, false, false, false, false };
+  __m256i mask_hard_vec = _mm256_set1_epi32(static_cast<int>(mask_hard));
+  __m256i mask_easy_vec = _mm256_set1_epi32(static_cast<int>(mask_easy));
+  if (!use_fastcdc_normalized_chunking) {
+    mask_hard_vec = _mm256_set1_epi32(static_cast<int>(mask_medium));
+    mask_easy_vec = _mm256_set1_epi32(static_cast<int>(mask_medium));
+  }
   __m256i cmask = _mm256_set1_epi32(0xff);
   __m256i hash = _mm256_set1_epi32(0);
   const __m256i zero_vec = _mm256_set1_epi32(0);
@@ -438,7 +482,9 @@ void cdc_find_cut_points_with_invariance(
   __m256i max_size_vec = _mm256_set1_epi32(std::numeric_limits<int>::max());
   __m256i avg_size_vec = _mm256_set1_epi32(std::numeric_limits<int>::max());
 
-  vindex.m256i_i32[0] = min_size;
+  if constexpr (use_fastcdc_subminimum_skipping) {
+    vindex.m256i_i32[0] = min_size;
+  }
 
   // For each lane, the last index they are allowed to access
   __m256i vindex_max = _mm256_add_epi32(vindex, _mm256_set1_epi32(bytes_per_lane));
@@ -447,42 +493,47 @@ void cdc_find_cut_points_with_invariance(
   __m256i vindex_max_avx2 = vindex_max;
   vindex_max_avx2.m256i_i32[7] -= 4;
 
-  // SuperCDC's even easier "backup mask" and backup result, if mask_l fails to find a cutoff point before the max_size we use the backup result
+  // SuperCDC's even easier "backup mask" and backup result, if mask_easy fails to find a cutoff point before the max_size we use the backup result
   // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
   // which helps better preserve the content defined nature of chunks and thus increase dedup ratios.
-  __m256i mask_b_vec = _mm256_set1_epi32(static_cast<int>(mask_l >> 1));
+  __m256i mask_b_vec = _mm256_set1_epi32(static_cast<int>(mask_easy >> 1));
   __m256i backup_cut_vec = max_size_vec;
 
   // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
   // the content defined nature of the Hashes.
   // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
   __m256i minmax_adjustment_vec = window_size_minus_one_vec;
-  vindex = _mm256_sub_epi32(vindex, window_size_minus_one_vec);
-  // HACK FOR REALLY LOW min_size
-  if (vindex.m256i_i32[0] < 0) {
-    vindex.m256i_i32[0] = 0;
-    minmax_adjustment_vec.m256i_i32[0] = 0;
+  if constexpr (use_supercdc_minmax_adjustment) {
+    vindex = _mm256_sub_epi32(vindex, window_size_minus_one_vec);
+    // HACK FOR REALLY LOW min_size or use_fastcdc_subminimum_skipping = false
+    if (vindex.m256i_i32[0] < 0) {
+      vindex.m256i_i32[0] = 0;
+      minmax_adjustment_vec.m256i_i32[0] = 0;
+    }
   }
 
   __m256i cds_mask_vec = _mm256_set1_epi32(constants::CDS_SAMPLING_MASK);
 
   uint32_t pattern = 0;
 
+  __m256i lane_not_marked_for_jump_vec;
   int lane_not_marked_for_jump = 0b11111111;
   __m256i jump_vec = zero_vec;
 
+  __m256i avg_size_hit_vmask;
+  __m256i minmax_adjustment_ready_vmask;
+
   auto process_lane = [&lane_results, &lane_achieved_chunk_invariance, &min_size, &avg_size, &max_size, &bytes_per_lane, &vindex, &vindex_max,
-  &lane_not_marked_for_jump, &jump_vec, &avg_size_vec, &max_size_vec, &backup_cut_vec, &lane_features_results, &lane_current_features]
-  (uint32_t lane_i, uint32_t pos) {
+    &lane_not_marked_for_jump, &jump_vec, &avg_size_vec, &max_size_vec, &backup_cut_vec, &lane_features_results, &lane_current_features]
+    (uint32_t lane_i, uint32_t pos) {
     // Lane already finished, and we are on a pos for another lane (or after data end)!
     if (pos >= static_cast<uint32_t>(vindex_max.m256i_i32[lane_i])) return;
-      
+
     if (lane_achieved_chunk_invariance[lane_i]) {
       if (lane_results[lane_i].empty()) {
         if (pos >= lane_i * bytes_per_lane + min_size) {
-          if (pos == max_size_vec.m256i_i32[lane_i] && pos > backup_cut_vec.m256i_i32[lane_i]) {
+          if (use_supercdc_backup_mask && pos == max_size_vec.m256i_i32[lane_i] && pos > backup_cut_vec.m256i_i32[lane_i]) {
             pos = backup_cut_vec.m256i_i32[lane_i];
-            vindex.m256i_i32[lane_i] = 0;  // We jump to a prior position so we set a lower idx such that _mm256_max_epi32 is able to use it for jump
           }
           lane_results[lane_i].emplace_back(pos);
           if constexpr (compute_features) {
@@ -492,15 +543,14 @@ void cdc_find_cut_points_with_invariance(
           max_size_vec.m256i_i32[lane_i] = pos + max_size;
           avg_size_vec.m256i_i32[lane_i] = pos + avg_size;
           lane_not_marked_for_jump ^= (0b1 << lane_i);
-          jump_vec.m256i_i32[lane_i] = pos + min_size - 31;
+          jump_vec.m256i_i32[lane_i] = pos;
         }
       }
       else {
         const auto dist_with_prev = pos - lane_results[lane_i].back();
         if (dist_with_prev >= min_size) {
-          if (pos == max_size_vec.m256i_i32[lane_i] && pos > backup_cut_vec.m256i_i32[lane_i]) {
+          if (use_supercdc_backup_mask && pos == max_size_vec.m256i_i32[lane_i] && pos > backup_cut_vec.m256i_i32[lane_i]) {
             pos = backup_cut_vec.m256i_i32[lane_i];
-            vindex.m256i_i32[lane_i] = 0;  // We jump to a prior position so we set a lower idx such that _mm256_max_epi32 is able to use it for jump
           }
           lane_results[lane_i].emplace_back(pos);
           if constexpr (compute_features) {
@@ -510,7 +560,7 @@ void cdc_find_cut_points_with_invariance(
           max_size_vec.m256i_i32[lane_i] = pos + max_size;
           avg_size_vec.m256i_i32[lane_i] = pos + avg_size;
           lane_not_marked_for_jump ^= (0b1 << lane_i);
-          jump_vec.m256i_i32[lane_i] = pos + min_size - 31;
+          jump_vec.m256i_i32[lane_i] = pos;
         }
       }
     }
@@ -523,7 +573,7 @@ void cdc_find_cut_points_with_invariance(
           max_size_vec.m256i_i32[lane_i] = pos + max_size;
           avg_size_vec.m256i_i32[lane_i] = pos + avg_size;
           lane_not_marked_for_jump ^= (0b1 << lane_i);
-          jump_vec.m256i_i32[lane_i] = pos + min_size - 31;
+          jump_vec.m256i_i32[lane_i] = pos;
         }
       }
       lane_results[lane_i].emplace_back(pos);
@@ -542,6 +592,22 @@ void cdc_find_cut_points_with_invariance(
     for (int feature_i = 0; feature_i < 16; feature_i++) {
       const auto& [mi, ai] = constants::N_Transform_Coefs[feature_i];
       lane_current_features[lane_i][feature_i] = std::max<uint32_t>(lane_current_features[lane_i][feature_i], (mi * pattern + ai) % (1LL << 32));
+    }
+  };
+
+  auto adjust_lane_for_jump = [&minmax_adjustment_vec, &backup_cut_vec, &max_size_vec, &jump_vec, &vindex, &min_size](uint32_t lane_i) {
+    vindex.m256i_i32[lane_i] = jump_vec.m256i_i32[lane_i];
+    if constexpr (use_fastcdc_subminimum_skipping) {
+      vindex.m256i_i32[lane_i] += min_size;
+    }
+
+    if constexpr (use_supercdc_minmax_adjustment) {
+      auto adjustment = std::min(31, vindex.m256i_i32[lane_i]);
+      vindex.m256i_i32[lane_i] -= adjustment;
+      minmax_adjustment_vec.m256i_i32[lane_i] = adjustment;
+    }
+    if constexpr (use_supercdc_backup_mask) {
+      backup_cut_vec.m256i_i32[lane_i] = max_size_vec.m256i_i32[lane_i];
     }
   };
 
@@ -564,37 +630,55 @@ void cdc_find_cut_points_with_invariance(
       __m256i tentry = _mm256_i32gather_epi32(reinterpret_cast<int const*>(constants::GEAR), idx, 4);
       hash = _mm256_add_epi32(hash, tentry);  // Add the values we got from the GEAR hash values to the values on the hash
 
-      // For each lane if we are at avg_size or higher we use the easier mask_l condition
-      __m256i avg_size_hit = _mm256_cmpgt_epi32(vindex, avg_size_vec);
-      __m256 mask_vec = _mm256_blendv_ps(_mm256_castsi256_ps(mask_s_vec), _mm256_castsi256_ps(mask_l_vec), _mm256_castsi256_ps(avg_size_hit));
+      if constexpr (use_fastcdc_normalized_chunking || use_supercdc_backup_mask) {
+        avg_size_hit_vmask = _mm256_cmpgt_epi32(vindex, avg_size_vec);
+      }
 
       // Compare each packed int by bitwise AND with the mask and checking that its 0
-      __m256i hash_masked = _mm256_and_epi32(hash, _mm256_castps_si256(mask_vec));
+      __m256i hash_masked;
+      if constexpr (use_fastcdc_normalized_chunking) {
+        // For each lane if we are at avg_size or higher we use the easier mask_easy condition
+        // TODO: this is actually a minor problem, because if we haven't hit the invariance condition yet on the lane, we don't know if we should
+        // be using one or the other, we should probably check both and submit both cuts if the conditions are satisfied, and allow the cut selection
+        // phase to sort it out
+        __m256 mask_vec = _mm256_blendv_ps(_mm256_castsi256_ps(mask_hard_vec), _mm256_castsi256_ps(mask_easy_vec), _mm256_castsi256_ps(avg_size_hit_vmask));
+        hash_masked = _mm256_and_epi32(hash, _mm256_castps_si256(mask_vec));
+      }
+      else {
+        // use_fastcdc_normalized_chunking is off so mask_hard_vec=mask_easy_vec and they actually just use the mask_medium to hit the avg size without normalization
+        hash_masked = _mm256_and_epi32(hash, mask_hard_vec);
+      }
       __m256i hash_eq_mask = _mm256_cmpeq_epi32(hash_masked, zero_vec);
       __m256 hash_eq_mask_ps = _mm256_castsi256_ps(hash_eq_mask);
 
-      // For the lanes that the backup cut condition is satisfied, update it if there is not a prior backup already
-      __m256i hash_backup_masked = _mm256_and_epi32(hash, mask_b_vec);
-      __m256i hash_backup_eq_mask = _mm256_cmpeq_epi32(hash_backup_masked, zero_vec);
-      // If the lane is marked for jump then the backup cut point has been updated for the new maximum after the jump, don't touch it
-      auto lane_not_marked_for_jump_vec = _mm256_setr_epi32(
-        lane_not_marked_for_jump & 0b00000001 ? 0xFFFFFFFF : 0,
-        lane_not_marked_for_jump & 0b00000010 ? 0xFFFFFFFF : 0,
-        lane_not_marked_for_jump & 0b00000100 ? 0xFFFFFFFF : 0,
-        lane_not_marked_for_jump & 0b00001000 ? 0xFFFFFFFF : 0,
-        lane_not_marked_for_jump & 0b00010000 ? 0xFFFFFFFF : 0,
-        lane_not_marked_for_jump & 0b00100000 ? 0xFFFFFFFF : 0,
-        lane_not_marked_for_jump & 0b01000000 ? 0xFFFFFFFF : 0,
-        lane_not_marked_for_jump & 0b10000000 ? 0xFFFFFFFF : 0
-      );
-      hash_backup_eq_mask = _mm256_and_epi32(hash_backup_eq_mask, lane_not_marked_for_jump_vec);
-      // Backup mask should not be used until after avg_size is hit
-      hash_backup_eq_mask = _mm256_and_epi32(hash_backup_eq_mask, avg_size_hit);
-      __m256 new_backup_cut_vec_ps = _mm256_blendv_ps(_mm256_castsi256_ps(backup_cut_vec), _mm256_castsi256_ps(vindex), _mm256_castsi256_ps(hash_backup_eq_mask));
-      backup_cut_vec = _mm256_min_epi32(backup_cut_vec, _mm256_castps_si256(new_backup_cut_vec_ps));
+      if constexpr (compute_features || use_supercdc_backup_mask) {
+        // If the lane is marked for jump then the backup cut point has been updated for the new maximum after the jump, don't touch it
+        lane_not_marked_for_jump_vec = _mm256_setr_epi32(
+          lane_not_marked_for_jump & 0b00000001 ? 0xFFFFFFFF : 0,
+          lane_not_marked_for_jump & 0b00000010 ? 0xFFFFFFFF : 0,
+          lane_not_marked_for_jump & 0b00000100 ? 0xFFFFFFFF : 0,
+          lane_not_marked_for_jump & 0b00001000 ? 0xFFFFFFFF : 0,
+          lane_not_marked_for_jump & 0b00010000 ? 0xFFFFFFFF : 0,
+          lane_not_marked_for_jump & 0b00100000 ? 0xFFFFFFFF : 0,
+          lane_not_marked_for_jump & 0b01000000 ? 0xFFFFFFFF : 0,
+          lane_not_marked_for_jump & 0b10000000 ? 0xFFFFFFFF : 0
+        );
+      }
 
-      __m256i minmax_adjustment_ready = _mm256_cmpgt_epi32(ones_vec, minmax_adjustment_vec);
-      __m256 minmax_adjustment_ready_mask_ps = _mm256_castsi256_ps(minmax_adjustment_ready);
+      if constexpr (use_supercdc_backup_mask) {
+        // For the lanes that the backup cut condition is satisfied, update it if there is not a prior backup already
+        __m256i hash_backup_masked = _mm256_and_epi32(hash, mask_b_vec);
+        __m256i hash_backup_eq_mask = _mm256_cmpeq_epi32(hash_backup_masked, zero_vec);
+        hash_backup_eq_mask = _mm256_and_epi32(hash_backup_eq_mask, lane_not_marked_for_jump_vec);
+        // Backup mask should not be used until after avg_size is hit
+        hash_backup_eq_mask = _mm256_and_epi32(hash_backup_eq_mask, avg_size_hit_vmask);
+        __m256 new_backup_cut_vec_ps = _mm256_blendv_ps(_mm256_castsi256_ps(backup_cut_vec), _mm256_castsi256_ps(vindex), _mm256_castsi256_ps(hash_backup_eq_mask));
+        backup_cut_vec = _mm256_min_epi32(backup_cut_vec, _mm256_castps_si256(new_backup_cut_vec_ps));
+      }
+
+      if constexpr (use_supercdc_minmax_adjustment) {
+        minmax_adjustment_ready_vmask = _mm256_cmpgt_epi32(ones_vec, minmax_adjustment_vec);
+      }
 
       __m256i max_size_hit = _mm256_cmpeq_epi32(max_size_vec, vindex);
       __m256 max_size_hit_mask_ps = _mm256_castsi256_ps(max_size_hit);
@@ -605,7 +689,9 @@ void cdc_find_cut_points_with_invariance(
         __m256i hash_cds_eq_vmask = _mm256_cmpeq_epi32(hash_cds_masked, zero_vec);
         // Ensure lane is not ready for jump or still doing min-max adjustment, in any of those cases we shouldn't sample
         hash_cds_eq_vmask = _mm256_and_epi32(hash_cds_eq_vmask, lane_not_marked_for_jump_vec);
-        hash_cds_eq_vmask = _mm256_and_epi32(hash_cds_eq_vmask, minmax_adjustment_ready);
+        if constexpr (use_supercdc_minmax_adjustment) {
+          hash_cds_eq_vmask = _mm256_and_epi32(hash_cds_eq_vmask, minmax_adjustment_ready_vmask);
+        }
         int hash_cds_eq_mask = _mm256_movemask_ps(_mm256_castsi256_ps(hash_cds_eq_vmask));
 
         if (hash_cds_eq_mask != 0) {
@@ -622,8 +708,10 @@ void cdc_find_cut_points_with_invariance(
 
       int lane_has_result = is_lane_not_finished &
         lane_not_marked_for_jump &
-        _mm256_movemask_ps(minmax_adjustment_ready_mask_ps) &
         (_mm256_movemask_ps(hash_eq_mask_ps) | _mm256_movemask_ps(max_size_hit_mask_ps));
+      if constexpr (use_supercdc_minmax_adjustment) {
+        lane_has_result &= _mm256_movemask_ps(_mm256_castsi256_ps(minmax_adjustment_ready_vmask));
+      }
 
       if (lane_has_result != 0) {
         if (lane_has_result & 0b00000001) process_lane(0, vindex.m256i_i32[0]);
@@ -636,25 +724,24 @@ void cdc_find_cut_points_with_invariance(
         if (lane_has_result & 0b10000000) process_lane(7, vindex.m256i_i32[7]);
       }
 
-      minmax_adjustment_vec = _mm256_sub_epi32(minmax_adjustment_vec, ones_vec);
+      if constexpr (use_supercdc_minmax_adjustment) {
+        minmax_adjustment_vec = _mm256_sub_epi32(minmax_adjustment_vec, ones_vec);
+      }
 
       ++j;
       vindex = _mm256_add_epi32(vindex, ones_vec);  // advance 1 byte in the data for each lane
     }
 
     if (lane_not_marked_for_jump != 0b11111111) {
-      vindex = _mm256_max_epi32(vindex, jump_vec);
+      if (!(lane_not_marked_for_jump & 0b00000001)) { adjust_lane_for_jump(0); }
+      if (!(lane_not_marked_for_jump & 0b00000010)) { adjust_lane_for_jump(1); }
+      if (!(lane_not_marked_for_jump & 0b00000100)) { adjust_lane_for_jump(2); }
+      if (!(lane_not_marked_for_jump & 0b00001000)) { adjust_lane_for_jump(3); }
+      if (!(lane_not_marked_for_jump & 0b00010000)) { adjust_lane_for_jump(4); }
+      if (!(lane_not_marked_for_jump & 0b00100000)) { adjust_lane_for_jump(5); }
+      if (!(lane_not_marked_for_jump & 0b01000000)) { adjust_lane_for_jump(6); }
+      if (!(lane_not_marked_for_jump & 0b10000000)) { adjust_lane_for_jump(7); }
 
-      if (!(lane_not_marked_for_jump & 0b00000001)) { minmax_adjustment_vec.m256i_i32[0] = 31; backup_cut_vec.m256i_i32[0] = max_size_vec.m256i_i32[0]; }
-      if (!(lane_not_marked_for_jump & 0b00000010)) { minmax_adjustment_vec.m256i_i32[1] = 31; backup_cut_vec.m256i_i32[1] = max_size_vec.m256i_i32[1]; }
-      if (!(lane_not_marked_for_jump & 0b00000100)) { minmax_adjustment_vec.m256i_i32[2] = 31; backup_cut_vec.m256i_i32[2] = max_size_vec.m256i_i32[2]; }
-      if (!(lane_not_marked_for_jump & 0b00001000)) { minmax_adjustment_vec.m256i_i32[3] = 31; backup_cut_vec.m256i_i32[3] = max_size_vec.m256i_i32[3]; }
-      if (!(lane_not_marked_for_jump & 0b00010000)) { minmax_adjustment_vec.m256i_i32[4] = 31; backup_cut_vec.m256i_i32[4] = max_size_vec.m256i_i32[4]; }
-      if (!(lane_not_marked_for_jump & 0b00100000)) { minmax_adjustment_vec.m256i_i32[5] = 31; backup_cut_vec.m256i_i32[5] = max_size_vec.m256i_i32[5]; }
-      if (!(lane_not_marked_for_jump & 0b01000000)) { minmax_adjustment_vec.m256i_i32[6] = 31; backup_cut_vec.m256i_i32[6] = max_size_vec.m256i_i32[6]; }
-      if (!(lane_not_marked_for_jump & 0b10000000)) { minmax_adjustment_vec.m256i_i32[7] = 31; backup_cut_vec.m256i_i32[7] = max_size_vec.m256i_i32[7]; }
-
-      jump_vec = zero_vec;
       lane_not_marked_for_jump = 0b11111111;
     }
   }
@@ -662,9 +749,10 @@ void cdc_find_cut_points_with_invariance(
   auto i = vindex.m256i_i32[7];
   pattern = hash.m256i_i32[7];  // Recover hash value from last lane
   // Deal with any trailing data sequentially
+  // TODO: Check backup mask? anything else I am missing here?
   while (i < data.size()) {
     pattern = (pattern >> 1) + constants::GEAR[data[i]];
-    if (!(pattern & mask_l)) process_lane(7, i);
+    if (!(pattern & mask_easy)) process_lane(7, i);
     ++i;
   }
 
@@ -690,6 +778,11 @@ void cdc_find_cut_points_with_invariance(
 
 template<
   bool compute_features,
+  bool avx2_allowed = true,
+  bool use_fastcdc_subminimum_skipping = true,
+  bool use_fastcdc_normalized_chunking = true,
+  bool use_supercdc_minmax_adjustment = true,
+  bool use_supercdc_backup_mask = true,
   typename CandidateFeaturesResult = std::conditional_t<compute_features, std::vector<std::vector<uint32_t>>, std::monostate>,
   typename CdcCandidatesResult = std::tuple<std::vector<CutPointCandidate>, CandidateFeaturesResult>
 >
@@ -700,10 +793,13 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
   if (data.empty()) return result;
 
   const auto bits = utility::logarithm2(avg_size);
-  const auto mask_s = utility::mask(bits + 1);
-  const auto mask_l = utility::mask(bits - 1);
+  const auto mask_hard = utility::mask(bits + 1);
+  const auto mask_medium = utility::mask(bits);
+  const auto mask_easy = utility::mask(bits - 1);
 
-  using cdc_offset_return_type = typename decltype(std::function{ cdc_next_offset<compute_features> })::result_type;
+  using cdc_offset_return_type = typename decltype(std::function{
+    cdc_next_offset<compute_features, use_fastcdc_subminimum_skipping, use_fastcdc_normalized_chunking, use_supercdc_minmax_adjustment, use_supercdc_backup_mask>
+    })::result_type;
 
   cdc_offset_return_type cdc_return{};
   uint32_t base_offset = 0;
@@ -712,7 +808,9 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
 
   // If this is not the first segment then we need to deal with the previous segment extended data and attempt to recover chunk invariance
   if (!is_first_segment) {
-    std::tie(cp, pattern) = cdc_next_offset<false>(data, 0, avg_size - 1, 4294967295, mask_s, mask_l, pattern);
+    std::tie(cp, pattern) = cdc_next_offset<false, use_fastcdc_subminimum_skipping, use_fastcdc_normalized_chunking, use_supercdc_minmax_adjustment, use_supercdc_backup_mask>(
+      data, 0, avg_size - 1, 4294967295, mask_hard, mask_medium, mask_easy, pattern
+    );
 
     base_offset += cp.offset;
     candidates.emplace_back(cp.type, base_offset);
@@ -727,7 +825,10 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
     // As soon as we find that we can break from here and keep processing as if we were processing without segments,
     // which in particular means we can exploit jumps to min_size again.
     while (!data.empty()) {
-      std::tie(cp, pattern) = cdc_next_offset<false>(std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_s, mask_l, pattern);
+      std::tie(cp, pattern) = cdc_next_offset<false, use_fastcdc_subminimum_skipping, use_fastcdc_normalized_chunking, use_supercdc_minmax_adjustment, use_supercdc_backup_mask>(
+        std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295,
+        mask_hard, mask_medium, mask_easy, pattern
+      );
       cp.offset = cp.offset + 1;
 
       base_offset += cp.offset;
@@ -740,13 +841,18 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
     }
   }
 
-  if (data.size() < 1024) {
+  if (data.size() < 1024 || !avx2_allowed) {
     while (!data.empty()) {
       if (base_offset == 0) {
-        cdc_return = cdc_next_offset<compute_features>(data, min_size, avg_size, max_size, mask_s, mask_l, pattern);
+        cdc_return = cdc_next_offset<compute_features, use_fastcdc_subminimum_skipping, use_fastcdc_normalized_chunking, use_supercdc_minmax_adjustment, use_supercdc_backup_mask>(
+          data, min_size, avg_size, max_size, mask_hard, mask_medium, mask_easy, pattern
+        );
       }
       else {
-        cdc_return = cdc_next_offset<compute_features>(std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_s, mask_l, pattern);
+        cdc_return = cdc_next_offset<compute_features, use_fastcdc_subminimum_skipping, use_fastcdc_normalized_chunking, use_supercdc_minmax_adjustment, use_supercdc_backup_mask>(
+          std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1,
+          mask_hard, mask_medium, mask_easy, pattern
+        );
         cp.offset = cp.offset + 1;
       }
 
@@ -759,7 +865,10 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
     }
   }
   else {
-    cdc_find_cut_points_with_invariance<compute_features>(candidates, candidate_features, data, base_offset, min_size, avg_size, max_size, mask_s, mask_l, pattern);
+    cdc_find_cut_points_with_invariance<compute_features, use_fastcdc_subminimum_skipping, use_fastcdc_normalized_chunking, use_supercdc_minmax_adjustment, use_supercdc_backup_mask>(
+      candidates, candidate_features, data, base_offset,
+      min_size, avg_size, max_size, mask_hard, mask_medium, mask_easy
+    );
   }
 
   if constexpr (compute_features) {
@@ -833,7 +942,9 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
 
   // Find the CDC minichunks and update the SimHash with their data
   const auto min_chunk_size = chunk_size / 2;
-  auto [cut_offsets, cut_offsets_features] = find_cdc_cut_candidates<false>(std::span(data, data_len), min_chunk_size, chunk_size, chunk_size * 2);
+  auto [cut_offsets, cut_offsets_features] = find_cdc_cut_candidates<false>(
+    std::span(data, data_len), min_chunk_size, chunk_size, chunk_size * 2
+  );
   uint32_t previous_offset = 0;
   for (const auto& cut_point_candidate : cut_offsets) {
     if (cut_point_candidate.offset <= previous_offset) continue;
@@ -870,7 +981,7 @@ uint64_t hamming_distance(const std::bitset<bit_size>& data1, const std::bitset<
 template<std::size_t bit_size>
 std::size_t hamming_syndrome(const std::bitset<bit_size>& data) {
   int result = 0;
-  std::bitset<bit_size> mask {0b1};
+  std::bitset<bit_size> mask{ 0b1 };
   for (std::size_t i = 0; i < bit_size; i++) {
     auto bit = data & mask;
     if (bit != 0) result ^= i;
@@ -995,7 +1106,7 @@ uint64_t find_identical_prefix_byte_count(const std::span<const uint8_t> data1_s
       i += avx2_matching_data_count;
     }
   }
-  
+
   const uint64_t sse_batches = (cmp_size - i) / 16;
   if (sse_batches > 0) {
     uint64_t sse_batches_size = sse_batches * 16;
@@ -1607,7 +1718,7 @@ public:
           // in which case we return the vec_size which will result in an end iterator
           return (has_last_index && **last_index >= *first_index && added_index > **last_index) ? vec_size : added_index;
         }
-        
+
         if (
           // If the vector doesn't have circular wrapping around behavior then just return index for end of vec
           !has_last_index ||
@@ -2656,12 +2767,13 @@ void select_cut_point_candidates(
   std::deque<utility::ChunkEntry>& process_pending_chunks,
   uint64_t last_used_cut_point,
   uint64_t segment_start_offset,
-  std::vector<uint8_t>& segment_data,
+  std::span<uint8_t> segment_data,
   std::vector<uint8_t>& prev_segment_remaining_data,
   uint32_t min_size,
   uint32_t max_size,
   bool segments_eof,
-  bool use_feature_extraction
+  bool use_feature_extraction,
+  bool copy_chunk_data = true
 ) {
   if (!segments_eof && !new_cut_point_candidates.empty() && new_cut_point_candidates.back().type == CutPointCandidateType::EOF_CUT) {
     new_cut_point_candidates.pop_back();
@@ -2670,22 +2782,24 @@ void select_cut_point_candidates(
     }
   }
 
-  auto make_chunk = [&] (uint64_t candidate_pos, uint64_t prev_point_offset, uint64_t segment_data_pos, uint64_t cut_point_pos) {
+  auto make_chunk = [&](uint64_t candidate_pos, uint64_t prev_point_offset, uint64_t segment_data_pos, uint64_t cut_point_pos) {
     process_pending_chunks.emplace_back(utility::ChunkEntry(prev_point_offset));
     auto& new_pending_chunk = process_pending_chunks.back();
 
-    if (!prev_segment_remaining_data.empty()) {
-      const auto chunk_size = prev_segment_remaining_data.size() + cut_point_pos - segment_data_pos;
-      new_pending_chunk.chunk_data->data.resize(chunk_size);
-      std::copy_n(prev_segment_remaining_data.data(), prev_segment_remaining_data.size(), new_pending_chunk.chunk_data->data.data());
-      std::copy_n(segment_data.data() + segment_data_pos, cut_point_pos - segment_data_pos, new_pending_chunk.chunk_data->data.data() + prev_segment_remaining_data.size());
-      prev_segment_remaining_data.clear();
+    if (copy_chunk_data) {
+      if (!prev_segment_remaining_data.empty()) {
+        const auto chunk_size = prev_segment_remaining_data.size() + cut_point_pos - segment_data_pos;
+        new_pending_chunk.chunk_data->data.resize(chunk_size);
+        std::copy_n(prev_segment_remaining_data.data(), prev_segment_remaining_data.size(), new_pending_chunk.chunk_data->data.data());
+        std::copy_n(segment_data.data() + segment_data_pos, cut_point_pos - segment_data_pos, new_pending_chunk.chunk_data->data.data() + prev_segment_remaining_data.size());
+        prev_segment_remaining_data.clear();
+      }
+      else {
+        new_pending_chunk.chunk_data->data.resize(cut_point_pos - segment_data_pos);
+        std::copy_n(segment_data.data() + segment_data_pos, cut_point_pos - segment_data_pos, new_pending_chunk.chunk_data->data.data());
+      }
+      new_pending_chunk.chunk_data->data.shrink_to_fit();
     }
-    else {
-      new_pending_chunk.chunk_data->data.resize(cut_point_pos - segment_data_pos);
-      std::copy_n(segment_data.data() + segment_data_pos, cut_point_pos - segment_data_pos, new_pending_chunk.chunk_data->data.data());
-    }
-    new_pending_chunk.chunk_data->data.shrink_to_fit();
 
     if (use_feature_extraction) {
       if (new_cut_point_candidates_features.size() >= candidate_pos + 1) {
@@ -2756,7 +2870,7 @@ void select_cut_point_candidates(
 
   // If there is more unused data at the end of the segment than the window_size - 1 bytes of the extension, we save that data
   // as it will need to be used for the next chunk
-  {
+  if (copy_chunk_data) {
     const auto in_segment_pos = process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size() - segment_start_offset;
     const auto segment_data_tail_len = segment_data.size() - in_segment_pos;
     if (segment_data_tail_len > 31) {
@@ -2868,6 +2982,114 @@ void decompress(T& output_iostream, BitInputStream& bit_input_stream) {
   }
 }
 
+void test_mode(const std::string& file_path, uint64_t file_size) {
+  print_to_console("TEST MODE\n");
+
+  const uint64_t min_size = 2048;
+  const uint64_t avg_size = 8 * 1024;
+  const uint64_t max_size = 64 * 1024;
+
+  const auto file_size_mb = file_size / (1024.0 * 1024);
+  const int alignment = 32;
+
+#ifndef _MSC_VER
+  const uint64_t adjusted_file_size = ((file_size + alignment - 1) / alignment) * alignment;
+  uint8_t* file_data = static_cast<uint8_t*>(std::aligned_alloc(32, adjusted_file_size));
+#else
+  uint8_t* file_data = static_cast<uint8_t*>(_aligned_malloc(file_size, alignment));
+#endif
+
+  auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
+  if (!file_stream.is_open()) {
+    print_to_console("Can't read file\n");
+    exit(1);
+  }
+  file_stream.read(reinterpret_cast<char*>(file_data), file_size);
+  if (file_stream.gcount() != file_size) {
+    print_to_console("Couldn't read whole file\n");
+    exit(1);
+  }
+
+  bool is_first_segment = true;
+  // For SIMD we are using lanes with signed 32bit integers, to make this easier and work we use 2gb segment sizes so we prevent overflows,
+  // but we need to actually remove the 31 byte extension we add for SS-SDC's recovering of the context from the prior segment, so when we add it
+  // we still don't overflow the signed 32bit ints
+  const uint64_t segment_size = std::numeric_limits<int32_t>::max() - 31;
+
+  std::vector<std::span<uint8_t>> segments;
+  {
+    auto data_span = std::span<uint8_t>(file_data, file_size);
+    while (!data_span.empty()) {
+      const uint64_t segment_expected_size = segment_size + (is_first_segment ? 0 : 31);
+      const uint64_t this_segment_size = std::min<uint64_t>(data_span.size(), segment_expected_size);
+
+      segments.emplace_back(data_span.data(), this_segment_size);
+      auto& data_segment_span = segments.back();
+
+      if (this_segment_size == segment_expected_size) {
+        data_span = std::span<uint8_t>(data_span.data() + data_segment_span.size() - 31, data_span.size() - data_segment_span.size() + 31);
+      }
+      else {
+        // last segment, set empty span so we quit
+        data_span = std::span<uint8_t>(data_span.data(), 0);
+      }
+      is_first_segment = false;
+    }
+  }
+  is_first_segment = true;
+
+  std::vector<std::tuple<std::vector<CutPointCandidate>, std::vector<std::vector<uint32_t>>>> results;
+  results.resize(segments.size());
+
+  std::deque<utility::ChunkEntry> process_pending_chunks{};
+  std::vector<uint8_t> prev_segment_remaining_data{};
+  uint64_t current_offset = 0;
+  uint64_t curr_segment_start_offset = 0;
+
+  auto chunking_start_time = std::chrono::high_resolution_clock::now();
+  for (uint64_t i = 0; i < segments.size(); i++) {
+    std::tie(std::get<0>(results[i]), std::ignore) = find_cdc_cut_candidates<false>(segments[i], min_size, avg_size, max_size, is_first_segment);
+    is_first_segment = false;
+  }
+  //auto chunking_end_time = std::chrono::high_resolution_clock::now();
+
+  for (uint64_t i = 0; i < results.size(); i++) {
+    select_cut_point_candidates(
+      std::get<0>(results[i]),
+      std::get<1>(results[i]),
+      process_pending_chunks,
+      current_offset,
+      curr_segment_start_offset,
+      segments[i],
+      prev_segment_remaining_data,
+      min_size,
+      max_size,
+      i == results.size() - 1,
+      false,
+      false
+    );
+
+    current_offset = process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size();
+    curr_segment_start_offset += std::min(segments[i].size(), segment_size);
+  }
+  auto chunking_end_time = std::chrono::high_resolution_clock::now();
+
+  auto test_elapsed_time = std::chrono::duration_cast<std::chrono::nanoseconds>(chunking_end_time - chunking_start_time);
+  auto test_elapsed_time_ns = test_elapsed_time.count();
+  const auto test_mb_per_nanosecond = file_size_mb / test_elapsed_time_ns;
+
+  print_to_console("Tested file size (bytes):    " + std::to_string(file_size) + "\n");
+  print_to_console("Tested Chunking Throughput:    %.1f MB/s\n", test_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Total chunk count:    " + std::to_string(process_pending_chunks.size()) + "\n");
+  print_to_console("Total test runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(test_elapsed_time).count()) + " seconds\n");
+
+#ifndef _MSC_VER
+  std::free(file_data);
+#else
+  _aligned_free(file_data);
+#endif
+}
+
 int main(int argc, char* argv[]) {
 #ifndef NDEBUG
   get_char_with_echo();
@@ -2884,6 +3106,9 @@ int main(int argc, char* argv[]) {
     else if (param.starts_with("-d=")) {
       do_decompression = true;
       cli_params["decomp_file_path"] = param.substr(3, param.size() - 3);
+    }
+    else if (param.starts_with("-test")) {
+      cli_params["test_mode"] = "true";
     }
     else {
       print_to_console("Bad arg: " + param + "\n");
@@ -2925,6 +3150,11 @@ int main(int argc, char* argv[]) {
   }
 
   uint64_t file_size = file_path == "-" ? 0 : std::filesystem::file_size(file_path);
+
+  if (cli_params["test_mode"] == "true") {
+    test_mode(file_path, file_size);
+    exit(0);
+  }
 
   uint32_t avg_size = 512;
   uint32_t min_size = avg_size / 4;
