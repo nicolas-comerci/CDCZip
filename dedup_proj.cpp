@@ -2769,7 +2769,7 @@ void select_cut_point_candidates(
 
 class FakeIOStream {
 public:
-  FakeIOStream(std::string& _file_path) : file_path(_file_path) { data.reserve(50ULL * 1024 * 1024 * 1024); }
+  FakeIOStream() { data.reserve(50ULL * 1024 * 1024 * 1024); }
 
   void write(char* buffer, uint64_t size) {
     if (pos + size > data.size()) {
@@ -2803,7 +2803,6 @@ public:
   }
 
 private:
-  std::string file_path;
   uint64_t pos = 0;
   std::vector<char> data;
 };
@@ -2874,18 +2873,23 @@ int main(int argc, char* argv[]) {
   get_char_with_echo();
 #endif
   std::string file_path{ argv[1] };
-  auto file_size = file_path == "-" ? 0 : std::filesystem::file_size(file_path);
-  if (argc > 3) {
-    print_to_console("Invalid command line\n");
-    return 1;
-  }
   bool do_decompression = false;
-  if (argc == 3) {
-    std::string third_arg{ argv[2] };
-    if (!third_arg.starts_with("-d=")) {
+
+  std::unordered_map<std::string, std::string> cli_params;
+  for (uint64_t param_idx = 2; param_idx < argc; param_idx++) {
+    auto param = std::string(argv[param_idx]);
+    if (param.starts_with("-dict=")) {
+      cli_params["max_dict"] = param.substr(6, param.size() - 6);
+    }
+    else if (param.starts_with("-d=")) {
       do_decompression = true;
+      cli_params["decomp_file_path"] = param.substr(3, param.size() - 3);
+    }
+    else {
+      print_to_console("Bad arg: " + param + "\n");
     }
   }
+
   if (do_decompression) {  // decompress
     auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
     if (!file_stream.is_open()) {
@@ -2894,20 +2898,33 @@ int main(int argc, char* argv[]) {
     }
     auto decompress_start_time = std::chrono::high_resolution_clock::now();
 
-    std::string decomp_file_path{ argv[2] };
-    //auto decomp_file_stream = std::fstream(decomp_file_path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
-    auto decomp_file_stream = FakeIOStream(decomp_file_path);
+    std::string& decomp_file_path = cli_params["decomp_file_path"];
+    const bool just_hash = decomp_file_path == "hash";
+    auto decomp_file_stream = std::fstream();
+    std::unique_ptr<FakeIOStream> decomp_hash_stream;
+    if (just_hash) {
+      decomp_hash_stream = std::make_unique<FakeIOStream>();
+    }
+    else {
+      decomp_file_stream.open(decomp_file_path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+    }
     auto wrapped_input_stream = WrappedIStreamInputStream(&file_stream);
     auto bit_input_stream = BitInputStream(wrapped_input_stream);
 
-    decompress(decomp_file_stream, bit_input_stream);
-
-    decomp_file_stream.print_hash();
+    if (just_hash) {
+      decompress(*decomp_hash_stream, bit_input_stream);
+      decomp_hash_stream->print_hash();
+    }
+    else {
+      decompress(decomp_file_stream, bit_input_stream);
+    }
 
     auto decompress_end_time = std::chrono::high_resolution_clock::now();
     print_to_console("Decompression finished in " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(decompress_end_time - decompress_start_time).count()) + " seconds!\n");
     return 0;
   }
+
+  uint64_t file_size = file_path == "-" ? 0 : std::filesystem::file_size(file_path);
 
   uint32_t avg_size = 512;
   uint32_t min_size = avg_size / 4;
@@ -3005,7 +3022,7 @@ int main(int argc, char* argv[]) {
   const bool verify_chunk_offsets = false;
 
   const std::optional<uint64_t> dictionary_size_limit = argc == 3
-    ? std::optional(static_cast<uint64_t>(std::stoi(std::string(argv[2] + 3))) * 1024 * 1024)
+    ? std::optional(static_cast<uint64_t>(std::stoi(cli_params["max_dict"])) * 1024 * 1024)
     : std::nullopt;
   uint64_t dictionary_size_used = 0;
   uint64_t first_non_out_of_range_chunk_i = 0;
