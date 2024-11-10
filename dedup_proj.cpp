@@ -132,7 +132,7 @@ namespace constants {
   // Largest acceptable value for the maximum chunk size.
   static constexpr uint32_t MAXIMUM_MAX = 1'073'741'824;
 
-  static constexpr alignas(16) uint32_t GEAR[256] = {
+  alignas(16) static constexpr uint32_t GEAR[256] = {
     0,          574654857,  759734804,  310648967,  1393527547, 1195718329,
     694400241,  1154184075, 1319583805, 1298164590, 122602963,  989043992,
     1918895050, 933636724,  1369634190, 1963341198, 1565176104, 1296753019,
@@ -2767,6 +2767,108 @@ void select_cut_point_candidates(
   }
 }
 
+class FakeIOStream {
+public:
+  FakeIOStream(std::string& _file_path) : file_path(_file_path) { data.reserve(50ULL * 1024 * 1024 * 1024); }
+
+  void write(char* buffer, uint64_t size) {
+    if (pos + size > data.size()) {
+      data.resize(pos + size);
+    }
+    std::copy_n(buffer, size, data.data() + pos);
+    pos = pos + size;
+  }
+  void flush() {}
+
+  void read(char* buffer, uint64_t size) {
+    const auto actual_read_size = std::min(data.size() - pos, size);
+    std::copy_n(data.data() + pos, actual_read_size, buffer);
+    pos = pos + actual_read_size;
+  }
+
+  uint64_t tellp() { return pos; }
+  uint64_t tellg() { return pos; }
+  void seekg(uint64_t offset) { pos = offset; }
+  void seekp(uint64_t offset) { pos = offset; }
+
+  bool eof() { return false; }
+  bool bad() { return false; }
+  bool fail() { return false; }
+
+  void print_hash() {
+    const auto hash = XXH64(data.data(), data.size(), 0);
+    auto hash_str = std::format("{:x}", hash);
+    std::ranges::transform(hash_str, hash_str.begin(), ::toupper);
+    print_to_console("XXH64 hash: " + hash_str + "\n");
+  }
+
+private:
+  std::string file_path;
+  uint64_t pos = 0;
+  std::vector<char> data;
+};
+
+template<typename T>
+void decompress(T& output_iostream, BitInputStream& bit_input_stream) {
+  std::vector<char> buffer;
+  uint64_t current_offset = 0;
+  auto instruction = bit_input_stream.get(8);
+  while (!bit_input_stream.eof()) {
+    const auto eof = output_iostream.eof();
+    const auto fail = output_iostream.fail();
+    const auto bad = output_iostream.bad();
+    if (eof || fail || bad) {
+      print_to_console("Something wrong bad during decompression\n");
+      exit(1);
+    }
+
+    uint64_t size = bit_input_stream.getVLI();
+
+    const auto prev_write_pos = output_iostream.tellp();
+    if (instruction == LZInstructionType::INSERT) {
+      buffer.resize(size);
+
+      for (uint64_t i = 0; i < size; i++) {
+        // pre-peak 64bits (or whatever amount of bits for the bytes left if at the end) so they are buffered and we don't read
+        // byte-by-byte
+        if (i % 8 == 0) {
+          const auto to_peek = std::min<uint64_t>(64, (size - i) * 8);
+          bit_input_stream.peek(static_cast<uint32_t>(to_peek));
+        }
+        const auto read = bit_input_stream.get(8);
+        const char read_char = read & 0xFF;
+        buffer[i] = read_char;
+      }
+      output_iostream.write(buffer.data(), size);
+    }
+    else {  // LZInstructionType::COPY
+      output_iostream.flush();
+      uint64_t relative_offset = bit_input_stream.getVLI();
+      uint64_t offset = current_offset - relative_offset;
+
+      // A COPY instruction might be overlapping with itself, which means we need to keep copying data already copied within the
+      // same COPY instruction (usually because of repeating patterns in data)
+      // In this case we have to only read again the non overlapping data
+      const auto actual_read_size = std::min(size, static_cast<uint64_t>(prev_write_pos) - offset);
+      buffer.resize(actual_read_size);
+
+      output_iostream.seekg(offset);
+      output_iostream.read(buffer.data(), actual_read_size);
+
+      output_iostream.seekp(prev_write_pos);
+      auto remaining_size = size;
+      while (remaining_size > 0) {
+        const auto write_size = std::min(remaining_size, actual_read_size);
+        output_iostream.write(buffer.data(), write_size);
+        remaining_size -= write_size;
+      }
+    }
+
+    current_offset += size;
+    instruction = bit_input_stream.get(8);
+  }
+}
+
 int main(int argc, char* argv[]) {
 #ifndef NDEBUG
   get_char_with_echo();
@@ -2792,68 +2894,15 @@ int main(int argc, char* argv[]) {
     }
     auto decompress_start_time = std::chrono::high_resolution_clock::now();
 
-    std::vector<char> buffer;
     std::string decomp_file_path{ argv[2] };
-    auto decomp_file_stream = std::fstream(decomp_file_path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+    //auto decomp_file_stream = std::fstream(decomp_file_path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+    auto decomp_file_stream = FakeIOStream(decomp_file_path);
     auto wrapped_input_stream = WrappedIStreamInputStream(&file_stream);
     auto bit_input_stream = BitInputStream(wrapped_input_stream);
 
-    uint64_t current_offset = 0;
-    auto instruction = bit_input_stream.get(8);
-    while (!bit_input_stream.eof()) {
-      const auto eof = decomp_file_stream.eof();
-      const auto fail = decomp_file_stream.fail();
-      const auto bad = decomp_file_stream.bad();
-      if (eof || fail || bad) {
-        print_to_console("Something wrong bad during decompression\n");
-        return 1;
-      }
+    decompress(decomp_file_stream, bit_input_stream);
 
-      uint64_t size = bit_input_stream.getVLI();
-
-      const auto prev_write_pos = decomp_file_stream.tellp();
-      if (instruction == LZInstructionType::INSERT) {
-        buffer.resize(size);
-
-        for (uint64_t i = 0; i < size; i++) {
-          // pre-peak 64bits (or whatever amount of bits for the bytes left if at the end) so they are buffered and we don't read
-          // byte-by-byte
-          if (i % 8 == 0) {
-            const auto to_peek = std::min<uint64_t>(64, (size - i) * 8);
-            bit_input_stream.peek(static_cast<uint32_t>(to_peek));
-          }
-          const auto read = bit_input_stream.get(8);
-          const char read_char = read & 0xFF;
-          buffer[i] = read_char;
-        }
-        decomp_file_stream.write(buffer.data(), size);
-      }
-      else {  // LZInstructionType::COPY
-        decomp_file_stream.flush();
-        uint64_t relative_offset = bit_input_stream.getVLI();
-        uint64_t offset = current_offset - relative_offset;
-
-        // A COPY instruction might be overlapping with itself, which means we need to keep copying data already copied within the
-        // same COPY instruction (usually because of repeating patterns in data)
-        // In this case we have to only read again the non overlapping data
-        const auto actual_read_size = std::min(size, static_cast<uint64_t>(prev_write_pos) - offset);
-        buffer.resize(actual_read_size);
-
-        decomp_file_stream.seekg(offset);
-        decomp_file_stream.read(buffer.data(), actual_read_size);
-
-        decomp_file_stream.seekp(prev_write_pos);
-        auto remaining_size = size;
-        while (remaining_size > 0) {
-          const auto write_size = std::min(remaining_size, actual_read_size);
-          decomp_file_stream.write(buffer.data(), write_size);
-          remaining_size -= write_size;
-        }
-      }
-
-      current_offset += size;
-      instruction = bit_input_stream.get(8);
-    }
+    decomp_file_stream.print_hash();
 
     auto decompress_end_time = std::chrono::high_resolution_clock::now();
     print_to_console("Decompression finished in " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(decompress_end_time - decompress_start_time).count()) + " seconds!\n");
