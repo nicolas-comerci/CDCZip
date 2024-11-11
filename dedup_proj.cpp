@@ -2761,7 +2761,7 @@ public:
   }
 };
 
-void select_cut_point_candidates(
+uint64_t select_cut_point_candidates(
   std::vector<CutPointCandidate>& new_cut_point_candidates,
   std::vector<std::vector<uint32_t>>& new_cut_point_candidates_features,
   std::deque<utility::ChunkEntry>& process_pending_chunks,
@@ -2782,23 +2782,32 @@ void select_cut_point_candidates(
     }
   }
 
+  utility::ChunkEntry* last_made_chunk = nullptr;
+  uint64_t last_made_chunk_size = 0;
   auto make_chunk = [&](uint64_t candidate_pos, uint64_t prev_point_offset, uint64_t segment_data_pos, uint64_t cut_point_pos) {
     process_pending_chunks.emplace_back(utility::ChunkEntry(prev_point_offset));
-    auto& new_pending_chunk = process_pending_chunks.back();
+    last_made_chunk = &process_pending_chunks.back();
 
+    if (!prev_segment_remaining_data.empty()) {
+      const auto chunk_size = prev_segment_remaining_data.size() + cut_point_pos - segment_data_pos;
+      last_made_chunk_size = chunk_size;
+      if (copy_chunk_data) {
+        last_made_chunk->chunk_data->data.resize(chunk_size);
+        std::copy_n(prev_segment_remaining_data.data(), prev_segment_remaining_data.size(), last_made_chunk->chunk_data->data.data());
+        std::copy_n(segment_data.data() + segment_data_pos, cut_point_pos - segment_data_pos, last_made_chunk->chunk_data->data.data() + prev_segment_remaining_data.size());
+      }
+      prev_segment_remaining_data.clear();
+    }
+    else {
+      const auto chunk_size = cut_point_pos - segment_data_pos;
+      last_made_chunk_size = chunk_size;
+      if (copy_chunk_data) {
+        last_made_chunk->chunk_data->data.resize(chunk_size);
+        std::copy_n(segment_data.data() + segment_data_pos, chunk_size, last_made_chunk->chunk_data->data.data());
+      }
+    }
     if (copy_chunk_data) {
-      if (!prev_segment_remaining_data.empty()) {
-        const auto chunk_size = prev_segment_remaining_data.size() + cut_point_pos - segment_data_pos;
-        new_pending_chunk.chunk_data->data.resize(chunk_size);
-        std::copy_n(prev_segment_remaining_data.data(), prev_segment_remaining_data.size(), new_pending_chunk.chunk_data->data.data());
-        std::copy_n(segment_data.data() + segment_data_pos, cut_point_pos - segment_data_pos, new_pending_chunk.chunk_data->data.data() + prev_segment_remaining_data.size());
-        prev_segment_remaining_data.clear();
-      }
-      else {
-        new_pending_chunk.chunk_data->data.resize(cut_point_pos - segment_data_pos);
-        std::copy_n(segment_data.data() + segment_data_pos, cut_point_pos - segment_data_pos, new_pending_chunk.chunk_data->data.data());
-      }
-      new_pending_chunk.chunk_data->data.shrink_to_fit();
+      last_made_chunk->chunk_data->data.shrink_to_fit();
     }
 
     if (use_feature_extraction) {
@@ -2806,20 +2815,24 @@ void select_cut_point_candidates(
         auto& cut_point_candidate_features = new_cut_point_candidates_features[candidate_pos];
         if (!cut_point_candidate_features.empty()) {
           // Takes 4 features (32bit(4byte) fingerprints, so 4 of them is 16bytes) and hash them into a single SuperFeature (seed used arbitrarily just because it needed one)
-          new_pending_chunk.chunk_data->super_features = {
+          last_made_chunk->chunk_data->super_features = {
             XXH32(cut_point_candidate_features.data(), 16, constants::CDS_SAMPLING_MASK),
             XXH32(cut_point_candidate_features.data() + 4, 16, constants::CDS_SAMPLING_MASK),
             XXH32(cut_point_candidate_features.data() + 8, 16, constants::CDS_SAMPLING_MASK),
             XXH32(cut_point_candidate_features.data() + 12, 16, constants::CDS_SAMPLING_MASK)
           };
-          new_pending_chunk.chunk_data->feature_sampling_failure = false;
+          last_made_chunk->chunk_data->feature_sampling_failure = false;
         }
       }
     }
   };
 
+  auto get_last_cut_point = [last_used_cut_point, &last_made_chunk, &last_made_chunk_size]() {
+    return last_made_chunk != nullptr ? last_made_chunk->offset + last_made_chunk_size : last_used_cut_point;
+  };
+
   uint64_t segment_data_pos = 0;
-  auto last_cut_point = process_pending_chunks.empty() ? last_used_cut_point : process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size();
+  auto last_cut_point = get_last_cut_point();
   // If the last used cut point is on data already on this segment (should be within the 31/window_size - 1 bytes extension of the previous segment)
   // we start from that pos on this segment
   if (last_cut_point > segment_start_offset) {
@@ -2828,7 +2841,7 @@ void select_cut_point_candidates(
 
   for (uint64_t i = 0; i < new_cut_point_candidates.size(); i++) {
     auto& cut_point_candidate = new_cut_point_candidates[i];
-    last_cut_point = process_pending_chunks.empty() ? last_used_cut_point : process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size();
+    last_cut_point = get_last_cut_point();
 
     const auto adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate.offset;
     while (adjusted_cut_point_candidate > last_cut_point + max_size) {
@@ -2856,7 +2869,7 @@ void select_cut_point_candidates(
 
   // We might have reached the end of the cut point candidates but there is enough data at the end of the segment that we need to enforce
   // the max_size for chunks, as we did between cut point candidates, just between the actual last candidate and the end of the segment this time
-  last_cut_point = process_pending_chunks.empty() ? last_used_cut_point : process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size();
+  last_cut_point = get_last_cut_point();
   const auto segment_end_pos = segment_start_offset + segment_data.size();
   while (segment_end_pos > last_cut_point + max_size) {
     // if the last_cut_point is on the previous segment some data might have come from the prev_segment_remaining_data so it's
@@ -2870,15 +2883,14 @@ void select_cut_point_candidates(
 
   // If there is more unused data at the end of the segment than the window_size - 1 bytes of the extension, we save that data
   // as it will need to be used for the next chunk
-  if (copy_chunk_data) {
-    const auto in_segment_pos = process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size() - segment_start_offset;
-    const auto segment_data_tail_len = segment_data.size() - in_segment_pos;
-    if (segment_data_tail_len > 31) {
-      prev_segment_remaining_data.resize(segment_data_tail_len - 31);
-      prev_segment_remaining_data.shrink_to_fit();
-      std::copy_n(segment_data.data() + in_segment_pos, segment_data_tail_len - 31, prev_segment_remaining_data.data());
-    }
+  const auto segment_data_tail_len = segment_data.size() - segment_data_pos;
+  if (segment_data_tail_len > 31) {
+    prev_segment_remaining_data.resize(segment_data_tail_len - 31);
+    prev_segment_remaining_data.shrink_to_fit();
+    std::copy_n(segment_data.data() + segment_data_pos, segment_data_tail_len - 31, prev_segment_remaining_data.data());
   }
+
+  return last_made_chunk_size;
 }
 
 class FakeIOStream {
@@ -3010,17 +3022,18 @@ void test_mode(const std::string& file_path, uint64_t file_size) {
     exit(1);
   }
 
-  bool is_first_segment = true;
-  // For SIMD we are using lanes with signed 32bit integers, to make this easier and work we use 2gb segment sizes so we prevent overflows,
-  // but we need to actually remove the 31 byte extension we add for SS-SDC's recovering of the context from the prior segment, so when we add it
-  // we still don't overflow the signed 32bit ints
-  const uint64_t segment_size = std::numeric_limits<int32_t>::max() - 31;
+  std::unordered_set<uint64_t> chunk_hashes{};
+  uint64_t deduped_size = 0;
+
+  // For SIMD we are using lanes with signed 32bit integers, if we use segments that are too large we risk overflows, this way we have pretty big segments
+  // with no risk of overflows.
+  const uint64_t segment_size = std::numeric_limits<int32_t>::max() / 2;
 
   std::vector<std::span<uint8_t>> segments;
   {
     auto data_span = std::span<uint8_t>(file_data, file_size);
     while (!data_span.empty()) {
-      const uint64_t segment_expected_size = segment_size + (is_first_segment ? 0 : 31);
+      const uint64_t segment_expected_size = segment_size + 31;
       const uint64_t this_segment_size = std::min<uint64_t>(data_span.size(), segment_expected_size);
 
       segments.emplace_back(data_span.data(), this_segment_size);
@@ -3033,10 +3046,8 @@ void test_mode(const std::string& file_path, uint64_t file_size) {
         // last segment, set empty span so we quit
         data_span = std::span<uint8_t>(data_span.data(), 0);
       }
-      is_first_segment = false;
     }
   }
-  is_first_segment = true;
 
   std::vector<std::tuple<std::vector<CutPointCandidate>, std::vector<std::vector<uint32_t>>>> results;
   results.resize(segments.size());
@@ -3045,16 +3056,40 @@ void test_mode(const std::string& file_path, uint64_t file_size) {
   std::vector<uint8_t> prev_segment_remaining_data{};
   uint64_t current_offset = 0;
   uint64_t curr_segment_start_offset = 0;
+  uint64_t current_segment_i = 0;
+  uint64_t current_segment_pos = 0;
 
+  auto make_chunk_hash = [&segments, &current_segment_i, &current_segment_pos]
+  (uint64_t chunk_size, XXH3_state_t* hash_state) {
+    auto in_segment_data = std::min(chunk_size, segments[current_segment_i].size() - current_segment_pos);
+    if (in_segment_data == 0) {
+      current_segment_i++;
+      current_segment_pos = 31;
+      in_segment_data = std::min(chunk_size, segments[current_segment_i].size() - current_segment_pos);
+    }
+    XXH3_64bits_reset(hash_state);
+    XXH3_64bits_update(hash_state, segments[current_segment_i].data() + current_segment_pos, in_segment_data);
+    current_segment_pos += in_segment_data;
+    if (in_segment_data < chunk_size) {
+      current_segment_i++;
+      current_segment_pos = 31;
+      in_segment_data = chunk_size - in_segment_data;
+      XXH3_64bits_update(hash_state, segments[current_segment_i].data() + current_segment_pos, in_segment_data);
+      current_segment_pos += in_segment_data;
+    }
+
+    return XXH3_64bits_digest(hash_state);
+  };
+
+  bool is_first_segment = true;
   auto chunking_start_time = std::chrono::high_resolution_clock::now();
   for (uint64_t i = 0; i < segments.size(); i++) {
     std::tie(std::get<0>(results[i]), std::ignore) = find_cdc_cut_candidates<false>(segments[i], min_size, avg_size, max_size, is_first_segment);
     is_first_segment = false;
   }
-  //auto chunking_end_time = std::chrono::high_resolution_clock::now();
 
   for (uint64_t i = 0; i < results.size(); i++) {
-    select_cut_point_candidates(
+    auto last_chunk_size = select_cut_point_candidates(
       std::get<0>(results[i]),
       std::get<1>(results[i]),
       process_pending_chunks,
@@ -3066,21 +3101,84 @@ void test_mode(const std::string& file_path, uint64_t file_size) {
       max_size,
       i == results.size() - 1,
       false,
+#ifdef NDEBUG
       false
+#else
+      true
+#endif
     );
 
-    current_offset = process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size();
+    current_offset = process_pending_chunks.back().offset + last_chunk_size;
     curr_segment_start_offset += std::min(segments[i].size(), segment_size);
   }
   auto chunking_end_time = std::chrono::high_resolution_clock::now();
 
-  auto test_elapsed_time = std::chrono::duration_cast<std::chrono::nanoseconds>(chunking_end_time - chunking_start_time);
+  XXH3_state_t* hash_state = XXH3_createState();
+  utility::ChunkEntry* prevChunk = nullptr;
+  auto dedup_start_time = std::chrono::high_resolution_clock::now();
+  for (auto& chunk : process_pending_chunks) {
+    if (prevChunk == nullptr) {
+      prevChunk = &chunk;
+      continue;
+    }
+    const auto chunk_size = chunk.offset - prevChunk->offset;
+    auto hash = make_chunk_hash(chunk_size, hash_state);
+#ifndef NDEBUG
+    auto hash_from_chunk_data = XXH3_64bits(prevChunk->chunk_data->data.data(), prevChunk->chunk_data->data.size());
+    if (hash != hash_from_chunk_data) {
+      print_to_console("ERROR: BAD CHUNK HASH, WILL MESS UP DEDUPLICATION\n");
+    }
+#endif
+    if (chunk_hashes.contains(hash)) {
+      deduped_size += chunk_size;
+    }
+    else {
+      chunk_hashes.emplace(hash);
+    }
+
+    prevChunk = &chunk;
+  }
+  {
+    const auto chunk_size = file_size - prevChunk->offset;
+    auto hash = make_chunk_hash(chunk_size, hash_state);
+#ifndef NDEBUG
+    auto hash_from_chunk_data = XXH3_64bits(prevChunk->chunk_data->data.data(), prevChunk->chunk_data->data.size());
+    if (hash != hash_from_chunk_data) {
+      print_to_console("ERROR: BAD CHUNK HASH, WILL MESS UP DEDUPLICATION\n");
+    }
+#endif
+    if (chunk_hashes.contains(hash)) {
+      deduped_size += chunk_size;
+    }
+    else {
+      chunk_hashes.emplace(hash);
+    }
+  }
+  XXH3_freeState(hash_state);
+  auto dedup_end_time = std::chrono::high_resolution_clock::now();
+
+  auto chunking_elapsed_time = std::chrono::duration_cast<std::chrono::nanoseconds>(chunking_end_time - chunking_start_time);
+  auto chunking_elapsed_time_ns = chunking_elapsed_time.count();
+  const auto chunking_mb_per_nanosecond = file_size_mb / chunking_elapsed_time_ns;
+
+  auto dedup_elapsed_time = std::chrono::duration_cast<std::chrono::nanoseconds>(dedup_end_time - dedup_start_time);
+  auto dedup_elapsed_time_ns = dedup_elapsed_time.count();
+  const auto dedup_mb_per_nanosecond = file_size_mb / dedup_elapsed_time_ns;
+
+  auto test_elapsed_time = std::chrono::duration_cast<std::chrono::nanoseconds>(dedup_end_time - chunking_start_time);
   auto test_elapsed_time_ns = test_elapsed_time.count();
   const auto test_mb_per_nanosecond = file_size_mb / test_elapsed_time_ns;
 
   print_to_console("Tested file size (bytes):    " + std::to_string(file_size) + "\n");
-  print_to_console("Tested Chunking Throughput:    %.1f MB/s\n", test_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Tested Chunking Throughput:    %.1f MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Tested Dedup Throughput:    %.1f MB/s\n", dedup_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Tested Chunking+Dedup Throughput:    %.1f MB/s\n", test_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Deduped size (bytes):    " + std::to_string(deduped_size) + "\n");
+  print_to_console("File size after dedup (bytes):    " + std::to_string(file_size - deduped_size) + "\n");
+  print_to_console("DER:    %f\n", static_cast<float>(file_size) / static_cast<float>(file_size - deduped_size));
   print_to_console("Total chunk count:    " + std::to_string(process_pending_chunks.size()) + "\n");
+  print_to_console("Total chunking runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(chunking_elapsed_time).count()) + " seconds\n");
+  print_to_console("Total dedup runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(dedup_elapsed_time).count()) + " seconds\n");
   print_to_console("Total test runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(test_elapsed_time).count()) + " seconds\n");
 
 #ifndef _MSC_VER
@@ -3412,7 +3510,7 @@ int main(int argc, char* argv[]) {
           new_cut_point_candidates,
           new_cut_point_candidates_features,
           process_pending_chunks,
-          current_offset,
+          !process_pending_chunks.empty() ? process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size() : current_offset,
           curr_segment_start_offset,
           segment_data,
           prev_segment_remaining_data,
@@ -4037,7 +4135,7 @@ int main(int argc, char* argv[]) {
   const auto hashing_mb_per_nanosecond = total_size_mbs / hashing_execution_time_ns;
   print_to_console("Hashing Throughput:    %.1f MB/s\n", hashing_mb_per_nanosecond * std::pow(10, 9));
   const auto simhashing_mb_per_nanosecond = total_size_mbs / simhashing_execution_time_ns;
-  print_to_console("SimHashing Throughput:    %.1f MB/s\n", simhashing_mb_per_nanosecond* std::pow(10, 9));
+  print_to_console("SimHashing Throughput:    %.1f MB/s\n", simhashing_mb_per_nanosecond * std::pow(10, 9));
   const auto total_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(total_dedup_end_time - total_runtime_start_time).count();
   const auto total_mb_per_nanosecond = total_size_mbs / total_elapsed_nanoseconds;
   print_to_console("Total Throughput:    %.1f MB/s\n", total_mb_per_nanosecond * std::pow(10, 9));
