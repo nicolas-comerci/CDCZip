@@ -514,9 +514,7 @@ void cdc_find_cut_points_with_invariance(
 
   __m256i cds_mask_vec = _mm256_set1_epi32(constants::CDS_SAMPLING_MASK);
 
-  uint32_t pattern = 0;
-
-  __m256i lane_not_marked_for_jump_vec;
+  __m256i lane_not_marked_for_jump_vec = _mm256_set1_epi32(0xFFFFFFFF);
   int lane_not_marked_for_jump = 0b11111111;
   __m256i jump_vec = zero_vec;
 
@@ -524,7 +522,7 @@ void cdc_find_cut_points_with_invariance(
   __m256i minmax_adjustment_ready_vmask;
 
   auto process_lane = [&lane_results, &lane_achieved_chunk_invariance, &min_size, &avg_size, &max_size, &bytes_per_lane, &vindex, &vindex_max,
-    &lane_not_marked_for_jump, &jump_vec, &avg_size_vec, &max_size_vec, &backup_cut_vec, &lane_features_results, &lane_current_features]
+    &lane_not_marked_for_jump_vec, &jump_vec, &avg_size_vec, &max_size_vec, &backup_cut_vec, &lane_features_results, &lane_current_features]
     (uint32_t lane_i, uint32_t pos) {
     // Lane already finished, and we are on a pos for another lane (or after data end)!
     if (pos >= static_cast<uint32_t>(vindex_max.m256i_i32[lane_i])) return;
@@ -542,7 +540,7 @@ void cdc_find_cut_points_with_invariance(
           }
           max_size_vec.m256i_i32[lane_i] = pos + max_size;
           avg_size_vec.m256i_i32[lane_i] = pos + avg_size;
-          lane_not_marked_for_jump ^= (0b1 << lane_i);
+          lane_not_marked_for_jump_vec.m256i_i32[lane_i] = 0;
           jump_vec.m256i_i32[lane_i] = pos;
         }
       }
@@ -559,7 +557,7 @@ void cdc_find_cut_points_with_invariance(
           }
           max_size_vec.m256i_i32[lane_i] = pos + max_size;
           avg_size_vec.m256i_i32[lane_i] = pos + avg_size;
-          lane_not_marked_for_jump ^= (0b1 << lane_i);
+          lane_not_marked_for_jump_vec.m256i_i32[lane_i] = 0;
           jump_vec.m256i_i32[lane_i] = pos;
         }
       }
@@ -572,7 +570,7 @@ void cdc_find_cut_points_with_invariance(
           lane_achieved_chunk_invariance[lane_i] = true;
           max_size_vec.m256i_i32[lane_i] = pos + max_size;
           avg_size_vec.m256i_i32[lane_i] = pos + avg_size;
-          lane_not_marked_for_jump ^= (0b1 << lane_i);
+          lane_not_marked_for_jump_vec.m256i_i32[lane_i] = 0;
           jump_vec.m256i_i32[lane_i] = pos;
         }
       }
@@ -613,9 +611,8 @@ void cdc_find_cut_points_with_invariance(
 
   while (true) {
     vindex = _mm256_min_epi32(vindex, vindex_max_avx2);
-    __m256i is_finish_vec = _mm256_cmpgt_epi32(vindex_max_avx2, vindex);
-    __m256 is_finish_vec_ps = _mm256_castsi256_ps(is_finish_vec);
-    int is_lane_not_finished = _mm256_movemask_ps(is_finish_vec_ps);
+    __m256i is_finish_vmask = _mm256_cmpgt_epi32(vindex_max_avx2, vindex);
+    int is_lane_not_finished = _mm256_movemask_ps(_mm256_castsi256_ps(is_finish_vmask));
     // If all lanes are finished we break, else we continue and lanes that are already finished will ignore results
     if (is_lane_not_finished == 0) break;
 
@@ -651,24 +648,11 @@ void cdc_find_cut_points_with_invariance(
       __m256i hash_eq_mask = _mm256_cmpeq_epi32(hash_masked, zero_vec);
       __m256 hash_eq_mask_ps = _mm256_castsi256_ps(hash_eq_mask);
 
-      if constexpr (compute_features || use_supercdc_backup_mask) {
-        // If the lane is marked for jump then the backup cut point has been updated for the new maximum after the jump, don't touch it
-        lane_not_marked_for_jump_vec = _mm256_setr_epi32(
-          lane_not_marked_for_jump & 0b00000001 ? 0xFFFFFFFF : 0,
-          lane_not_marked_for_jump & 0b00000010 ? 0xFFFFFFFF : 0,
-          lane_not_marked_for_jump & 0b00000100 ? 0xFFFFFFFF : 0,
-          lane_not_marked_for_jump & 0b00001000 ? 0xFFFFFFFF : 0,
-          lane_not_marked_for_jump & 0b00010000 ? 0xFFFFFFFF : 0,
-          lane_not_marked_for_jump & 0b00100000 ? 0xFFFFFFFF : 0,
-          lane_not_marked_for_jump & 0b01000000 ? 0xFFFFFFFF : 0,
-          lane_not_marked_for_jump & 0b10000000 ? 0xFFFFFFFF : 0
-        );
-      }
-
       if constexpr (use_supercdc_backup_mask) {
         // For the lanes that the backup cut condition is satisfied, update it if there is not a prior backup already
         __m256i hash_backup_masked = _mm256_and_epi32(hash, mask_b_vec);
         __m256i hash_backup_eq_mask = _mm256_cmpeq_epi32(hash_backup_masked, zero_vec);
+        // If the lane is marked for jump then the backup cut point has been updated for the new maximum after the jump, don't touch it
         hash_backup_eq_mask = _mm256_and_epi32(hash_backup_eq_mask, lane_not_marked_for_jump_vec);
         // Backup mask should not be used until after avg_size is hit
         hash_backup_eq_mask = _mm256_and_epi32(hash_backup_eq_mask, avg_size_hit_vmask);
@@ -706,11 +690,17 @@ void cdc_find_cut_points_with_invariance(
         }
       }
 
-      int lane_has_result = is_lane_not_finished &
-        lane_not_marked_for_jump &
-        (_mm256_movemask_ps(hash_eq_mask_ps) | _mm256_movemask_ps(max_size_hit_mask_ps));
-      if constexpr (use_supercdc_minmax_adjustment) {
-        lane_has_result &= _mm256_movemask_ps(_mm256_castsi256_ps(minmax_adjustment_ready_vmask));
+      lane_not_marked_for_jump = _mm256_movemask_ps(_mm256_castsi256_ps(lane_not_marked_for_jump_vec));
+
+      // We order the condition checks by probability, with reasonable min_size/masks that a lane hash a hash that satisfies the condition is already pretty rare,
+      // so most of the time we are better checking that before bothering to check all the others conditions.
+      // Other than the max_size which also needs to always be checked.
+      int lane_has_result = _mm256_movemask_ps(_mm256_or_ps(hash_eq_mask_ps, max_size_hit_mask_ps));
+      if (lane_has_result != 0) {
+        lane_has_result &= is_lane_not_finished & lane_not_marked_for_jump;
+        if constexpr (use_supercdc_minmax_adjustment) {
+          lane_has_result &= _mm256_movemask_ps(_mm256_castsi256_ps(minmax_adjustment_ready_vmask));
+        }
       }
 
       if (lane_has_result != 0) {
@@ -742,12 +732,12 @@ void cdc_find_cut_points_with_invariance(
       if (!(lane_not_marked_for_jump & 0b01000000)) { adjust_lane_for_jump(6); }
       if (!(lane_not_marked_for_jump & 0b10000000)) { adjust_lane_for_jump(7); }
 
-      lane_not_marked_for_jump = 0b11111111;
+      lane_not_marked_for_jump_vec = _mm256_set1_epi32(0xFFFFFFFF);
     }
   }
 
   auto i = vindex.m256i_i32[7];
-  pattern = hash.m256i_i32[7];  // Recover hash value from last lane
+  auto pattern = hash.m256i_i32[7];  // Recover hash value from last lane
   // Deal with any trailing data sequentially
   // TODO: Check backup mask? anything else I am missing here?
   while (i < data.size()) {
@@ -3082,11 +3072,16 @@ void test_mode(const std::string& file_path, uint64_t file_size) {
   };
 
   bool is_first_segment = true;
+  //print_to_console("dale gil\n");
+  //get_char_with_echo();
+
   auto chunking_start_time = std::chrono::high_resolution_clock::now();
   for (uint64_t i = 0; i < segments.size(); i++) {
     std::tie(std::get<0>(results[i]), std::ignore) = find_cdc_cut_candidates<false>(segments[i], min_size, avg_size, max_size, is_first_segment);
     is_first_segment = false;
   }
+
+  //exit(0);
 
   for (uint64_t i = 0; i < results.size(); i++) {
     auto last_chunk_size = select_cut_point_candidates(
