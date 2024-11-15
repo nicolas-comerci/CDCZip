@@ -27,6 +27,7 @@
 class TaskPool {
 public:
   TaskPool();
+  TaskPool(size_t threadLimit);
   ~TaskPool();
 
   template<class F, class... Args>

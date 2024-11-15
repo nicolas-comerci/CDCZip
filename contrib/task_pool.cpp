@@ -23,6 +23,11 @@ TaskPool::TaskPool()
   , _threadLimit(std::max(1u, std::thread::hardware_concurrency()) - 1) {
 }
 
+TaskPool::TaskPool(size_t threadLimit)
+  : _state(INIT)
+  , _threadLimit(std::max<size_t>(1u, threadLimit) - 1) {
+}
+
 void TaskPool::_init() {
   _state = RUN;
   std::function<void(void)> workerLoop = [this] {
