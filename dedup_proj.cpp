@@ -768,11 +768,11 @@ void cdc_find_cut_points_with_invariance(
 
 template<
   bool compute_features,
-  bool avx2_allowed = true,
+  bool avx2_allowed = false,
   bool use_fastcdc_subminimum_skipping = true,
   bool use_fastcdc_normalized_chunking = true,
   bool use_supercdc_minmax_adjustment = true,
-  bool use_supercdc_backup_mask = false,
+  bool use_supercdc_backup_mask = true,
   typename CandidateFeaturesResult = std::conditional_t<compute_features, std::vector<std::vector<uint32_t>>, std::monostate>,
   typename CdcCandidatesResult = std::tuple<std::vector<CutPointCandidate>, CandidateFeaturesResult>
 >
@@ -3018,11 +3018,11 @@ void test_mode(const std::string& file_path, uint64_t file_size) {
   const auto file_size_mb = file_size / (1024.0 * 1024);
   const int alignment = 32;
 
-#ifndef _MSC_VER
-  const uint64_t adjusted_file_size = ((file_size + alignment - 1) / alignment) * alignment;
-  uint8_t* file_data = static_cast<uint8_t*>(std::aligned_alloc(32, adjusted_file_size));
+#ifndef __clang__
+  auto file_data = static_cast<uint8_t*>(_aligned_malloc(file_size, alignment));
 #else
-  uint8_t* file_data = static_cast<uint8_t*>(_aligned_malloc(file_size, alignment));
+  const uint64_t adjusted_file_size = ((file_size + alignment - 1) / alignment) * alignment;
+  auto file_data = static_cast<uint8_t*>(std::aligned_alloc(32, adjusted_file_size));
 #endif
 
   auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
@@ -3030,10 +3030,20 @@ void test_mode(const std::string& file_path, uint64_t file_size) {
     print_to_console("Can't read file\n");
     exit(1);
   }
-  file_stream.read(reinterpret_cast<char*>(file_data), file_size);
-  if (file_stream.gcount() != file_size) {
-    print_to_console("Couldn't read whole file\n");
-    exit(1);
+  {
+      uint64_t remaining = file_size;
+      char* data_ptr = reinterpret_cast<char*>(file_data);
+      while (remaining > 0) {
+          const auto read_amt = static_cast<std::streamsize>(std::min<uint64_t>(100 * 1024 * 1024, remaining));
+          file_stream.read(data_ptr, read_amt);
+          const auto actually_read = file_stream.gcount();
+          if (actually_read != read_amt) {
+              print_to_console("Couldn't read whole file\n");
+              exit(1);
+          }
+          remaining -= actually_read;
+          data_ptr += actually_read;
+      }
   }
 
   std::unordered_set<uint64_t> chunk_hashes{};
@@ -3243,10 +3253,10 @@ void test_mode(const std::string& file_path, uint64_t file_size) {
   print_to_console("Total dedup runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(dedup_elapsed_time).count()) + " seconds\n");
   print_to_console("Total test runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(test_elapsed_time).count()) + " seconds\n");
 
-#ifndef _MSC_VER
-  std::free(file_data);
-#else
+#ifndef __clang__
   _aligned_free(file_data);
+#else
+  std::free(file_data);
 #endif
 }
 
@@ -3316,7 +3326,7 @@ int main(int argc, char* argv[]) {
     exit(0);
   }
 
-  uint32_t avg_size = 512;
+  uint32_t avg_size = 256;
   uint32_t min_size = avg_size / 4;
   uint32_t max_size = avg_size * 8;
 
@@ -4208,7 +4218,7 @@ int main(int argc, char* argv[]) {
   print_to_console("Total runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_runtime_start_time).count()) + " seconds\n");
 
   print_to_console("Processing finished, press enter to quit.\n");
-  get_char_with_echo();
+  //get_char_with_echo();
   exit(0);  // Dirty, dirty, dirty, but should be fine as long all threads have finished, for exiting quickly until I refactor the codebase a little
   return 0;
 }
