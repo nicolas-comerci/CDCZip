@@ -38,7 +38,9 @@
 #include <unordered_set>
 #include <thread>
 
+#if defined(__AVX2__) || defined(__SSE2__)
 #include <immintrin.h>
+#endif
 
 #include "contrib/bitstream.h"
 #include "contrib/stream.h"
@@ -63,6 +65,8 @@ void set_std_handle_binary_mode(StdHandles handle) {}
 #endif
 
 #ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
 int ttyfd = -1;
 #endif
 
@@ -436,6 +440,7 @@ ReturnType cdc_next_offset(
   }
 }
 
+#if defined(__AVX2__)
 static int32_t _mm256_extract_epi32_var_indx(const __m256i vec, const unsigned int i) {
   const __m128i indx = _mm_cvtsi32_si128(i);
   const __m256i val = _mm256_permutevar8x32_epi32(vec, _mm256_castsi128_si256(indx));
@@ -785,6 +790,7 @@ void cdc_find_cut_points_with_invariance(
     }
   }
 }
+#endif
 
 template<
   bool compute_features,
@@ -851,7 +857,12 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
     }
   }
 
-  if (data.size() < 1024 || !avx2_allowed) {
+  if (
+    data.size() < 1024 || !avx2_allowed
+#ifndef __AVX2__
+    || true
+#endif
+) {
     while (!data.empty()) {
       if (base_offset == 0) {
         cdc_return = cdc_next_offset<compute_features, use_fastcdc_subminimum_skipping, use_fastcdc_normalized_chunking, use_supercdc_minmax_adjustment, use_supercdc_backup_mask>(
@@ -874,12 +885,14 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
       data = std::span(data.data() + cp.offset, data.size() - cp.offset);
     }
   }
+#ifdef __AVX2__
   else {
     cdc_find_cut_points_with_invariance<compute_features, use_fastcdc_subminimum_skipping, use_fastcdc_normalized_chunking, use_supercdc_minmax_adjustment, use_supercdc_backup_mask>(
       candidates, candidate_features, data, base_offset,
       min_size, avg_size, max_size, mask_hard, mask_medium, mask_easy
     );
   }
+#endif
 
   if constexpr (compute_features) {
     candidate_features.shrink_to_fit();
@@ -888,6 +901,7 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, uint32_t mi
   return result;
 }
 
+#if defined(__AVX2__)
 __m256i movemask_inverse_epi8(const uint32_t mask) {
   __m256i vmask(_mm256_set1_epi32(mask));
   const __m256i shuffle(_mm256_setr_epi64x(0x0000000000000000, 0x0101010101010101, 0x0202020202020202, 0x0303030303030303));
@@ -909,6 +923,7 @@ __m256i add_32bit_hash_to_simhash_counter(const uint32_t new_hash, __m256i count
 uint32_t finalize_32bit_simhash_from_counter(const __m256i counter_vector) {
   return _mm256_movemask_epi8(counter_vector);
 }
+#endif
 
 std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_shingling(uint8_t* data, uint32_t data_len, uint32_t chunk_size) {
   __m256i upper_counter_vector = _mm256_set1_epi8(0);
@@ -1031,6 +1046,7 @@ struct DeltaEncodingResult {
   std::vector<LZInstruction> instructions;
 };
 
+#if defined(__SSE2__)
 inline unsigned long trailingZeroesCount32(uint32_t mask) {
 #ifndef __GNUC__
   unsigned long result;
@@ -1053,12 +1069,14 @@ inline unsigned long leadingZeroesCount32(uint32_t mask) {
   return _lzcnt_u32(mask);
 #endif
 }
+#endif
 
 uint64_t find_identical_prefix_byte_count(const std::span<const uint8_t> data1_span, const std::span<const uint8_t> data2_span) {
   const auto cmp_size = std::min(data1_span.size(), data2_span.size());
   uint64_t matching_data_count = 0;
   uint64_t i = 0;
 
+#if defined(__AVX2__)
   const uint64_t avx2_batches = cmp_size / 32;
   if (avx2_batches > 0) {
     uint64_t avx2_batches_size = avx2_batches * 32;
@@ -1116,7 +1134,9 @@ uint64_t find_identical_prefix_byte_count(const std::span<const uint8_t> data1_s
       i += avx2_matching_data_count;
     }
   }
+#endif
 
+#if defined(__SSE2__)
   const uint64_t sse_batches = (cmp_size - i) / 16;
   if (sse_batches > 0) {
     uint64_t sse_batches_size = sse_batches * 16;
@@ -1174,6 +1194,7 @@ uint64_t find_identical_prefix_byte_count(const std::span<const uint8_t> data1_s
       i += sse_matching_data_count;
     }
   }
+#endif
 
   while (i < cmp_size) {
     const bool can_u64int_compare = cmp_size - i >= 8;
@@ -1198,6 +1219,7 @@ uint64_t find_identical_suffix_byte_count(const std::span<const uint8_t> data1_s
   uint64_t matching_data_count = 0;
   uint64_t i = 0;
 
+#if defined(__AVX2__)
   const uint64_t avx2_batches = cmp_size / 32;
   if (avx2_batches > 0) {
     uint64_t avx2_batches_size = avx2_batches * 32;
@@ -1255,7 +1277,9 @@ uint64_t find_identical_suffix_byte_count(const std::span<const uint8_t> data1_s
       i += avx2_matching_data_count;
     }
   }
+#endif
 
+#if defined(__SSE2__)
   const uint64_t sse_batches = (cmp_size - i) / 16;
   if (sse_batches > 0) {
     uint64_t sse_batches_size = sse_batches * 16;
@@ -1315,6 +1339,7 @@ uint64_t find_identical_suffix_byte_count(const std::span<const uint8_t> data1_s
       i += sse_matching_data_count;
     }
   }
+#endif
 
   while (i < cmp_size) {
     const bool can_u64int_compare = cmp_size - i >= 8;
@@ -3201,7 +3226,7 @@ void test_mode(const std::string& file_path, uint64_t file_size) {
     );
 
     current_offset = process_pending_chunks.back().offset + last_chunk_size;
-    curr_segment_start_offset += std::min(segments[i].size(), segment_size);
+    curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
   }
   auto chunking_end_time = std::chrono::high_resolution_clock::now();
 
@@ -3549,12 +3574,12 @@ int main(int argc, char* argv[]) {
     for (uint64_t i = 0; i < cdc_thread_count; i++) {
       if (segment_batch_data_span.empty()) break;
       auto current_segment_data = std::vector<uint8_t>();
-      current_segment_data.resize(std::min(segment_batch_data_span.size(), segment_size + 31));
+      current_segment_data.resize(std::min<uint64_t>(segment_batch_data_span.size(), segment_size + 31));
       current_segment_data.shrink_to_fit();
       std::copy_n(segment_batch_data_span.data(), current_segment_data.size(), current_segment_data.data());
       bool segments_eof = current_segment_data.size() != segment_size + 31;
 
-      const auto span_advance_size = std::min(current_segment_data.size(), segment_size);
+      const auto span_advance_size = std::min<uint64_t>(current_segment_data.size(), segment_size);
 
       cdc_candidates_futures.emplace_back(
         globalTaskPool.addTask(
