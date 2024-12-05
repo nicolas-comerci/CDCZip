@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 cmake_policy(SET CMP0091 NEW)
 
-project(dedup_proj)
+project(cdczip)
 
 set(SRCDIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(OBJDIR ${CMAKE_CURRENT_BINARY_DIR})
@@ -116,10 +116,10 @@ add_stem2file(BITSTREAM_HDR "${SRCDIR}/contrib/%STEM%.h" "stream;bit_helper;bits
 set(BITSTREAM_SRC "")
 add_stem2file(BITSTREAM_SRC "${SRCDIR}/contrib/%STEM%.cpp" "bit_helper;bitstream;task_pool;")
 
-set(DEDUP_PROJ_SRC "${SRCDIR}/dedup_proj.cpp")
+set(DEDUP_PROJ_SRC "${SRCDIR}/cdczip.cpp")
 
-#add_executable(dedup_proj ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${SSDEEP_SRC} ${BITSTREAM_HDR} ${BITSTREAM_SRC} )
-add_executable(dedup_proj ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${BITSTREAM_HDR} ${BITSTREAM_SRC} )
-#target_link_libraries(dedup_proj bert faiss)
+#add_executable(cdczip ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${SSDEEP_SRC} ${BITSTREAM_HDR} ${BITSTREAM_SRC} )
+add_executable(cdczip ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${BITSTREAM_HDR} ${BITSTREAM_SRC} )
+#target_link_libraries(cdczip bert faiss)
 
-install(TARGETS dedup_proj DESTINATION bin)
+install(TARGETS cdczip DESTINATION bin)
