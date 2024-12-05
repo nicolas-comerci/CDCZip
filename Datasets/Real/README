@@ -1,0 +1,77 @@
+Copyright (c) 2012-2016 Vasily Tarasov
+Copyright (c) 2012-2016 Geoff Kuenning
+Copyright (c) 2012-2014 Sonam Mandal
+Copyright (c) 2012-2016 Philip Shilane
+Copyright (c) 2012-2014 Sagar Trehan
+Copyright (c) 2012-2016 Erez Zadok
+Copyright (c) 2015-2016 Zhen "Jason" Sun
+Copyright (c) 2012-2016 Harvey Mudd College
+Copyright (c) 2012-2016 Stony Brook University
+Copyright (c) 2012-2016 Research Foundation for State University of New York
+
+The Research Foundation expressly disclaims any warranty of merchantability
+or fitness for a particular purpose and provides the snapshots "as is."
+
+*** GENERAL INFORMATION ***
+
+The Fslhomes dataset contains snapshots of students' home directories from a
+shared network file system.  The snapshots were collected in the File system
+and Storage Lab (FSL) at Stony Brook University.  A typical activity in the
+lab involves code development and debugging, paper writing, and other office
+activities.  The files consist of source code, binaries, office documents,
+virtual machine images, and other miscellaneous files.
+
+The snapshots were collected between the end of year 2011 and the beginning
+of year 2015.  Upon joining the lab the students were added to the list of
+active users and the snapshots of their home directories were preserved
+daily.  After graduating, the students were removed from the active users
+list.  If a student was out of the lab for a summer internship, we removed
+him or her from the active users list for the duration of their internship.
+In total, over the course of four years, 39 users were active during some
+time period.  At any given time, anywhere from half a dozen to a dozen users
+were active.
+
+We tried to collect the snapshots daily but it was not always possible.  If
+a snapshot for some date is missing, it means that for technical reasons the
+file system was not scanned on that day.
+
+Until Jan 25, 2012, the snapshots were collected with an average chunk size
+of 8KiB.  Afterwards, the snapshots were collected with multiple average
+chunk sizes of 2KiB, 4KiB, 8KiB, 16KiB, 32KiB, 64KiB, and 128KiB.  To make
+it clearer to figure this, we separated the snapshots that we distribute
+online, such that those that include only an 8kb chunking sizes are in a
+folder named YYYY-8kb-only.
+
+The date in the file's name corresponds to the date when the snapshot was
+taken.  In addition, each hash file internally stores the anonymization
+start and end dates.  The anonymization dates can be different from the
+snapshot date because snapshots were anonymized later on.
+
+For privacy reasons, file paths and chunk hashes were anonymized.  The
+anonymization process ensured the preservation of parent-child relationship
+between files and directories.  The process also guaranteed that the files
+that had the same names in the original snapshots have the same anonymized
+names.  To preserve valuable information about file types we did not
+anonymize file extensions.
+
+The fs-hasher package was used to collect the snapshots.  The package
+contains both a tool to read the snapshots (hf-stat), as well as a tool to
+collect the snapshots (fs-hasher).  The fs-hasher package is available for
+download from both the FSL-hosted Web-site and the SNIA IOTTA repository:
+
+	1) http://tracer.filesystems.org
+
+	2) http://iotta.snia.org/tools
+
+The server tracer.filesystems.org also hosts other traces and snapshots
+collected by the File system and Storage Lab (FSL).  Any questions regarding
+the snapshots and corresponding software should be sent to the following
+mailing list:
+
+	fsltraces@fsl.cs.sunysb.edu
+
+One can subscribe to this mailing list at:
+
+	http://www.fsl.cs.sunysb.edu/mailman/listinfo/fsltraces
+
+*** PER-SNAPSHOT INFORMATION AS PRINTED BY HF-STAT ***
