@@ -3020,10 +3020,261 @@ private:
   std::vector<char> data;
 };
 
+struct DecompressionWindowData {
+  uint64_t original_offset;
+  uint64_t size;
+};
+
+struct DecompressionWindowEntry {
+  uint64_t offset;
+  std::vector<DecompressionWindowData> data;
+};
+
+struct DecompressDictionaryEntry {
+  std::vector<char> data;
+  uint64_t owner_idx;
+};
+
+class DecompressionDictionary {
+public:
+  DecompressionDictionary(uint64_t _max_size) : max_size(_max_size) {}
+
+  void add(std::vector<char>&& data, uint64_t data_offset) {
+    DecompressionWindowEntry entry;
+    entry.offset = data_offset;
+    entry.data.emplace_back(data_offset, data.size());
+    dict[data_offset].data = std::move(data);
+    dict[data_offset].owner_idx = decompression_window.fullSize();
+    decompression_window.emplace_back(std::move(entry));
+
+    current_size += dict[data_offset].data.size();
+    if (current_size <= max_size) return;
+
+    // If we are here we need to evict data from the dictionary because we exceeded the max_size
+    while (current_size > max_size) {
+      auto window_entry_iter = decompression_window.begin();
+      uint64_t window_entry_idx = window_entry_iter.get_index();
+      auto& window_entry = decompression_window.front();
+      auto erase_range_end_iter = window_entry.data.begin();
+      for (auto& data_entry : window_entry.data) {
+        uint64_t current_original_offset = data_entry.original_offset;
+        // The dict entry might have gotten split, so walk through the dict, reclaiming space for any owned dict data
+        while (data_entry.size > 0) {
+          auto& dict_entry = dict[current_original_offset];
+          uint64_t dict_entry_size = dict_entry.data.size();
+
+          // If we own the dict entry we reclaim space
+          if (dict_entry.owner_idx == window_entry_idx) {
+            // If deleting the whole entry would be too much, we adapt it
+            if (current_size - dict_entry_size < max_size) {
+              const uint64_t to_delete_dict_data_size = current_size - max_size;
+              const uint64_t new_dict_entry_size = dict_entry_size - to_delete_dict_data_size;
+              const uint64_t new_original_offset = current_original_offset + to_delete_dict_data_size;
+              dict[new_original_offset].data.resize(new_dict_entry_size);
+              dict[new_original_offset].data.shrink_to_fit();
+              std::copy_n(dict_entry.data.data(), new_dict_entry_size, dict[new_original_offset].data.data());
+
+              current_size -= to_delete_dict_data_size;  // this should be max_size
+              data_entry.original_offset = new_original_offset;
+              dict_entry_size = to_delete_dict_data_size;
+            }
+            // We can delete the whole thing
+            else {
+              current_size -= dict_entry_size;
+            }
+
+            dict.erase(current_original_offset);
+          }
+
+          data_entry.size -= dict_entry_size;
+          if (current_size == max_size) {
+            break;
+          }
+          current_original_offset += dict_entry_size;
+        }
+
+        if (current_size == max_size) {
+          break;
+        }
+        ++erase_range_end_iter;
+      }
+
+      // If we didn't evict the whole window entry then remove from its data, else just pop the whole thing and continue
+      if (erase_range_end_iter != window_entry.data.end()) {
+        window_entry.data.erase(window_entry.data.begin(), erase_range_end_iter);
+        break;
+      }
+      decompression_window.pop_front();
+    }
+    decompression_window.shrink_to_fit();
+  }
+
+  void get(uint64_t output_stream_offset, const uint64_t copy_offset, uint64_t size, std::vector<char>& buffer) {
+    // Create new decompression window entry, so it's already there, and we can use its index for taking ownership of dictionary data.
+    const auto new_window_entry_idx = decompression_window.fullSize();
+    {
+      DecompressionWindowEntry new_entry;
+      new_entry.offset = output_stream_offset;
+      decompression_window.emplace_back(std::move(new_entry));
+    }
+    DecompressionWindowEntry& new_window_entry = decompression_window.back();
+
+    // A COPY instruction might be overlapping with itself, which means we need to keep copying data already copied within the
+    // same COPY instruction (usually because of repeating patterns in data)
+    // In this case we have to only read again the non overlapping data
+    const uint64_t actual_read_size = std::min(size, output_stream_offset - copy_offset);
+    buffer.resize(size);
+    uint64_t buffer_pos = 0;
+
+    static constexpr auto compare_offset = [](const DecompressionWindowEntry& x, const DecompressionWindowEntry& y) { return x.offset < y.offset; };
+
+    auto search_entry = DecompressionWindowEntry();
+    search_entry.offset = copy_offset;
+    auto window_entry_iter = std::lower_bound(decompression_window.begin(), decompression_window.end() - 1, search_entry, compare_offset);
+    //auto window_entry_iter = std::ranges::lower_bound(std::as_const(decompression_window), search_entry, compare_offset);
+    if (window_entry_iter == decompression_window.cend() || (*window_entry_iter).offset > copy_offset) --window_entry_iter;
+
+    const DecompressionWindowEntry* window_entry = &*window_entry_iter;
+    auto window_data_iter = window_entry->data.begin();
+    auto current_offset = window_entry->offset;
+
+    // We might need to skip some data subentries on the prior window entry
+    while (copy_offset >= current_offset + window_data_iter->size) {
+      current_offset += window_data_iter->size;
+      ++window_data_iter;
+    }
+    uint64_t current_original_offset = window_data_iter->original_offset;
+    DecompressDictionaryEntry* dict_entry = &dict[current_original_offset];
+
+    // We need data from the current window data subentry, but not from its start, so we need to advance through the dict, minding previous splits
+    if (copy_offset > current_offset) {
+      const uint64_t in_data_entry_pos = copy_offset - current_offset;
+
+      // The dict entry might have gotten split so we might need to skip some dict entries to get to the in_data pos
+      while (current_original_offset + dict_entry->data.size() - window_data_iter->original_offset <= in_data_entry_pos) {
+        current_original_offset += dict_entry->data.size();
+        current_offset += dict_entry->data.size();
+        dict_entry = &dict[current_original_offset];
+      }
+
+      // Now that we are at a dict entry with some data we want, if we are not going to use the whole dict entry, we split it
+      const uint64_t dict_entry_skip_data_len = in_data_entry_pos - (current_original_offset - window_data_iter->original_offset);
+      if (dict_entry_skip_data_len > 0) {
+        const auto new_dict_entry_size = dict_entry->data.size() - dict_entry_skip_data_len;
+        current_original_offset += dict_entry_skip_data_len;
+        current_offset += dict_entry_skip_data_len;
+        dict[current_original_offset].data.resize(new_dict_entry_size);
+        dict[current_original_offset].data.shrink_to_fit();
+        std::copy_n(dict_entry->data.data() + dict_entry_skip_data_len, new_dict_entry_size, dict[current_original_offset].data.data());
+        dict[current_original_offset].owner_idx = dict_entry->owner_idx;
+        dict_entry->data.resize(dict_entry_skip_data_len);
+        dict_entry->data.shrink_to_fit();
+      }
+    }
+
+    // Okay finally we can start going through the data entries and later window entries, taking ownership of dict entries, until we get all the data
+    uint64_t remaining_size = actual_read_size;
+    while (remaining_size > 0) {
+      while (window_data_iter != window_entry->data.end()) {
+        dict_entry = &dict[current_original_offset];
+
+        // We might not be at a dict entry that corresponds to the start of the data entry, so we need to adapt to whatever has already been skipped.
+        // We need to keep track of this because the dict entries might have gotten split so we can't trust their sizes, but we can trust that
+        // there will be an entry that continues the original data for the data entry, if the dict entry size is not the same
+        uint64_t in_data_entry_remaining_size = std::min(
+          window_data_iter->size - (current_original_offset - window_data_iter->original_offset),
+          remaining_size
+        );
+        while (in_data_entry_remaining_size > 0) {
+          // We might need to split the last dict entry if we don't need all of it's data
+          if (remaining_size < dict_entry->data.size()) {
+            const auto new_dict_entry_size = dict_entry->data.size() - remaining_size;
+            dict[current_original_offset + remaining_size].data.resize(new_dict_entry_size);
+            dict[current_original_offset + remaining_size].data.shrink_to_fit();
+            std::copy_n(dict_entry->data.data() + remaining_size, new_dict_entry_size, dict[current_original_offset + remaining_size].data.data());
+            dict[current_original_offset + remaining_size].owner_idx = dict_entry->owner_idx;
+            dict_entry->data.resize(remaining_size);
+            dict_entry->data.shrink_to_fit();
+          }
+
+          // Take ownership of dict entry and copy data to buffer
+          dict_entry->owner_idx = new_window_entry_idx;
+          std::copy_n(dict_entry->data.data(), dict_entry->data.size(), buffer.data() + buffer_pos);
+          buffer_pos += dict_entry->data.size();
+
+          // Add data subentry to new window entry
+          new_window_entry.data.emplace_back(current_original_offset, dict_entry->data.size());
+
+          current_original_offset += dict_entry->data.size();
+          remaining_size -= dict_entry->data.size();
+          in_data_entry_remaining_size -= dict_entry->data.size();
+          if (in_data_entry_remaining_size > 0) {
+            dict_entry = &dict[current_original_offset];
+          }
+        }
+        
+        if (remaining_size == 0) break;
+
+        ++window_data_iter;
+        if (window_data_iter != window_entry->data.end()) {
+          current_original_offset = window_data_iter->original_offset;
+        }
+      }
+
+      ++window_entry_iter;
+      if ((*window_entry_iter).offset == new_window_entry.offset && remaining_size > 0) {
+        print_to_console("Catastrophic error during decompression");
+        exit(1);
+      }
+      else {
+        window_entry = &*window_entry_iter;
+        window_data_iter = window_entry->data.begin();
+        current_original_offset = window_data_iter->original_offset;
+      }
+    }
+
+    // In case we had overlapping COPY, we need to repeat the dict entries until all the size has been covered
+    remaining_size = size - actual_read_size;
+    // We are going to add more data entries, but we only want to keep iterating on the original non overlapping data ones
+    const uint64_t non_overlapping_data_entries_size = new_window_entry.data.size();
+    while (remaining_size > 0) {
+      for (uint64_t i = 0; i < non_overlapping_data_entries_size; i++) {
+        auto& data_entry = new_window_entry.data[i];
+        dict_entry = &dict[data_entry.original_offset];
+
+        // split the entry and use the first "half" if the data entry is larger than we need
+        if (data_entry.size > remaining_size) {
+          const auto new_dict_entry_size = data_entry.size - remaining_size;
+          dict[data_entry.original_offset + remaining_size].data.resize(new_dict_entry_size);
+          dict[data_entry.original_offset + remaining_size].data.shrink_to_fit();
+          std::copy_n(dict_entry->data.data() + remaining_size, new_dict_entry_size, dict[data_entry.original_offset + remaining_size].data.data());
+          dict[data_entry.original_offset + remaining_size].owner_idx = dict_entry->owner_idx;
+          dict_entry->data.resize(remaining_size);
+          dict_entry->data.shrink_to_fit();
+        }
+
+        new_window_entry.data.emplace_back(data_entry.original_offset, dict_entry->data.size());
+        std::copy_n(dict_entry->data.data(), dict_entry->data.size(), buffer.data() + buffer_pos);
+        buffer_pos += dict_entry->data.size();
+        remaining_size -= dict_entry->data.size();
+
+        if (remaining_size == 0) break;
+      }
+    }
+  }
+
+private:
+  uint64_t max_size;
+  uint64_t current_size = 0;
+
+  std::unordered_map<uint64_t, DecompressDictionaryEntry> dict;
+  circular_vector<DecompressionWindowEntry> decompression_window;
+};
+
 template<typename T>
-void decompress(T& output_iostream, BitInputStream& bit_input_stream) {
-  std::vector<char> buffer;
+void decompress(T& output_iostream, BitInputStream& bit_input_stream, DecompressionDictionary& dict) {
   uint64_t current_offset = 0;
+
   auto instruction = bit_input_stream.get(8);
   while (!bit_input_stream.eof()) {
     const auto eof = output_iostream.eof();
@@ -3036,9 +3287,10 @@ void decompress(T& output_iostream, BitInputStream& bit_input_stream) {
 
     uint64_t size = bit_input_stream.getVLI();
 
-    const auto prev_write_pos = output_iostream.tellp();
     if (instruction == LZInstructionType::INSERT) {
+      std::vector<char> buffer;
       buffer.resize(size);
+      buffer.shrink_to_fit();
 
       for (uint64_t i = 0; i < size; i++) {
         // pre-peak 64bits (or whatever amount of bits for the bytes left if at the end) so they are buffered and we don't read
@@ -3052,28 +3304,16 @@ void decompress(T& output_iostream, BitInputStream& bit_input_stream) {
         buffer[i] = read_char;
       }
       output_iostream.write(buffer.data(), size);
+      dict.add(std::move(buffer), current_offset);
     }
     else {  // LZInstructionType::COPY
       output_iostream.flush();
       uint64_t relative_offset = bit_input_stream.getVLI();
-      uint64_t offset = current_offset - relative_offset;
+      uint64_t copy_offset = current_offset - relative_offset;
 
-      // A COPY instruction might be overlapping with itself, which means we need to keep copying data already copied within the
-      // same COPY instruction (usually because of repeating patterns in data)
-      // In this case we have to only read again the non overlapping data
-      const auto actual_read_size = std::min(size, static_cast<uint64_t>(prev_write_pos) - offset);
-      buffer.resize(actual_read_size);
-
-      output_iostream.seekg(offset);
-      output_iostream.read(buffer.data(), actual_read_size);
-
-      output_iostream.seekp(prev_write_pos);
-      auto remaining_size = size;
-      while (remaining_size > 0) {
-        const auto write_size = std::min(remaining_size, actual_read_size);
-        output_iostream.write(buffer.data(), write_size);
-        remaining_size -= write_size;
-      }
+      std::vector<char> buffer;
+      dict.get(current_offset, copy_offset, size, buffer);
+      output_iostream.write(buffer.data(), buffer.size());
     }
 
     current_offset += size;
@@ -3364,6 +3604,16 @@ int main(int argc, char* argv[]) {
       print_to_console("Can't read file\n");
       return 1;
     }
+
+    std::array<char, 12> header;
+    file_stream.read(header.data(), 12);
+    if (header[0] != 'C' || header[1] != 'D' || header[2] != 'C' || header[3] != 'Z') {
+      print_to_console("Input is not a CDCZip deduplicated stream!\n");
+      exit(1);
+    }
+    uint64_t dict_size = *reinterpret_cast<uint64_t*>(&header[4]);
+
+    auto dict = DecompressionDictionary(dict_size);
     auto decompress_start_time = std::chrono::high_resolution_clock::now();
 
     std::string& decomp_file_path = cli_params["decomp_file_path"];
@@ -3376,19 +3626,22 @@ int main(int argc, char* argv[]) {
     else {
       decomp_file_stream.open(decomp_file_path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
     }
+
     auto wrapped_input_stream = WrappedIStreamInputStream(&file_stream);
     auto bit_input_stream = BitInputStream(wrapped_input_stream);
 
     if (just_hash) {
-      decompress(*decomp_hash_stream, bit_input_stream);
+      decompress(*decomp_hash_stream, bit_input_stream, dict);
       decomp_hash_stream->print_hash();
     }
     else {
-      decompress(decomp_file_stream, bit_input_stream);
+      decompress(decomp_file_stream, bit_input_stream, dict);
+      decomp_file_stream.flush();
     }
 
     auto decompress_end_time = std::chrono::high_resolution_clock::now();
     print_to_console("Decompression finished in " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(decompress_end_time - decompress_start_time).count()) + " seconds!\n");
+    exit(0);
     return 0;
   }
 
@@ -3529,6 +3782,17 @@ int main(int argc, char* argv[]) {
   auto dump_file = std::ofstream(/*file_path + ".ddp", std::ios::out | std::ios::binary | std::ios::trunc*/);
   set_std_handle_binary_mode(StdHandles::STDOUT_HANDLE);
   reinterpret_cast<std::ostream*>(&dump_file)->rdbuf(std::cout.rdbuf());
+  dump_file.put('C');
+  dump_file.put('D');
+  dump_file.put('C');
+  dump_file.put('Z');
+  if (dictionary_size_limit.has_value()) {
+    dump_file.write(reinterpret_cast<const char*>(&*dictionary_size_limit), 8);
+  }
+  else {
+    dump_file.put(0); dump_file.put(0); dump_file.put(0); dump_file.put(0); dump_file.put(0); dump_file.put(0); dump_file.put(0); dump_file.put(0);
+  }
+  
   LZInstructionManager lz_manager{ &chunks, use_match_extension_backwards, use_match_extension, &dump_file };
 
   static constexpr auto similar_chunk_tuple_cmp = [](const std::tuple<uint64_t, uint64_t>& a, const std::tuple<uint64_t, uint64_t>& b) {
