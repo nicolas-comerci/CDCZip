@@ -2278,6 +2278,13 @@ public:
   }
 };
 
+struct ChunkIndexEntry {
+  uint64_t chunk_id;
+  circular_vector<uint64_t> instances_idx;
+};
+
+using ChunkIndex = std::unordered_map<std::bitset<64>, ChunkIndexEntry>;
+
 std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<utility::ChunkEntry>& chunks, uint64_t offset) {
   static constexpr auto compare_offset = [](const utility::ChunkEntry& x, const utility::ChunkEntry& y) { return x.offset < y.offset; };
 
@@ -3020,10 +3027,115 @@ private:
   std::vector<char> data;
 };
 
+class CircularBuffer {
+public:
+    explicit CircularBuffer(uint64_t size) {
+        data.resize(size);
+    }
+
+    std::tuple<std::span<const uint8_t>, std::span<const uint8_t>> getSpansForRead(uint64_t size = 0, bool fromEnd = false) const {
+        if (size == 0) size = m_usedSize;
+        if (size > m_usedSize) throw std::runtime_error("Tried to read more data than available on CircularBuffer");
+        std::tuple<std::span<const uint8_t>, std::span<const uint8_t>> ret_val;
+        std::span<const uint8_t>& pre_wrapping_data = std::get<0>(ret_val);
+        std::span<const uint8_t>& post_wrapping_data = std::get<1>(ret_val);
+
+        // If the circular buffer is not full and wrapped around yet then m_dataStartOffset=0 so we get all the data in the pre_wrapping_data.
+        // Otherwise m_usedSize=data.size() and we get all the data after m_dataStartOffset in the pre_wrapping_data, and the rest in the post_wrapping_data.
+        pre_wrapping_data = std::span(data.data() + m_dataStartOffset, m_usedSize - m_dataStartOffset);
+        post_wrapping_data = std::span(data.data(), m_dataStartOffset);
+
+        // If the whole circular buffer data wasn't requested we adjust the spans so that only the requested amount (from the start or end)
+        // is returned
+        if (size != m_usedSize) {
+            if (fromEnd) {
+                if (post_wrapping_data.size() >= size) {
+                    const auto excess_data_size = post_wrapping_data.size() - size;
+                    post_wrapping_data = std::span(post_wrapping_data.data() + excess_data_size, post_wrapping_data.size() - excess_data_size);
+                    // We are getting data from the end and the post warpping data is already more than enough, so pre_wrapping_data get cleared
+                    pre_wrapping_data = std::span(data.data(), 0);
+                }
+                size -= post_wrapping_data.size();
+
+                if (size > 0) {
+#ifndef NDEBUG
+                    if (pre_wrapping_data.size() < size) throw std::runtime_error("getSpansForRead fromEnd somehow we don't have enough data!");
+#endif
+                    const auto excess_data_size = pre_wrapping_data.size() - size;
+                    pre_wrapping_data = std::span(pre_wrapping_data.data() + excess_data_size, pre_wrapping_data.size() - excess_data_size);
+                }
+            }
+            else {
+                if (pre_wrapping_data.size() >= size) {
+                    const auto excess_data_size = pre_wrapping_data.size() - size;
+                    pre_wrapping_data = std::span(pre_wrapping_data.data(), pre_wrapping_data.size() - excess_data_size);
+                    post_wrapping_data = std::span(data.data(), 0);
+                }
+                size -= pre_wrapping_data.size();
+
+                if (size > 0) {
+#ifndef NDEBUG
+                    if (post_wrapping_data.size() < size) throw std::runtime_error("getSpansForRead somehow we don't have enough data!");
+#endif
+                    const auto excess_data_size = post_wrapping_data.size() - size;
+                    post_wrapping_data = std::span(post_wrapping_data.data(), post_wrapping_data.size() - excess_data_size);
+                }
+            }
+        }
+        return ret_val;
+    }
+
+    std::tuple<std::span<uint8_t>, std::span<uint8_t>> getSpansForWrite(const uint64_t size) {
+        if (size > data.size()) throw std::runtime_error("Tried to write more data than available size on CircularBuffer");
+        uint64_t remaining_size = size;
+        std::tuple<std::span<uint8_t>, std::span<uint8_t>> ret_val;
+        std::span<uint8_t>& pre_wrapping_data = std::get<0>(ret_val);
+        std::span<uint8_t>& post_wrapping_data = std::get<1>(ret_val);
+
+        // First we set the span for the data before we need to wrap around the circular buffer
+        const auto unused_size = data.size() - m_usedSize;
+        if (unused_size > 0) {  // CircularBuffer not even full, can just add data at the end
+            const uint64_t to_add_size = std::min(size, unused_size);
+            pre_wrapping_data = std::span(data.data() + m_usedSize, to_add_size);
+            m_usedSize += to_add_size;
+            remaining_size -= to_add_size;
+        }
+        else {  // CircularBuffer is already full, get data after the m_dataStartOffset
+            const uint64_t non_wrapped_data_end = std::min(m_dataStartOffset + size, data.size());
+            const uint64_t non_wrapped_size = non_wrapped_data_end - m_dataStartOffset;
+            pre_wrapping_data = std::span(data.data() + m_dataStartOffset, non_wrapped_size);
+            remaining_size -= non_wrapped_size;
+
+            m_dataStartOffset += non_wrapped_size;
+            if (m_dataStartOffset == data.size()) m_dataStartOffset = 0;
+        }
+        if (remaining_size == 0) return ret_val;  // If we got the size requested with just the pre_wrapping_data we quit here
+
+#ifndef NDEBUG
+        if (m_dataStartOffset != 0) throw std::runtime_error("Wrapping around but m_dataStartOffset is not 0!");
+#endif
+        // If we are here, there is some data size that we need to take, after wrapping to the beginning of the circular buffer
+        post_wrapping_data = std::span(data.data(), remaining_size);
+        m_dataStartOffset = remaining_size;
+#ifndef NDEBUG
+        if (pre_wrapping_data.size() + post_wrapping_data.size() != size) throw std::runtime_error("getSpansForWrite got incorrect data size!");
+#endif
+        return ret_val;
+    }
+
+private:
+    std::vector<uint8_t> data;
+    uint64_t m_dataStartOffset = 0;
+    uint64_t m_usedSize = 0;
+};
+
 template<typename T>
-void decompress(T& output_iostream, BitInputStream& bit_input_stream) {
-  std::vector<char> buffer;
+void decompress(T& output_iostream, BitInputStream& bit_input_stream, uint64_t dict_size) {
+  std::vector<char> read_buffer;
   uint64_t current_offset = 0;
+  auto lzDict = CircularBuffer(dict_size);
+  bool isSeekMode = dict_size == 0;  // If dict_size is zero then we are in SEEK mode, and we just seek back in the output file itself to get the data
+
   auto instruction = bit_input_stream.get(8);
   while (!bit_input_stream.eof()) {
     const auto eof = output_iostream.eof();
@@ -3036,22 +3148,19 @@ void decompress(T& output_iostream, BitInputStream& bit_input_stream) {
 
     uint64_t size = bit_input_stream.getVLI();
 
-    const auto prev_write_pos = output_iostream.tellp();
     if (instruction == LZInstructionType::INSERT) {
-      buffer.resize(size);
+      read_buffer.resize(size);
+      const auto read_amt = bit_input_stream.readBytes(reinterpret_cast<unsigned char*>(read_buffer.data()), size);
+      if (read_amt != size) throw std::runtime_error("Unable to read expected INSERT data");
+      output_iostream.write(read_buffer.data(), size);
 
-      for (uint64_t i = 0; i < size; i++) {
-        // pre-peak 64bits (or whatever amount of bits for the bytes left if at the end) so they are buffered and we don't read
-        // byte-by-byte
-        if (i % 8 == 0) {
-          const auto to_peek = std::min<uint64_t>(64, (size - i) * 8);
-          bit_input_stream.peek(static_cast<uint32_t>(to_peek));
-        }
-        const auto read = bit_input_stream.get(8);
-        const char read_char = read & 0xFF;
-        buffer[i] = read_char;
+      if (!isSeekMode) {  // Add INSERTed data to the lzDict
+          auto [pre_wrap_data, post_wrap_data] = lzDict.getSpansForWrite(size);
+          std::copy_n(read_buffer.data(), pre_wrap_data.size(), pre_wrap_data.data());
+          if (!post_wrap_data.empty()) {
+              std::copy_n(read_buffer.data() + pre_wrap_data.size(), post_wrap_data.size(), post_wrap_data.data());
+          }
       }
-      output_iostream.write(buffer.data(), size);
     }
     else {  // LZInstructionType::COPY
       output_iostream.flush();
@@ -3061,18 +3170,64 @@ void decompress(T& output_iostream, BitInputStream& bit_input_stream) {
       // A COPY instruction might be overlapping with itself, which means we need to keep copying data already copied within the
       // same COPY instruction (usually because of repeating patterns in data)
       // In this case we have to only read again the non overlapping data
-      const auto actual_read_size = std::min(size, static_cast<uint64_t>(prev_write_pos) - offset);
-      buffer.resize(actual_read_size);
+      const uint64_t prev_write_pos = output_iostream.tellp();
+      const auto actual_read_size = std::min(size, prev_write_pos - offset);
+      read_buffer.resize(actual_read_size);
 
-      output_iostream.seekg(offset);
-      output_iostream.read(buffer.data(), actual_read_size);
+      if (isSeekMode) {
+          output_iostream.seekg(offset);
+          output_iostream.read(read_buffer.data(), actual_read_size);
+          output_iostream.seekp(prev_write_pos);
+      }
+      else {
+          auto [pre_wrap_data, post_wrap_data] = lzDict.getSpansForRead(relative_offset, true);
+#ifndef NDEBUG
+          output_iostream.seekg(offset);
+          output_iostream.read(read_buffer.data(), actual_read_size);
+          output_iostream.seekp(prev_write_pos);
 
-      output_iostream.seekp(prev_write_pos);
-      auto remaining_size = size;
-      while (remaining_size > 0) {
-        const auto write_size = std::min(remaining_size, actual_read_size);
-        output_iostream.write(buffer.data(), write_size);
-        remaining_size -= write_size;
+          const auto pre_wrap_data_size = std::min<uint64_t>(pre_wrap_data.size(), actual_read_size);
+          auto cmp_result = std::memcmp(read_buffer.data(), pre_wrap_data.data(), pre_wrap_data_size);
+          if (cmp_result != 0) throw std::runtime_error("Data gotten from the dict pre_wrap_data is different than the one from the file");
+          if (pre_wrap_data_size < actual_read_size) {
+              cmp_result = std::memcmp(read_buffer.data() + pre_wrap_data_size, post_wrap_data.data(), actual_read_size - pre_wrap_data_size);
+              if (cmp_result != 0) throw std::runtime_error("Data gotten from the dict post_wrap_data is different than the one from the file");
+          }
+#endif
+          uint64_t data_size_from_pre_wrap_data = std::min(actual_read_size, pre_wrap_data.size());
+          if (data_size_from_pre_wrap_data > 0) std::copy_n(pre_wrap_data.data(), data_size_from_pre_wrap_data, read_buffer.data());
+          if (uint64_t data_size_from_post_wrap_data = actual_read_size - data_size_from_pre_wrap_data) {
+              std::copy_n(post_wrap_data.data(), data_size_from_post_wrap_data, read_buffer.data() + data_size_from_pre_wrap_data);
+          }
+      }
+
+      {
+          uint64_t remaining_size = size;
+          while (remaining_size > 0) {
+              const auto write_size = std::min(remaining_size, actual_read_size);
+              output_iostream.write(read_buffer.data(), write_size);
+              remaining_size -= write_size;
+          }
+      }
+
+      if (!isSeekMode) {  // COPY the data at the end of the lzDict
+        auto [pre_wrap_write_data, post_wrap_write_data] = lzDict.getSpansForWrite(size);
+        uint64_t remaining_size = size;
+        while (remaining_size > 0) {
+          const auto write_size = std::min(remaining_size, actual_read_size);
+          auto read_buffer_span = std::span(read_buffer.data(), write_size);
+          if (!pre_wrap_write_data.empty()) {
+            const auto pre_wrap_data_write_size = std::min(pre_wrap_write_data.size(), write_size);
+            std::copy_n(read_buffer_span.data(), pre_wrap_data_write_size, pre_wrap_write_data.data());
+            pre_wrap_write_data = std::span(pre_wrap_write_data.data() + pre_wrap_data_write_size, pre_wrap_write_data.size() - pre_wrap_data_write_size);
+            read_buffer_span = std::span(read_buffer_span.data() + pre_wrap_data_write_size, read_buffer_span.size() - pre_wrap_data_write_size);
+          }
+          if (!read_buffer_span.empty()) {  // if we still have data in the read buffer span then we must dump it into the post_wrap_write_data span
+            std::copy_n(read_buffer_span.data(), read_buffer_span.size(), post_wrap_write_data.data());
+            post_wrap_write_data = std::span(post_wrap_write_data.data() + read_buffer_span.size(), post_wrap_write_data.size() - read_buffer_span.size());
+          }
+          remaining_size -= write_size;
+        }
       }
     }
 
@@ -3364,6 +3519,17 @@ int main(int argc, char* argv[]) {
       print_to_console("Can't read file\n");
       return 1;
     }
+
+    std::array<char, 12> header;
+    file_stream.read(header.data(), 12);
+    if (header[0] != 'C' || header[1] != 'D' || header[2] != 'C' || header[3] != 'Z') {
+      print_to_console("Input is not a CDCZip deduplicated stream!\n");
+      exit(1);
+    }
+    uint64_t dict_size = *reinterpret_cast<uint64_t*>(&header[4]);
+    uint8_t flags;
+    file_stream.read(reinterpret_cast<char*>(&flags), 1);
+
     auto decompress_start_time = std::chrono::high_resolution_clock::now();
 
     std::string& decomp_file_path = cli_params["decomp_file_path"];
@@ -3380,11 +3546,11 @@ int main(int argc, char* argv[]) {
     auto bit_input_stream = BitInputStream(wrapped_input_stream);
 
     if (just_hash) {
-      decompress(*decomp_hash_stream, bit_input_stream);
+      decompress(*decomp_hash_stream, bit_input_stream, dict_size);
       decomp_hash_stream->print_hash();
     }
     else {
-      decompress(decomp_file_stream, bit_input_stream);
+      decompress(decomp_file_stream, bit_input_stream, dict_size);
     }
 
     auto decompress_end_time = std::chrono::high_resolution_clock::now();
@@ -3429,9 +3595,10 @@ int main(int argc, char* argv[]) {
   uint64_t delta_compressed_approx_size = 0;
   uint64_t delta_compressed_chunk_count = 0;
 
-  std::unordered_map<std::bitset<64>, circular_vector<uint64_t>> known_hashes{};  // Find chunk pos by hash
+  ChunkIndex known_hashes{};  // Find chunk pos by hash
 
   uint64_t chunk_i = 0;
+  uint64_t chunk_id = 0;
   uint64_t last_reduced_chunk_i = 0;
   std::vector<int32_t> pending_chunks_indexes(batch_size, 0);
   std::vector<uint8_t> pending_chunk_data(batch_size * max_size, 0);
@@ -3498,6 +3665,9 @@ int main(int argc, char* argv[]) {
     ? std::optional(static_cast<uint64_t>(std::stoi(cli_params["max_dict"])) * 1024 * 1024)
     : std::nullopt;
   uint64_t dictionary_size_used = 0;
+  // If true, a regular LZ77 Data Window will be used, which results in easiest/fastest decompression, otherwise matches will be outputted in terms of the chunks
+  // which a more complex and slows decompression process, but it allows for better deduplication ratios in heavily duplicated data
+  const bool lz77_mode = true;
   uint64_t first_non_out_of_range_chunk_i = 0;
 
   circular_vector<utility::ChunkEntry> chunks{};
@@ -3529,6 +3699,19 @@ int main(int argc, char* argv[]) {
   auto dump_file = std::ofstream(/*file_path + ".ddp", std::ios::out | std::ios::binary | std::ios::trunc*/);
   set_std_handle_binary_mode(StdHandles::STDOUT_HANDLE);
   reinterpret_cast<std::ostream*>(&dump_file)->rdbuf(std::cout.rdbuf());
+  dump_file.put('C');
+  dump_file.put('D');
+  dump_file.put('C');
+  dump_file.put('Z');
+  if (dictionary_size_limit.has_value()) {
+    dump_file.write(reinterpret_cast<const char*>(&*dictionary_size_limit), 8);
+  }
+  else {
+    dump_file.put(0); dump_file.put(0); dump_file.put(0); dump_file.put(0); dump_file.put(0); dump_file.put(0); dump_file.put(0); dump_file.put(0);
+  }
+  // Dump header config flags
+  dump_file.put(lz77_mode ? 0b1 : 0);
+
   LZInstructionManager lz_manager{ &chunks, use_match_extension_backwards, use_match_extension, &dump_file };
 
   static constexpr auto similar_chunk_tuple_cmp = [](const std::tuple<uint64_t, uint64_t>& a, const std::tuple<uint64_t, uint64_t>& b) {
@@ -3690,7 +3873,7 @@ int main(int argc, char* argv[]) {
         auto& previous_chunk = chunks[first_non_out_of_range_chunk_i];
 
         // Remove the out of range chunks from the indexes so they can't be used for dedup or delta
-        auto& hash_list = known_hashes[previous_chunk.chunk_data->hash];
+        auto& hash_list = known_hashes[previous_chunk.chunk_data->hash].instances_idx;
         if (hash_list.size() == 1) {
           known_hashes.erase(previous_chunk.chunk_data->hash);
 
@@ -3700,6 +3883,8 @@ int main(int argc, char* argv[]) {
         else {
           hash_list.pop_front();
           hash_list.shrink_to_fit();
+          // In LZ77 mode we always adjust the used window, because the space is spent for every instance of the chunk within the data window
+          if (lz77_mode) dictionary_size_used -= previous_chunk.chunk_data->data.size();
         }
 
         if (use_generalized_resemblance_detection) {
@@ -3797,7 +3982,7 @@ int main(int argc, char* argv[]) {
       }
     }
     if (!duplicate_chunk_i.has_value() && known_hashes.contains(chunk.chunk_data->hash)) {
-      const auto duplicate_chunk_i_candidate = known_hashes[chunk.chunk_data->hash].back();
+      const auto duplicate_chunk_i_candidate = known_hashes[chunk.chunk_data->hash].instances_idx.back();
       duplicate_chunk_i = duplicate_chunk_i_candidate >= first_non_out_of_range_chunk_i ? std::optional{duplicate_chunk_i_candidate} : std::nullopt;
     }
     const bool is_duplicate_chunk = duplicate_chunk_i.has_value();
@@ -3929,7 +4114,7 @@ int main(int argc, char* argv[]) {
           circular_vector<uint64_t> similarity_anchor_i_list;
           circular_vector<uint64_t>* chunks_with_similarity_anchor_hash;
           if (exhaustive_dupadj) {
-            chunks_with_similarity_anchor_hash = &known_hashes[chunks[*prev_similarity_locality_anchor_i].chunk_data->hash];
+            chunks_with_similarity_anchor_hash = &known_hashes[chunks[*prev_similarity_locality_anchor_i].chunk_data->hash].instances_idx;
           }
           else {
             similarity_anchor_i_list.emplace_back(*prev_similarity_locality_anchor_i);
@@ -4048,7 +4233,10 @@ int main(int argc, char* argv[]) {
 
       new_instructions.emplace_back(LZInstructionType::COPY, previous_chunk_instance.offset, chunk.chunk_data->data.size());
     }
-    known_hashes[chunk.chunk_data->hash].emplace_back(chunk_i);
+    if (!is_duplicate_chunk) {
+      known_hashes[chunk.chunk_data->hash].chunk_id = chunk_id++;
+    }
+    known_hashes[chunk.chunk_data->hash].instances_idx.emplace_back(chunk_i);
 
     // if similarity_locality_anchor has a value it means we either deduplicated the chunk or delta compressed it
     if (similarity_locality_anchor_i.has_value()) {
@@ -4073,7 +4261,7 @@ int main(int argc, char* argv[]) {
           circular_vector<uint64_t> backtrack_anchor_i_list;
           circular_vector<uint64_t>* chunks_with_backtrack_anchor_hash;
           if (exhaustive_dupadj) {
-            chunks_with_backtrack_anchor_hash = &known_hashes[chunks[backtrack_similarity_anchor_i].chunk_data->hash];
+            chunks_with_backtrack_anchor_hash = &known_hashes[chunks[backtrack_similarity_anchor_i].chunk_data->hash].instances_idx;
           }
           else {
             backtrack_anchor_i_list.emplace_back(backtrack_similarity_anchor_i);
@@ -4208,7 +4396,7 @@ int main(int argc, char* argv[]) {
       lz_manager.addInstruction({ .type = LZInstructionType::INSERT, .offset = chunk.offset, .size = chunk.chunk_data->data.size() }, chunk.offset, verify_addInstruction, chunks[first_non_out_of_range_chunk_i].offset);
     }
 
-    dictionary_size_used += is_duplicate_chunk ? 0 : chunk.chunk_data->data.size();
+    dictionary_size_used += !lz77_mode && is_duplicate_chunk ? 0 : chunk.chunk_data->data.size();
     chunk_i++;
     current_offset += chunk.chunk_data->data.size();
 
@@ -4252,7 +4440,7 @@ int main(int argc, char* argv[]) {
   print_to_console("In dictionary chunk count: " + std::to_string(chunks.size()) + "\n");
   print_to_console("In memory chunk count: " + std::to_string(chunks.innerVecSize()) + "\n");
   print_to_console("Real AVG chunk size: " + std::to_string(total_size / chunks.fullSize()) + "\n");
-  print_to_console("Total unique chunk count: " + std::to_string(known_hashes.size()) + "\n");
+  print_to_console("Total unique chunk count: " + std::to_string(chunk_id) + "\n");
   print_to_console("Total delta compressed chunk count: " + std::to_string(delta_compressed_chunk_count) + "\n");
 
   const auto total_accumulated_savings = lz_manager.accumulatedSavings();

@@ -64,6 +64,13 @@ public:
   size_t getReverse(const unsigned n) {
     return bitReverse(get(n), n);
   }
+  size_t readBytes(unsigned char* buffer, const size_t len) {
+    // If _bitsRemaining is not multiple of 8 (that is, we don't have a whole amount of bytes remaining) just quit
+    if (_bitsRemaining & 7) return 0;
+    const auto readCount = _input.read(buffer, len);
+    if (readCount < len) _eof = true;
+    return readCount;
+  }
   size_t copyBytesTo(OutputStream& output, const size_t len);
   uint64_t getVLI();
 
