@@ -3492,7 +3492,7 @@ int main(int argc, char* argv[]) {
 #ifndef NDEBUG
   get_char_with_echo();
 #endif
-  std::string file_path{ argv[1] };
+  std::string input_path{ argv[1] };
   bool do_decompression = false;
 
   std::unordered_map<std::string, std::string> cli_params;
@@ -3513,22 +3513,34 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  if (do_decompression) {  // decompress
-    auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
-    if (!file_stream.is_open()) {
-      print_to_console("Can't read file\n");
-      return 1;
-    }
+  auto input_stream = std::ifstream();
+  if (input_path == "-") {
+      set_std_handle_binary_mode(StdHandles::STDIN_HANDLE);
+      reinterpret_cast<std::istream*>(&input_stream)->rdbuf(std::cin.rdbuf());
+  }
+  else {
+      input_stream.open(input_path, std::ios::in | std::ios::binary);
+      if (!input_stream.is_open()) {
+          print_to_console("Can't read file\n");
+          return 1;
+      }
+  }
 
+  if (do_decompression) {  // decompress
     std::array<char, 12> header;
-    file_stream.read(header.data(), 12);
+    input_stream.read(header.data(), 12);
     if (header[0] != 'C' || header[1] != 'D' || header[2] != 'C' || header[3] != 'Z') {
       print_to_console("Input is not a CDCZip deduplicated stream!\n");
       exit(1);
     }
     uint64_t dict_size = *reinterpret_cast<uint64_t*>(&header[4]);
+    if (input_path == "-" && dict_size == 0) {
+        print_to_console("Can't decompress file from stdin as it is flagged as seekable stream only decompressable");
+        exit(1);
+    }
+
     uint8_t flags;
-    file_stream.read(reinterpret_cast<char*>(&flags), 1);
+    input_stream.read(reinterpret_cast<char*>(&flags), 1);
 
     auto decompress_start_time = std::chrono::high_resolution_clock::now();
 
@@ -3542,7 +3554,7 @@ int main(int argc, char* argv[]) {
     else {
       decomp_file_stream.open(decomp_file_path, std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
     }
-    auto wrapped_input_stream = WrappedIStreamInputStream(&file_stream);
+    auto wrapped_input_stream = WrappedIStreamInputStream(&input_stream);
     auto bit_input_stream = BitInputStream(wrapped_input_stream);
 
     if (just_hash) {
@@ -3558,10 +3570,10 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  uint64_t file_size = file_path == "-" ? 0 : std::filesystem::file_size(file_path);
+  uint64_t file_size = input_path == "-" ? 0 : std::filesystem::file_size(input_path);
 
   if (cli_params["test_mode"] == "true") {
-    test_mode(file_path, file_size);
+    test_mode(input_path, file_size);
     exit(0);
   }
 
@@ -3671,27 +3683,14 @@ int main(int argc, char* argv[]) {
   uint64_t first_non_out_of_range_chunk_i = 0;
 
   circular_vector<utility::ChunkEntry> chunks{};
-
-  auto file_stream = std::ifstream();
-  if (file_path == "-") {
-    set_std_handle_binary_mode(StdHandles::STDIN_HANDLE);
-    reinterpret_cast<std::istream*>(&file_stream)->rdbuf(std::cin.rdbuf());
-  }
-  else {
-    file_stream.open(file_path, std::ios::in | std::ios::binary);
-    if (!file_stream.is_open()) {
-      print_to_console("Can't read file\n");
-      return 1;
-    }
-  }
   
-  auto wrapped_file = IStreamWrapper(&file_stream);
+  auto wrapped_input_stream = IStreamWrapper(&input_stream);
 
   std::optional<uint64_t> similarity_locality_anchor_i{};
 
   auto verify_file_stream = std::fstream();
-  if (file_path != "-") {
-    verify_file_stream.open(file_path, std::ios::in | std::ios::binary);
+  if (input_path != "-") {
+    verify_file_stream.open(input_path, std::ios::in | std::ios::binary);
   }
   std::vector<uint8_t> verify_buffer{};
   std::vector<uint8_t> verify_buffer_delta{};
@@ -3759,18 +3758,18 @@ int main(int argc, char* argv[]) {
   bool is_first_segment = true;
 
   std::future<std::vector<uint8_t>> load_next_segment_batch_future;
-  auto load_next_segment_batch = [&wrapped_file, segment_batch_size]
+  auto load_next_segment_batch = [&wrapped_input_stream, segment_batch_size]
   (std::array<uint8_t, 31>&& _prev_segment_extend_data) -> std::vector<uint8_t> {
     std::array<uint8_t, 31> prev_segment_extend_data = std::move(_prev_segment_extend_data);
     std::vector<uint8_t> new_segment_batch_data;
-    new_segment_batch_data.resize(segment_batch_size + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
+    new_segment_batch_data.resize(segment_batch_size + 31);  // +31 bytes (our GEAR window size - 1) at the end so it overlaps with next segment as described in SS-CDC
 
     // We get the 31byte extension to be at the start of the new segment data
     std::copy_n(prev_segment_extend_data.data(), 31, new_segment_batch_data.data());
 
     // And attempt to load remaining data for the new segments including next segment extension
-    wrapped_file.read(new_segment_batch_data.data() + 31, segment_batch_size);
-    new_segment_batch_data.resize(31 + wrapped_file.gcount());
+    wrapped_input_stream.read(new_segment_batch_data.data() + 31, segment_batch_size);
+    new_segment_batch_data.resize(31 + wrapped_input_stream.gcount());
 
     new_segment_batch_data.shrink_to_fit();
     return new_segment_batch_data;
@@ -3856,9 +3855,9 @@ int main(int argc, char* argv[]) {
 
   {
     std::vector<uint8_t> segment_batch_data;
-    segment_batch_data.resize(segment_size * cdc_thread_count + 31);  // +31 bytes (our GEAR window size) at the end so it overlaps with next segment as described in SS-CDC
-    wrapped_file.read(segment_batch_data.data(), segment_batch_size + 31);
-    segment_batch_data.resize(wrapped_file.gcount());
+    segment_batch_data.resize(segment_size * cdc_thread_count + 31);  // +31 bytes (our GEAR window size - 1) at the end so it overlaps with next segment as described in SS-CDC
+    wrapped_input_stream.read(segment_batch_data.data(), segment_batch_size + 31);
+    segment_batch_data.resize(wrapped_input_stream.gcount());
     segment_batch_data.shrink_to_fit();
 
     launch_cdc_threads(segment_batch_data);
