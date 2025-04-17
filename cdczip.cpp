@@ -2509,6 +2509,56 @@ class LZInstructionManager {
     return extended_forwards_size;
   }
 
+  void verify_copy_instruction_data(char* buffer_ptr, char* verify_buffer_ptr, const LZInstruction& instruction, uint64_t prev_outputted_up_to_offset) {
+      auto [copy_instruction_chunk_i, copy_instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
+      auto [curr_instruction_chunk_i, curr_instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, outputted_up_to_offset);
+      auto* copy_instruction_chunk = &(*chunks)[copy_instruction_chunk_i];
+      auto* curr_instruction_chunk = &(*chunks)[curr_instruction_chunk_i];
+
+      uint64_t remaining_size = instruction.size;
+      while (remaining_size > 0) {
+          if (copy_instruction_chunk->chunk_data->data.size() == copy_instruction_chunk_pos) {
+              copy_instruction_chunk_i++;
+              copy_instruction_chunk_pos = 0;
+              copy_instruction_chunk = &(*chunks)[copy_instruction_chunk_i];
+          }
+          if (curr_instruction_chunk->chunk_data->data.size() == curr_instruction_chunk_pos) {
+              curr_instruction_chunk_i++;
+              curr_instruction_chunk_pos = 0;
+              curr_instruction_chunk = &(*chunks)[curr_instruction_chunk_i];
+          }
+          auto cmp_size = std::min<uint64_t>(
+              copy_instruction_chunk->chunk_data->data.size() - copy_instruction_chunk_pos,
+              curr_instruction_chunk->chunk_data->data.size() - curr_instruction_chunk_pos
+          );
+          cmp_size = std::min(cmp_size, remaining_size);
+          const auto copy_chunk_data = copy_instruction_chunk->chunk_data->data.data() + copy_instruction_chunk_pos;
+          const auto curr_chunk_data = curr_instruction_chunk->chunk_data->data.data() + curr_instruction_chunk_pos;
+
+          if (std::memcmp(curr_chunk_data, verify_buffer_ptr, cmp_size) != 0) {
+              print_to_console("ERROR ON CURR CHUNK DATA!\n");
+              print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
+              throw std::runtime_error("Verification error");
+          }
+          verify_buffer_ptr += cmp_size;
+          if (std::memcmp(copy_chunk_data, buffer_ptr, cmp_size) != 0) {
+              print_to_console("ERROR ON COPY CHUNK DATA!\n");
+              print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
+              throw std::runtime_error("Verification error");
+          }
+          buffer_ptr += cmp_size;
+
+          if (std::memcmp(copy_chunk_data, curr_chunk_data, cmp_size) != 0) {
+              print_to_console("Error while verifying outputted match with chunk data at offset " + std::to_string(outputted_up_to_offset) + "\n");
+              print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
+              throw std::runtime_error("Verification error");
+          }
+          remaining_size -= cmp_size;
+          copy_instruction_chunk_pos += cmp_size;
+          curr_instruction_chunk_pos += cmp_size;
+      }
+  }
+
 public:
   explicit LZInstructionManager(circular_vector<utility::ChunkEntry>* _chunks, bool _use_match_extension_backwards, bool _use_match_extension, std::ostream* _ostream)
     : chunks(_chunks), ostream(_ostream), output_stream(_ostream), bit_output_stream(output_stream),
@@ -2722,7 +2772,6 @@ public:
 
   void dump(std::istream& istream, bool verify_copies, std::optional<uint64_t> up_to_offset = std::nullopt, bool flush = false) {
     std::vector<char> buffer;
-    std::vector<char> verify_buffer;
 
     auto prev_outputted_up_to_offset = outputted_up_to_offset;
     while (instructions.size() != 0) {
@@ -2754,6 +2803,7 @@ public:
           buffer.resize(instruction.size);
           istream.read(buffer.data(), instruction.size);
 
+          thread_local std::vector<char> verify_buffer;
           istream.seekg(outputted_up_to_offset);
           verify_buffer.resize(instruction.size);
           istream.read(verify_buffer.data(), instruction.size);
@@ -2764,58 +2814,7 @@ public:
             throw std::runtime_error("Verification error");
           }
 
-          /*
-          auto* buffer_ptr = buffer.data();
-          auto* verify_buffer_ptr = verify_buffer.data();
-
-          auto [copy_instruction_chunk_i, copy_instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
-          auto [curr_instruction_chunk_i, curr_instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, outputted_up_to_offset);
-          auto* copy_instruction_chunk = &(*chunks)[copy_instruction_chunk_i];
-          auto* curr_instruction_chunk = &(*chunks)[curr_instruction_chunk_i];
-
-          uint64_t remaining_size = instruction.size;
-          while (remaining_size > 0) {
-            if (copy_instruction_chunk->chunk_data->data.size() == copy_instruction_chunk_pos) {
-              copy_instruction_chunk_i++;
-              copy_instruction_chunk_pos = 0;
-              copy_instruction_chunk = &(*chunks)[copy_instruction_chunk_i];
-            }
-            if (curr_instruction_chunk->chunk_data->data.size() == curr_instruction_chunk_pos) {
-              curr_instruction_chunk_i++;
-              curr_instruction_chunk_pos = 0;
-              curr_instruction_chunk = &(*chunks)[curr_instruction_chunk_i];
-            }
-            auto cmp_size = std::min<uint64_t>(
-              copy_instruction_chunk->chunk_data->data.size() - copy_instruction_chunk_pos,
-              curr_instruction_chunk->chunk_data->data.size() - curr_instruction_chunk_pos
-            );
-            cmp_size = std::min(cmp_size, remaining_size);
-            const auto copy_chunk_data = copy_instruction_chunk->chunk_data->data.data() + copy_instruction_chunk_pos;
-            const auto curr_chunk_data = curr_instruction_chunk->chunk_data->data.data() + curr_instruction_chunk_pos;
-
-            if (std::memcmp(curr_chunk_data, verify_buffer_ptr, cmp_size) != 0) {
-              print_to_console("ERROR ON CURR CHUNK DATA!\n");
-              print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
-              throw std::runtime_error("Verification error");
-            }
-            verify_buffer_ptr += cmp_size;
-            if (std::memcmp(copy_chunk_data, buffer_ptr, cmp_size) != 0) {
-              print_to_console("ERROR ON COPY CHUNK DATA!\n");
-              print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
-              throw std::runtime_error("Verification error");
-            }
-            buffer_ptr += cmp_size;
-
-            if (std::memcmp(copy_chunk_data, curr_chunk_data, cmp_size) != 0) {
-              print_to_console("Error while verifying outputted match with chunk data at offset " + std::to_string(outputted_up_to_offset) + "\n");
-              print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
-              throw std::runtime_error("Verification error");
-            }
-            remaining_size -= cmp_size;
-            copy_instruction_chunk_pos += cmp_size;
-            curr_instruction_chunk_pos += cmp_size;
-          }
-          */
+          //verify_copy_instruction_data(buffer.data(), verify_buffer.data(), instruction, prev_outputted_up_to_offset);
         }
       }
       prev_outputted_up_to_offset = outputted_up_to_offset;
@@ -3673,7 +3672,7 @@ int main(int argc, char* argv[]) {
   const bool verify_addInstruction = false;
   const bool verify_chunk_offsets = false;
 
-  const std::optional<uint64_t> dictionary_size_limit = argc == 3
+  const std::optional<uint64_t> dictionary_size_limit = cli_params.contains("max_dict")
     ? std::optional(static_cast<uint64_t>(std::stoi(cli_params["max_dict"])) * 1024 * 1024)
     : std::nullopt;
   uint64_t dictionary_size_used = 0;
