@@ -1062,8 +1062,7 @@ std::bitset<bit_size> hamming_base(const std::bitset<bit_size>& data) {
 
 enum LZInstructionType : uint8_t {
   COPY,
-  INSERT,
-  DELTA
+  INSERT
 };
 
 struct LZInstruction {
@@ -2306,6 +2305,16 @@ std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<ut
   return { chunk_i, chunk_pos };
 }
 
+enum CDCZipInstructionType : uint8_t {
+    INSERT_DATA,  // Data size followed by the raw data
+    INSERT_DATA_OPEN,  // Idem above but for CDC mode, this type specifies that the last chunk is not finished with this INSERT
+    COPY_DATA,  // Negative relative offset + size for LZ MODE, Single CDC chunk id otherwise
+    COPY_CDC_RANGE_OPEN_CHUNK,  // Single CDC chunk id + data size, this type specifies that the last chunk is not finished with this COPY
+    COPY_CDC_RANGE_CLOSED_CHUNK,  // Idem above but last chunk is fully finished
+    COPY_CDC_RANGE_OPEN_CHUNK_W_OFFSET,  // Single CDC chunk id + in chunk offset + data size, open chunk as in COPY_CDC_RANGE_OPEN_CHUNK
+    COPY_CDC_RANGE_CLOSED_CHUNK_W_OFFSET,  // Idem above but last chunk is fully finished
+};
+
 class LZInstructionManager {
   circular_vector<utility::ChunkEntry>* chunks;
   circular_vector<LZInstruction> instructions;
@@ -2316,6 +2325,7 @@ class LZInstructionManager {
 
   const bool use_match_extension_backwards;
   const bool use_match_extension;
+  const bool m_dumpInLZMode;
 
   uint64_t accumulated_savings = 0;
   uint64_t accumulated_extended_backwards_savings = 0;
@@ -2560,9 +2570,9 @@ class LZInstructionManager {
   }
 
 public:
-  explicit LZInstructionManager(circular_vector<utility::ChunkEntry>* _chunks, bool _use_match_extension_backwards, bool _use_match_extension, std::ostream* _ostream)
+  explicit LZInstructionManager(circular_vector<utility::ChunkEntry>* _chunks, bool _use_match_extension_backwards, bool _use_match_extension, bool dump_in_lzmode, std::ostream* _ostream)
     : chunks(_chunks), ostream(_ostream), output_stream(_ostream), bit_output_stream(output_stream),
-      use_match_extension_backwards(_use_match_extension_backwards), use_match_extension(_use_match_extension) {}
+      use_match_extension_backwards(_use_match_extension_backwards), use_match_extension(_use_match_extension), m_dumpInLZMode(dump_in_lzmode) {}
 
   ~LZInstructionManager() {
     bit_output_stream.flush();
@@ -2774,30 +2784,55 @@ public:
     std::vector<char> buffer;
 
     auto prev_outputted_up_to_offset = outputted_up_to_offset;
+    bool chunk_dump_incomplete = false;
     while (instructions.size() != 0) {
       if (up_to_offset.has_value() && outputted_up_to_offset > *up_to_offset) break;
       auto instruction = std::move(instructions.front());
       instructions.pop_front();
 
-      bit_output_stream.put(instruction.type, 8);
-      bit_output_stream.putVLI(instruction.size);
       if (instruction.type == LZInstructionType::INSERT) {
+        bit_output_stream.put(instruction.type, 8);
+        if (m_dumpInLZMode) {
+          bit_output_stream.putVLI(instruction.size);
+        }
+
         auto [instruction_chunk_i, instruction_chunk_pos] = get_chunk_i_and_pos_for_offset(*chunks, instruction.offset);
         buffer.resize(instruction.size);
         uint64_t written = 0;
+        std::vector<uint64_t> chunk_sizes{};
         while (written < instruction.size) {
           auto& instruction_chunk = (*chunks)[instruction_chunk_i];
           uint64_t to_read_from_chunk = std::min(instruction.size - written, instruction_chunk.chunk_data->data.size() - instruction_chunk_pos);
           std::copy_n(instruction_chunk.chunk_data->data.data() + instruction_chunk_pos, to_read_from_chunk, buffer.data() + written);
           written += to_read_from_chunk;
+          chunk_dump_incomplete = instruction_chunk_pos + to_read_from_chunk < instruction_chunk.chunk_data->data.size();
 
           instruction_chunk_i++;
           instruction_chunk_pos = 0;
+          if (!m_dumpInLZMode) {
+            chunk_sizes.push_back(to_read_from_chunk);
+          }
         }
+        if (!m_dumpInLZMode) {
+          bit_output_stream.putVLI(chunk_sizes.size());
+          for (auto& chunk_size : chunk_sizes) {
+            bit_output_stream.putVLI(chunk_size);
+          }
+	    }
         bit_output_stream.putBytes(reinterpret_cast<const uint8_t*>(buffer.data()), instruction.size);
       }
       else {
-        bit_output_stream.putVLI(outputted_up_to_offset - instruction.offset);
+        if (!m_dumpInLZMode) {
+          bit_output_stream.put(instruction.type, 8);
+          bit_output_stream.putVLI(instruction.size);
+          bit_output_stream.putVLI(outputted_up_to_offset - instruction.offset);
+        }
+        else {
+          bit_output_stream.put(instruction.type, 8);
+          bit_output_stream.putVLI(instruction.size);
+          bit_output_stream.putVLI(outputted_up_to_offset - instruction.offset);
+        }
+
         if (verify_copies) {
           istream.seekg(instruction.offset);
           buffer.resize(instruction.size);
@@ -3507,6 +3542,9 @@ int main(int argc, char* argv[]) {
     else if (param.starts_with("-test")) {
       cli_params["test_mode"] = "true";
     }
+    else if (param.starts_with("-cdc")) {
+        cli_params["lz_mode"] = "false";
+    }
     else {
       print_to_console("Bad arg: " + param + "\n");
     }
@@ -3540,6 +3578,11 @@ int main(int argc, char* argv[]) {
 
     uint8_t flags;
     input_stream.read(reinterpret_cast<char*>(&flags), 1);
+    const bool is_lzmode = flags & 0b1;
+    if (!is_lzmode) {
+        print_to_console("Only LZ mode supported at the moment!");
+        exit(1);
+    }
 
     auto decompress_start_time = std::chrono::high_resolution_clock::now();
 
@@ -3678,7 +3721,7 @@ int main(int argc, char* argv[]) {
   uint64_t dictionary_size_used = 0;
   // If true, a regular LZ77 Data Window will be used, which results in easiest/fastest decompression, otherwise matches will be outputted in terms of the chunks
   // which a more complex and slows decompression process, but it allows for better deduplication ratios in heavily duplicated data
-  const bool lz77_mode = true;
+  const bool lz77_mode = cli_params["lz_mode"] != "false";
   uint64_t first_non_out_of_range_chunk_i = 0;
 
   circular_vector<utility::ChunkEntry> chunks{};
@@ -3710,7 +3753,7 @@ int main(int argc, char* argv[]) {
   // Dump header config flags
   dump_file.put(lz77_mode ? 0b1 : 0);
 
-  LZInstructionManager lz_manager{ &chunks, use_match_extension_backwards, use_match_extension, &dump_file };
+  LZInstructionManager lz_manager{ &chunks, use_match_extension_backwards, use_match_extension, lz77_mode, &dump_file };
 
   static constexpr auto similar_chunk_tuple_cmp = [](const std::tuple<uint64_t, uint64_t>& a, const std::tuple<uint64_t, uint64_t>& b) {
     // 1st member is hamming dist, less hamming dist, better result, we want those tuple first, so we say they compare as lesser
