@@ -85,41 +85,24 @@ if ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
 endif ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
 
 set(XXHASH_SRC "${SRCDIR}/contrib/xxHash/xxhash.c")
-#set(SSDEEP_SRC "${SRCDIR}/contrib/ssdeep/fuzzy.c")
-
-# Bert
-#add_subdirectory(contrib/embeddings.cpp)
-#set(BERT_SRC "${SRCDIR}/contrib/embeddings.cpp/bert.cpp")
-#set(GGML_INCLUDE_DIR "${SRCDIR}/contrib/embeddings.cpp/ggml/include/ggml")
-#include_directories(AFTER ${GGML_INCLUDE_DIR})
-
-# netlib blas
-#add_subdirectory(contrib/BLAS)
-
-# compiled openblas
-#add_library(blas STATIC IMPORTED) # or STATIC instead of SHARED
-#set_target_properties(blas PROPERTIES
-#  IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/contrib/OpenBLAS-0.3.26-x64/lib/libopenblas.lib"
-#  INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/contrib/OpenBLAS-0.3.26-x64/include"
-#)
-#set(BLAS_LIBRARIES "blas")
-#set(NOFORTRAN True)
-#add_subdirectory(contrib/OpenBLAS-0.3.26)
-
-#set(FAISS_ENABLE_PYTHON OFF)
-#set(FAISS_ENABLE_GPU OFF)
-#set(BUILD_TESTING OFF)
-#add_subdirectory(contrib/faiss)
 
 set(BITSTREAM_HDR "")
 add_stem2file(BITSTREAM_HDR "${SRCDIR}/contrib/%STEM%.h" "stream;bit_helper;bitstream;task_pool;")
 set(BITSTREAM_SRC "")
 add_stem2file(BITSTREAM_SRC "${SRCDIR}/contrib/%STEM%.cpp" "bit_helper;bitstream;task_pool;")
 
-set(DEDUP_PROJ_SRC "${SRCDIR}/cdczip.cpp")
+set(CDCZIP_ALGOS_SRC "")
+add_stem2file(CDCZIP_ALGOS_SRC "${SRCDIR}/cdc_algos/%STEM%.cpp" "cdcz;")
 
-#add_executable(cdczip ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${SSDEEP_SRC} ${BITSTREAM_HDR} ${BITSTREAM_SRC} )
-add_executable(cdczip ${DEDUP_PROJ_SRC} ${XXHASH_SRC} ${BITSTREAM_HDR} ${BITSTREAM_SRC} )
-#target_link_libraries(cdczip bert faiss)
+set(CDCZIP_UTILS_SRC "")
+add_stem2file(CDCZIP_UTILS_SRC "${SRCDIR}/utils/%STEM%.cpp" "chunks;console_utils;io_utils;prefix_suffix_count;")
+
+set(CDCZIP_DELTA_SRC "")
+add_stem2file(CDCZIP_DELTA_SRC "${SRCDIR}/delta_compression/%STEM%.cpp" "encoding;simhash;")
+
+set(CDCZIP_SRC "${SRCDIR}/cdczip.cpp")
+set(CDCZ_TEST_SRC "${SRCDIR}/cdcz_test.cpp")
+
+add_executable(cdczip ${CDCZIP_SRC} ${CDCZ_TEST_SRC} ${CDCZIP_UTILS_SRC} ${CDCZIP_DELTA_SRC} ${CDCZIP_ALGOS_SRC} ${XXHASH_SRC} ${BITSTREAM_HDR} ${BITSTREAM_SRC} )
 
 install(TARGETS cdczip DESTINATION bin)
