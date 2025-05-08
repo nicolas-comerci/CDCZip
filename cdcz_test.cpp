@@ -11,8 +11,36 @@
 #include "utils/chunks.hpp"
 #include "utils/console_utils.hpp"
 
-void cdcz_test_mode(const std::string& file_path, uint64_t file_size) {
+struct ChunkTrace {
+  uint64_t hash;
+  uint64_t size;
+};
+
+void cdcz_test_mode(const std::string& file_path, uint64_t file_size, const std::string& trace_out_path, const std::string& trace_in_path) {
   print_to_console("TEST MODE\n");
+
+  auto trace_out = std::fstream();
+  if (!trace_out_path.empty()) {
+    trace_out.open(trace_out_path, std::ios::out | std::ios::trunc);
+    if (!trace_out.is_open()) {
+      print_to_console("Can't read trace out file\n");
+      exit(1);
+    }
+  }
+  std::vector<ChunkTrace> trace_inputs{};
+  if (!trace_in_path.empty()) {
+    auto trace_in = std::fstream(trace_in_path, std::ios::in);
+    if (!trace_in.is_open()) {
+      print_to_console("Can't read trace in file\n");
+      exit(1);
+    }
+    print_to_console("WARNING: using trace input to ensure chunks produced are expected ones, this will penalize Throughput slightly\n");
+    std::string line;
+    while (std::getline(trace_in, line)) {
+      auto space_pos = line.find(' ');
+      trace_inputs.emplace_back(std::stoull(line.substr(0, space_pos)), std::stoull(line.substr(space_pos + 1, line.size() - space_pos - 1)));
+    }
+  }
 
   const uint64_t min_size = 2048;
   const uint64_t avg_size = 8ull * 1024;
@@ -30,7 +58,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size) {
 
   auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
   if (!file_stream.is_open()) {
-    print_to_console("Can't read file\n");
+    print_to_console("Can't read test input file\n");
     exit(1);
   }
   {
@@ -83,13 +111,8 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size) {
     segments.emplace_back(file_data, file_size);
   }
 
-  std::vector<CdcCandidatesResult> results;
-  results.resize(segments.size());
-
   std::deque<utility::ChunkEntry> process_pending_chunks{};
   std::vector<uint8_t> prev_segment_remaining_data{};
-  uint64_t current_offset = 0;
-  uint64_t curr_segment_start_offset = 0;
   uint64_t current_segment_i = 0;
   uint64_t current_segment_pos = 0;
 
@@ -115,9 +138,6 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size) {
     return XXH3_64bits_digest(hash_state);
     };
 
-  //print_to_console("dale gil\n");
-  //get_char_with_echo();
-
   auto cdc_func = [&min_size, &avg_size, &max_size, &is_use_simd](std::span<uint8_t> segment_data, bool is_first_segment) {
     if (is_use_simd) {
       return find_cdc_cut_candidates<false, true>(segment_data, min_size, avg_size, max_size, is_first_segment);
@@ -127,89 +147,120 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size) {
     }
     };
 
-  bool is_first_segment = true;
-
   auto chunking_start_time = std::chrono::high_resolution_clock::now();
-  std::deque<std::future<CdcCandidatesResult>> cdc_candidates_futures;
-  for (uint64_t i = 0; i < segments.size(); i++) {
-    cdc_candidates_futures.emplace_back(
-      threadPool.addTask(
-        [&cdc_func, &segments, is_first_segment, i]() mutable {
-          return cdc_func(segments[i], is_first_segment);
-        }
-      )
-    );
-    is_first_segment = false;
-  }
-
-  for (uint64_t i = 0; i < segments.size(); i++) {
-    auto& future = cdc_candidates_futures.front();
-    results[i] = future.get();
-    cdc_candidates_futures.pop_front();
-  }
-
-  //exit(0);
-
-  for (uint64_t i = 0; i < results.size(); i++) {
-    auto last_chunk_size = select_cut_point_candidates(
-      results[i].candidates,
-      results[i].candidatesFeatureResults,
-      process_pending_chunks,
-      current_offset,
-      curr_segment_start_offset,
-      segments[i],
-      prev_segment_remaining_data,
-      min_size,
-      avg_size,
-      max_size,
-      i == results.size() - 1,
-      false,
-#ifdef NDEBUG
-      false
-#else
-      true
-#endif
-    );
-
-    current_offset = process_pending_chunks.back().offset + last_chunk_size;
-    curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
-  }
   auto chunking_end_time = std::chrono::high_resolution_clock::now();
 
-  XXH3_state_t* hash_state = XXH3_createState();
-  utility::ChunkEntry* prevChunk = nullptr;
-  auto dedup_start_time = std::chrono::high_resolution_clock::now();
-  for (auto& chunk : process_pending_chunks) {
-    if (prevChunk == nullptr) {
-      prevChunk = &chunk;
-      continue;
-    }
-    const auto chunk_size = chunk.offset - prevChunk->offset;
-    auto hash = make_chunk_hash(chunk_size, hash_state);
-#ifndef NDEBUG
-    auto hash_from_chunk_data = XXH3_64bits(prevChunk->chunk_data->data.data(), prevChunk->chunk_data->data.size());
-    if (hash != hash_from_chunk_data) {
-      print_to_console("ERROR: BAD CHUNK HASH, WILL MESS UP DEDUPLICATION\n");
-    }
-#endif
-    if (chunk_hashes.contains(hash)) {
-      deduped_size += chunk_size;
-    }
-    else {
-      chunk_hashes.emplace(hash);
+  {
+    std::deque<std::future<CdcCandidatesResult>> cdc_candidates_futures;
+    CdcCandidatesResult result;
+    bool is_first_segment = true;
+    uint64_t curr_segment_start_offset = 0;
+    uint64_t current_offset = 0;
+
+    uint64_t chunk_idx = 0;
+    auto pending_chunks_iter = process_pending_chunks.cbegin();
+
+    chunking_start_time = std::chrono::high_resolution_clock::now();
+    for (uint64_t i = 0; i < segments.size(); i++) {
+      cdc_candidates_futures.emplace_back(
+        threadPool.addTask(
+          [&cdc_func, &segments, is_first_segment, i]() mutable {
+            return cdc_func(segments[i], is_first_segment);
+          }
+        )
+      );
+      is_first_segment = false;
     }
 
-    prevChunk = &chunk;
+    for (uint64_t i = 0; i < segments.size(); i++) {
+      auto& future = cdc_candidates_futures.front();
+      result = future.get();
+
+      auto last_chunk_size = select_cut_point_candidates(
+        result.candidates,
+        result.candidatesFeatureResults,
+        process_pending_chunks,
+        current_offset,
+        curr_segment_start_offset,
+        segments[i],
+        prev_segment_remaining_data,
+        min_size,
+        avg_size,
+        max_size,
+        i == segments.size() - 1,
+        false,
+#ifdef NDEBUG
+        false
+#else
+        true
+#endif
+      );
+
+      if (!trace_inputs.empty()) {
+        if (i == 0) {
+          pending_chunks_iter = process_pending_chunks.cbegin();
+        }
+        else {
+          ++pending_chunks_iter;
+        }
+        while (pending_chunks_iter != process_pending_chunks.cend()) {
+          auto next_pending_chunk_iter = pending_chunks_iter + 1;
+          uint64_t chunk_size = next_pending_chunk_iter == process_pending_chunks.cend() ? last_chunk_size : next_pending_chunk_iter->offset - pending_chunks_iter->offset;
+          if (chunk_size != trace_inputs[chunk_idx].size) {
+            print_to_console(
+              "Chunk size mismatch for chunk idx " + std::to_string(chunk_idx) + ". Actual: " + std::to_string(chunk_size) +
+              ", Expected: " + std::to_string(trace_inputs[chunk_idx].size) + ".\n" +
+              "On segment " + std::to_string(i) + ", current_offset: " + std::to_string(current_offset) + ", segment offset: " + std::to_string(curr_segment_start_offset) + "\n"
+            );
+            exit(1);
+          }
+          pending_chunks_iter = next_pending_chunk_iter;
+          ++chunk_idx;
+        }
+        --pending_chunks_iter;  // leave the iter pointing to the last actual chunk, so for next segment when there are new chunks we can get to them from here
+      }
+
+      current_offset = process_pending_chunks.back().offset + last_chunk_size;
+      curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
+
+      cdc_candidates_futures.pop_front();
+    }
+    chunking_end_time = std::chrono::high_resolution_clock::now();
   }
-  {
-    const auto chunk_size = file_size - prevChunk->offset;
-    auto hash = make_chunk_hash(chunk_size, hash_state);
+
+  XXH3_state_t* hash_state = XXH3_createState();
+  auto chunks_iter = process_pending_chunks.cbegin();
+  uint64_t chunk_idx = 0;
+  auto dedup_start_time = std::chrono::high_resolution_clock::now();
+  while (chunks_iter != process_pending_chunks.cend()) {
+    const utility::ChunkEntry& chunk = *chunks_iter;
+    ++chunks_iter;
+    const uint64_t next_chunk_offset = chunks_iter == process_pending_chunks.cend() ? file_size : chunks_iter->offset;
+
+    const uint64_t chunk_size = next_chunk_offset - chunk.offset;
+    const uint64_t hash = make_chunk_hash(chunk_size, hash_state);
 #ifndef NDEBUG
     auto hash_from_chunk_data = XXH3_64bits(prevChunk->chunk_data->data.data(), prevChunk->chunk_data->data.size());
     if (hash != hash_from_chunk_data) {
       print_to_console("ERROR: BAD CHUNK HASH, WILL MESS UP DEDUPLICATION\n");
     }
 #endif
+    if (!trace_inputs.empty() && trace_inputs.size() <= chunk_idx) {
+      print_to_console("Chunk idx " + std::to_string(chunk_idx) + " is more than whats available on the trace input.\n");
+      exit(1);
+    }
+    if (!trace_inputs.empty() && trace_inputs.size() > chunk_idx && trace_inputs[chunk_idx].hash != hash) {
+      print_to_console(
+        "Chunk idx " + std::to_string(chunk_idx) + " has hash " + std::to_string(trace_inputs[chunk_idx].hash) + " and it should have " + std::to_string(hash) + ".\n"
+      );
+      exit(1);
+    }
+    ++chunk_idx;
+    if (!trace_out_path.empty()) {
+      const std::string trace_line = std::to_string(hash) + " " + std::to_string(chunk_size) + std::string("\n");
+      trace_out.write(trace_line.c_str(), trace_line.size());
+    }
+
     if (chunk_hashes.contains(hash)) {
       deduped_size += chunk_size;
     }
@@ -217,8 +268,9 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size) {
       chunk_hashes.emplace(hash);
     }
   }
-  XXH3_freeState(hash_state);
   auto dedup_end_time = std::chrono::high_resolution_clock::now();
+  XXH3_freeState(hash_state);
+  if (!trace_out_path.empty()) trace_out.close();
 
   auto chunking_elapsed_time = std::chrono::duration_cast<std::chrono::nanoseconds>(chunking_end_time - chunking_start_time);
   auto chunking_elapsed_time_ns = chunking_elapsed_time.count();

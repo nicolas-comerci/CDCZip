@@ -80,6 +80,14 @@ int main(int argc, char* argv[]) {
     else if (param.starts_with("-test")) {
       cli_params["test_mode"] = "true";
     }
+    else if (param.starts_with("-trace-out=")) {
+      constexpr auto opt_size = std::string("-trace-out=").size();
+      cli_params["trace_out_file_path"] = param.substr(opt_size, param.size() - opt_size);
+    }
+    else if (param.starts_with("-trace-in=")) {
+      constexpr auto opt_size = std::string("-trace-in=").size();
+      cli_params["trace_in_file_path"] = param.substr(opt_size, param.size() - opt_size);
+    }
     else {
       print_to_console("Bad arg: " + param + "\n");
     }
@@ -150,7 +158,7 @@ int main(int argc, char* argv[]) {
   uint64_t file_size = input_path == "-" ? 0 : std::filesystem::file_size(input_path);
 
   if (cli_params["test_mode"] == "true") {
-    cdcz_test_mode(input_path, file_size);
+    cdcz_test_mode(input_path, file_size, cli_params["trace_out_file_path"], cli_params["trace_in_file_path"]);
     exit(0);
   }
 
@@ -272,7 +280,7 @@ int main(int argc, char* argv[]) {
   std::vector<uint8_t> verify_buffer{};
   std::vector<uint8_t> verify_buffer_delta{};
 
-  auto dump_file = std::ofstream(/*file_path + ".ddp", std::ios::out | std::ios::binary | std::ios::trunc*/);
+  auto dump_file = std::ofstream(/*file_path + ".cdcz", std::ios::out | std::ios::binary | std::ios::trunc*/);
   set_std_handle_binary_mode(StdHandles::STDOUT_HANDLE);
   reinterpret_cast<std::ostream*>(&dump_file)->rdbuf(std::cout.rdbuf());
   dump_file.put('C');
