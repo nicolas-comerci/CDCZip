@@ -99,8 +99,8 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
 
   // Find the CDC minichunks and update the SimHash with their data
   const auto min_chunk_size = chunk_size / 2;
-  auto [cut_offsets, cut_offsets_features] = find_cdc_cut_candidates<false>(
-    std::span(data, data_len), min_chunk_size, chunk_size, chunk_size * 2
+  auto [cut_offsets, cut_offsets_features] = find_cdc_cut_candidates(
+    std::span(data, data_len), min_chunk_size, chunk_size, chunk_size * 2, CDCZ_CONFIG{}
   );
   uint64_t previous_offset = 0;
   for (const auto& cut_point_candidate : cut_offsets) {

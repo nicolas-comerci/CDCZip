@@ -65,7 +65,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, const std:
     uint64_t remaining = file_size;
     char* data_ptr = reinterpret_cast<char*>(file_data);
     while (remaining > 0) {
-      const auto read_amt = static_cast<std::streamsize>(std::min<uint64_t>(100 * 1024 * 1024, remaining));
+      const auto read_amt = static_cast<std::streamsize>(std::min<uint64_t>(100ull * 1024 * 1024, remaining));
       file_stream.read(data_ptr, read_amt);
       const auto actually_read = file_stream.gcount();
       if (actually_read != read_amt) {
@@ -138,15 +138,6 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, const std:
     return XXH3_64bits_digest(hash_state);
     };
 
-  auto cdc_func = [&min_size, &avg_size, &max_size, &is_use_simd](std::span<uint8_t> segment_data, bool is_first_segment) {
-    if (is_use_simd) {
-      return find_cdc_cut_candidates<false, true>(segment_data, min_size, avg_size, max_size, is_first_segment);
-    }
-    else {
-      return find_cdc_cut_candidates<false, false>(segment_data, min_size, avg_size, max_size, is_first_segment);
-    }
-    };
-
   auto chunking_start_time = std::chrono::high_resolution_clock::now();
   auto chunking_end_time = std::chrono::high_resolution_clock::now();
 
@@ -164,8 +155,9 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, const std:
     for (uint64_t i = 0; i < segments.size(); i++) {
       cdc_candidates_futures.emplace_back(
         threadPool.addTask(
-          [&cdc_func, &segments, is_first_segment, i]() mutable {
-            return cdc_func(segments[i], is_first_segment);
+          [&segments, is_first_segment, i, &min_size, &avg_size, &max_size, &is_use_simd]() {
+            const CDCZ_CONFIG cfg{ .avx2_allowed = is_use_simd};
+            return find_cdc_cut_candidates(segments[i], min_size, avg_size, max_size, cfg, is_first_segment);
           }
         )
       );

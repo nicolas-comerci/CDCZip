@@ -329,12 +329,8 @@ int main(int argc, char* argv[]) {
   auto find_cdc_cut_candidates_in_thread = [min_size, avg_size, max_size]
   (std::vector<uint8_t>&& segment_data, uint64_t segment_start_offset, bool is_eof_segment, bool is_first_segment) {
     CdcCandidatesResult cdc_candidates_result;
-    if (use_feature_extraction) {
-      cdc_candidates_result = find_cdc_cut_candidates<true>(segment_data, min_size, avg_size, max_size, is_first_segment);
-    }
-    else {
-      cdc_candidates_result = find_cdc_cut_candidates<false>(segment_data, min_size, avg_size, max_size, is_first_segment);
-    }
+    const CDCZ_CONFIG cfg{ .compute_features = use_feature_extraction};
+    cdc_candidates_result = find_cdc_cut_candidates(segment_data, min_size, avg_size, max_size, cfg, is_first_segment);
     return std::tuple(std::move(cdc_candidates_result), std::move(segment_data), segment_start_offset, is_eof_segment);
   };
 
