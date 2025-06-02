@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <utility>
 
+#ifndef NDEBUG
+#include "console_utils.hpp"
+#endif
+
 std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<utility::ChunkEntry>& chunks, uint64_t offset) {
   static constexpr auto compare_offset = [](const utility::ChunkEntry& x, const utility::ChunkEntry& y) { return x.offset < y.offset; };
 
@@ -16,7 +20,7 @@ std::tuple<uint64_t, uint64_t> get_chunk_i_and_pos_for_offset(circular_vector<ut
 
 #ifndef NDEBUG
   if (chunk->offset + chunk_pos != offset || chunk_pos >= chunk->chunk_data->data.size()) {
-    print_to_console("get_chunk_i_and_pos_for_offset() found incorrect chunk_i and pos at offset: " + std::to_string(offset) + "\n");
+    print_to_console("get_chunk_i_and_pos_for_offset() found incorrect chunk_i and pos at offset: {}\n", offset);
     throw std::runtime_error("Verification error");
   }
 #endif

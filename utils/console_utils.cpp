@@ -20,19 +20,19 @@ void set_std_handle_binary_mode(StdHandles handle) {}
 int ttyfd = -1;
 #endif
 
-void print_to_console(const std::string& format) {
+void print_to_console(const std::string& fmt) {
 #ifdef _WIN32
-  for (char chr : format) {
+  for (char chr : fmt) {
     _putch(chr);
   }
 #else
   if (ttyfd < 0)
     ttyfd = open("/dev/tty", O_RDWR);
-  write(ttyfd, format.c_str(), format.length());
+  write(ttyfd, fmt.c_str(), fmt.length());
 #endif
 }
 
-void print_to_console(const char* fmt, ...) {
+void printf_to_console(const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
   va_list args_copy;

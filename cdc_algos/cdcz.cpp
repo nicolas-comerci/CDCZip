@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <deque>
 #include <variant>
-#include <queue>
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -13,7 +12,7 @@
 
 #include "delta_compression/delta.hpp"
 
-CutPointCandidateWithContext cdc_next_cutpoint_candidate(
+CutPointCandidateWithContext cdc_next_cutpoint(
   const std::span<uint8_t> data,
   uint32_t min_size,
   uint32_t avg_size,
@@ -26,16 +25,16 @@ CutPointCandidateWithContext cdc_next_cutpoint_candidate(
 ) {
   CutPointCandidateWithContext result;
   result.pattern = initial_pattern;
-  uint32_t size = data.size();
+  const uint64_t size = data.size();
   uint32_t barrier;
   uint32_t i;
 
   if (cdcz_cfg.use_fastcdc_subminimum_skipping) {
-    barrier = std::min(avg_size, size);
+    barrier = static_cast<uint32_t>(std::min<uint64_t>(avg_size, size));
     i = std::min(barrier, min_size);
   }
   else {
-    barrier = std::min(min_size, size);
+    barrier = static_cast<uint32_t>(std::min<uint64_t>(min_size, size));
     i = 0;
   }
 
@@ -52,33 +51,33 @@ CutPointCandidateWithContext cdc_next_cutpoint_candidate(
   std::optional<uint32_t> backup_i{};
   uint32_t mask_backup = 0;
   if (cdcz_cfg.use_supercdc_backup_mask) {
-    mask_backup = mask_easy >> 1;
+    mask_backup = mask_easy << 1;
   }
 
   // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
   // the content defined nature of the Hashes.
   // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
   uint32_t remaining_minmax_adjustment = 0;
-  if (cdcz_cfg.use_supercdc_minmax_adjustment) {
-    remaining_minmax_adjustment = std::min<uint32_t>(i, 31);
-    i -= remaining_minmax_adjustment;
+  if (cdcz_cfg.use_fastcdc_subminimum_skipping) {
+    if (cdcz_cfg.use_supercdc_minmax_adjustment) {
+      remaining_minmax_adjustment = std::min<uint32_t>(i, 31);
+      i -= remaining_minmax_adjustment;
+    }
+  }
+  // If we don't have skipping to the minimum size enabled we advance GEAR up to the minimum
+  else {
+    while (i < barrier) {
+      result.pattern = (result.pattern << 1) + GEAR_TABLE[data[i]];
+      i++;
+    }
+    barrier = static_cast<uint32_t>(std::min<uint64_t>(avg_size, size));
   }
 
-  // If we don't have skipping to the minimum size enabled we advance GEAR up to the minimum
-  if (!cdcz_cfg.use_fastcdc_subminimum_skipping) {
-    while (i < barrier) {
-      result.pattern = (result.pattern >> 1) + GEAR_TABLE[data[i]];
-      i++;
-    }
-    barrier = std::min(avg_size, size);
-  }
-  // And if we had minmax adjustment to do, we do it now as well
-  if (cdcz_cfg.use_supercdc_minmax_adjustment) {
-    while (remaining_minmax_adjustment > 0) {
-      result.pattern = (result.pattern >> 1) + GEAR_TABLE[data[i]];
-      remaining_minmax_adjustment--;
-      i++;
-    }
+  // If we had minmax adjustment to do, we do it now before the main GEAR CDC loop starts
+  while (remaining_minmax_adjustment > 0) {
+    result.pattern = (result.pattern << 1) + GEAR_TABLE[data[i]];
+    remaining_minmax_adjustment--;
+    i++;
   }
   // If enabled, we use the GEAR hash values to extract features as described on ODESS paper, which allows us to do Delta compression on top of
   // dedup with very reduced computational overhead
@@ -100,7 +99,7 @@ CutPointCandidateWithContext cdc_next_cutpoint_candidate(
   // Okay, finally we do pretty standard GEAR CDC, not being for readjusting the barrier after avg_size for FastCDC's normalized chunking and
   // SuperCDC's backup cut condition if those are enabled
   while (i < barrier) {
-    result.pattern = (result.pattern >> 1) + GEAR_TABLE[data[i]];
+    result.pattern = (result.pattern << 1) + GEAR_TABLE[data[i]];
     if (!(result.pattern & mask_hard)) {
       result.candidate.type = CutPointCandidateType::HARD_CUT_MASK;
       result.candidate.offset = i;
@@ -109,9 +108,9 @@ CutPointCandidateWithContext cdc_next_cutpoint_candidate(
     process_feature_computation();
     i++;
   }
-  barrier = std::min(max_size, size);
+  barrier = static_cast<uint32_t>(std::min<uint64_t>(max_size, size));
   while (i < barrier) {
-    result.pattern = (result.pattern >> 1) + GEAR_TABLE[data[i]];
+    result.pattern = (result.pattern << 1) + GEAR_TABLE[data[i]];
     if (!(result.pattern & mask_easy)) {
       result.candidate.type = CutPointCandidateType::EASY_CUT_MASK;
       result.candidate.offset = i;
@@ -129,8 +128,61 @@ CutPointCandidateWithContext cdc_next_cutpoint_candidate(
     result.candidate.offset = *backup_i;
   }
   else {
-    result.candidate.type = CutPointCandidateType::EOF_CUT;
+    result.candidate.type = i == max_size ? CutPointCandidateType::MAX_SIZE : CutPointCandidateType::EOF_CUT;
     result.candidate.offset = i;
+  }
+  if (!cdcz_cfg.use_fastcdc_normalized_chunking && result.candidate.type == CutPointCandidateType::EASY_CUT_MASK) {
+    // If we don't have normalized chunking enabled, the EASY/HARD cut conditions are the same so we ensure any cut candidate
+    // that was found on the second part of the iteration is treated the same as the others by marking them as HARD as well
+    result.candidate.type = CutPointCandidateType::HARD_CUT_MASK;
+  }
+  return result;
+}
+
+CutPointCandidateWithContext cdc_next_cutpoint_candidate(
+  const std::span<uint8_t> data,
+  uint32_t mask_hard,
+  uint32_t mask_medium,
+  uint32_t mask_easy,
+  const CDCZ_CONFIG& cdcz_cfg,
+  uint32_t initial_pattern
+) {
+  // We craft a CDCZ_CONFIG and settings to force cdc_next_cutpoint to give us the next possible candidate according to any of the available criteria,
+  // given that the chunk invariance condition is not satisfied
+  CDCZ_CONFIG all_candidates_cfg {
+    .compute_features = cdcz_cfg.compute_features,
+    .use_fastcdc_subminimum_skipping = false,  // we don't want anything skipped
+    .use_fastcdc_normalized_chunking = true, // set this to true so cdc_next_cutpoint doesn't adjust the masks we will give it
+    .use_supercdc_minmax_adjustment = false,  // as we don't use subminimum skipping, it makes no sense to attempt minmax_adjustment
+    .use_supercdc_backup_mask = false,  // if we need to search for possible backup masks we will handle it by forcing mask_easy
+  };
+  uint32_t condition_mask = cdcz_cfg.use_fastcdc_normalized_chunking ? mask_easy : mask_medium;
+  if (cdcz_cfg.use_supercdc_backup_mask) {
+    // instead of using it as a backup, we just set the SuperCDC backup mask as the mask to be used, to force any position that satisfies it to be returned
+    condition_mask = condition_mask << 1;
+  }
+  CutPointCandidateWithContext result = cdc_next_cutpoint(
+    data, 0, data.size(), data.size(),
+    condition_mask, condition_mask, condition_mask,
+    all_candidates_cfg, initial_pattern
+  );
+  // Set the candidate type according to the condition_mask we used
+  result.candidate.type = cdcz_cfg.use_supercdc_backup_mask ?
+    CutPointCandidateType::SUPERCDC_BACKUP_MASK
+    : cdcz_cfg.use_fastcdc_normalized_chunking ? CutPointCandidateType::EASY_CUT_MASK : CutPointCandidateType::HARD_CUT_MASK;
+  // Now we need to "promote" the cut condition if possible, that is, if we found a cut candidate that satisfied SuperCDC's backup mask,
+  // but it also satisfies FastCDC's normalized chunking easy mask, or even the hard mask, we return it for the hardest condition available
+  if (result.candidate.type == CutPointCandidateType::SUPERCDC_BACKUP_MASK) {
+    if (cdcz_cfg.use_fastcdc_normalized_chunking && !(result.pattern & mask_easy)) {
+      result.candidate.type = CutPointCandidateType::EASY_CUT_MASK;
+    }
+    else if (!cdcz_cfg.use_fastcdc_normalized_chunking && !(result.pattern & mask_medium)) {
+      result.candidate.type = CutPointCandidateType::HARD_CUT_MASK;
+    }
+  }
+  // Note that the type can only be EASY here if normalized chunking is on, so no need for extra check
+  if (result.candidate.type == CutPointCandidateType::EASY_CUT_MASK && !(result.pattern & mask_hard)) {
+    result.candidate.type = CutPointCandidateType::HARD_CUT_MASK;
   }
   return result;
 }
@@ -139,7 +191,7 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, const uint3
   CdcCandidatesResult result;
   if (data.empty()) return result;
 
-  const auto make_mask = [](uint32_t bits) { return static_cast<uint32_t>(std::pow(2, bits)) - 1; };
+  const auto make_mask = [](uint32_t bits) { return 0xFFFFFFFF << (32 - bits); };
   const auto bits = std::lround(std::log2(avg_size));
   const auto mask_hard = make_mask(bits + 1);
   const auto mask_medium = make_mask(bits);
@@ -150,33 +202,57 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, const uint3
 
   // If this is not the first segment then we need to deal with the previous segment extended data and attempt to recover chunk invariance
   if (!is_first_segment) {
-    cdc_return = cdc_next_cutpoint_candidate(data, 0, avg_size - 1, 4294967295, mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern);
+    cdc_return = cdc_next_cutpoint_candidate(data, mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern);
 
     base_offset += cdc_return.candidate.offset;
     result.candidates.emplace_back(cdc_return.candidate.type, base_offset);
     if (cdcz_cfg.compute_features) {
-      result.candidatesFeatureResults.emplace_back();
+      result.candidatesFeatureResults.emplace_back(std::move(cdc_return.features));
     }
     data = std::span(data.data() + cdc_return.candidate.offset, data.size() - cdc_return.candidate.offset);
+    bool is_prev_candidate_hard = cdc_return.candidate.type == CutPointCandidateType::HARD_CUT_MASK;
 
     // And now we need to recover chunk invariance in accordance to the chunk invariance recovery condition.
     // We are guaranteed to be back in sync with what non-segmented CDC would have done as soon as we find a cut candidate with
     // distance_w_prev_cut_candidate >= min_size and distance_w_prev_cut_candidate + min_size <= max_size.
-    // As soon as we find that we can break from here and keep processing as if we were processing without segments,
+    // As soon as we find that, we can break from here and keep processing as if we were processing without segments,
     // which in particular means we can exploit jumps to min_size again.
     while (!data.empty()) {
+      // We need to skip processing the first byte as we already have the pattern with GEAR having processed that byte.
       cdc_return = cdc_next_cutpoint_candidate(
-        std::span(data.data() + 1, data.size() - 1), 0, avg_size - 1, 4294967295, mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern
+        std::span(data.data() + 1, data.size() - 1), mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern
       );
-      cdc_return.candidate.offset = cdc_return.candidate.offset + 1;
+      cdc_return.candidate.offset = cdc_return.candidate.offset + 1; // +1 because of the first byte that we skipped
 
       base_offset += cdc_return.candidate.offset;
       result.candidates.emplace_back(cdc_return.candidate.type, base_offset);
       if (cdcz_cfg.compute_features) {
-        result.candidatesFeatureResults.emplace_back();
+        result.candidatesFeatureResults.emplace_back(std::move(cdc_return.features));
       }
       data = std::span(data.data() + cdc_return.candidate.offset, data.size() - cdc_return.candidate.offset);
-      if (cdc_return.candidate.offset >= min_size && (cdc_return.candidate.offset + min_size <= max_size)) break;  // back in sync with non-segmented processing!
+
+      // For a more in depth explanation of the chunk invariance recovery condition please refer to my CDCZ paper
+      if (
+        is_prev_candidate_hard &&
+        // Given that the previous candidate is of HARD type, either it will be used, or it will be discarded which can only happen
+        // if a cut was used with at most min_size distance before the previous candidate. Knowing the previous cut to be used is
+        // at most at distance_w_prev_cut_candidate + min_size distance we can ensure we don't violate max_size if we use the current candidate.
+        (cdc_return.candidate.offset + min_size <= max_size) &&
+        (
+          // We also need to check that the current candidate is actually eligible, a HARD type cut needs to be at least min_size from the previous
+          // cut to be valid, whereas an EASY cut needs to be at least avg_size from it.
+          // Note that we check using distance_w_prev_cut_candidate, with the same logic as the check we did for the max_size, if it won't be used
+          // then the actual distance to the previous cut will be even larger so these conditions will also validate the eligibility of the current
+          // candidate in that case
+          (cdc_return.candidate.type == CutPointCandidateType::HARD_CUT_MASK && cdc_return.candidate.offset >= min_size) ||
+          (cdc_return.candidate.type == CutPointCandidateType::EASY_CUT_MASK && cdc_return.candidate.offset >= avg_size)
+          )
+        ) {
+        // We demonstrated the current cut candidate will be used!, no more uncertainty, back in sync with non-segmented processing!
+        break;
+      }
+
+      is_prev_candidate_hard = cdc_return.candidate.type == CutPointCandidateType::HARD_CUT_MASK;
     }
   }
 
@@ -188,13 +264,15 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, const uint3
     ) {
     while (!data.empty()) {
       if (base_offset == 0) {
-        cdc_return = cdc_next_cutpoint_candidate(data, min_size, avg_size, max_size, mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern);
+        cdc_return = cdc_next_cutpoint(data, min_size, avg_size, max_size, mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern);
       }
       else {
-        cdc_return = cdc_next_cutpoint_candidate(
+        // Once again we need to skip processing the first byte as we already have the pattern with GEAR having processed that byte.
+        // But this time we also need to adjust the min/avg/max sizes so the chunks match the sizes as if we hadn't skipped that first byte.
+        cdc_return = cdc_next_cutpoint(
           std::span(data.data() + 1, data.size() - 1), min_size - 1, avg_size - 1, max_size - 1, mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern
         );
-        cdc_return.candidate.offset = cdc_return.candidate.offset + 1;
+        cdc_return.candidate.offset = cdc_return.candidate.offset + 1; // +1 because of the first byte that we skipped
       }
 
       base_offset += cdc_return.candidate.offset;
@@ -225,6 +303,7 @@ uint64_t select_cut_point_candidates(
   std::vector<CutPointCandidate>& new_cut_point_candidates,
   std::vector<std::vector<uint32_t>>& new_cut_point_candidates_features,
   std::deque<utility::ChunkEntry>& process_pending_chunks,
+  std::queue<uint64_t>& supercdc_backup_pos,
   uint64_t last_used_cut_point,
   uint64_t segment_start_offset,
   std::span<uint8_t> segment_data,
@@ -234,8 +313,10 @@ uint64_t select_cut_point_candidates(
   uint32_t max_size,
   bool segments_eof,
   bool use_feature_extraction,
+  bool is_first_segment,
   bool copy_chunk_data
 ) {
+  // TODO: WE ARE DISCARDING FEATURES!!
   if (!segments_eof && !new_cut_point_candidates.empty() && new_cut_point_candidates.back().type == CutPointCandidateType::EOF_CUT) {
     new_cut_point_candidates.pop_back();
     if (use_feature_extraction) {
@@ -255,7 +336,7 @@ uint64_t select_cut_point_candidates(
     const auto chunk_size = cut_point_offset - last_cut_point;
     // if the last_cut_point is on the previous segment some data might have come from the prev_segment_remaining_data so it's
     // not counting towards our segment data position
-    const auto chunk_size_in_segment = chunk_size - prev_segment_remaining_data.size();
+    const auto chunk_size_in_segment = chunk_size > prev_segment_remaining_data.size() ? chunk_size - prev_segment_remaining_data.size() : 0;
 
     process_pending_chunks.emplace_back(last_cut_point);
     last_made_chunk = &process_pending_chunks.back();
@@ -264,10 +345,17 @@ uint64_t select_cut_point_candidates(
       last_made_chunk_size = chunk_size;
       if (copy_chunk_data) {
         last_made_chunk->chunk_data->data.resize(chunk_size);
-        std::copy_n(prev_segment_remaining_data.data(), prev_segment_remaining_data.size(), last_made_chunk->chunk_data->data.data());
-        std::copy_n(segment_data.data() + segment_data_pos, chunk_size_in_segment, last_made_chunk->chunk_data->data.data() + prev_segment_remaining_data.size());
+        std::copy_n(prev_segment_remaining_data.data(), chunk_size - chunk_size_in_segment, last_made_chunk->chunk_data->data.data());
+        if (chunk_size_in_segment > 0) {
+          std::copy_n(segment_data.data() + segment_data_pos, chunk_size_in_segment, last_made_chunk->chunk_data->data.data() + chunk_size - chunk_size_in_segment);
+        }
       }
-      prev_segment_remaining_data.clear();
+      if (chunk_size_in_segment > 0 || chunk_size == prev_segment_remaining_data.size()) {
+        prev_segment_remaining_data.clear();
+      }
+      else {
+        prev_segment_remaining_data.erase(prev_segment_remaining_data.begin(), prev_segment_remaining_data.begin() + static_cast<int64_t>(chunk_size));
+      }
     }
     else {
       last_made_chunk_size = chunk_size;
@@ -305,35 +393,45 @@ uint64_t select_cut_point_candidates(
     segment_data_pos = last_cut_point - segment_start_offset;
   }
 
-  std::queue<uint64_t> supercdc_backup_pos;
-
   auto trunc_with_max_size = [&last_cut_point, &supercdc_backup_pos, &make_chunk, avg_size, max_size]
-    (uint64_t candidate_index, uint64_t adjusted_cut_point_candidate) {
-    while (adjusted_cut_point_candidate > last_cut_point + max_size) {
+    (uint64_t candidate_index, uint64_t up_to_pos, bool including = false) {
+    while (up_to_pos >= last_cut_point + max_size) {
       while (!supercdc_backup_pos.empty()) {
+        // Any saved SuperCDC backup candidate that is not valid (before avg_size is skipped)
         auto& backup_pos = supercdc_backup_pos.front();
-        if (backup_pos <= last_cut_point + avg_size) {
+        if (backup_pos < last_cut_point + avg_size) {
           supercdc_backup_pos.pop();
           continue;
         }
         break;
       }
+      // If we didn't skip all SuperCDC backup candidates, and we have one that should be used, then use it.
       if (!supercdc_backup_pos.empty() && supercdc_backup_pos.front() < last_cut_point + max_size) {
         // TODO: these chunks will share features, which is not right, need to figure out a solution
         make_chunk(candidate_index, supercdc_backup_pos.front());
         last_cut_point = supercdc_backup_pos.front();
         supercdc_backup_pos.pop();
       }
-      else {
+      // Else we insert a max_size chunk if the max_size was reached before up_to_pos or up_to_pos was reached but the including flag is on
+      else if (including || up_to_pos != last_cut_point + max_size) {
         // TODO: these chunks will share features, which is not right, need to figure out a solution
         make_chunk(candidate_index, last_cut_point + max_size);
         last_cut_point = last_cut_point + max_size;
       }
+      else {
+        // We can only be here id the including flag is off, and we reached up_to_pos with max size, so there is nothing left to do.
+        break;
+      }
     }
-    };
+  };
 
     for (uint64_t i = 0; i < new_cut_point_candidates.size(); i++) {
       auto& cut_point_candidate = new_cut_point_candidates[i];
+      if (!is_first_segment && cut_point_candidate.offset <= 31) {
+        // Any supposed candidate on a segment which is not the first one, before the GEAR_WINDOW_SIZE - 1 is fully processed is either spurious
+        // (an artifact of the GEAR hash not being fully loaded yet) or it already should have gotten returned at the end of the previous segment
+        continue;
+      }
       last_cut_point = get_last_cut_point();
 
       const uint64_t adjusted_cut_point_candidate = segment_start_offset + cut_point_candidate.offset;
@@ -342,6 +440,7 @@ uint64_t select_cut_point_candidates(
         continue;
       }
       trunc_with_max_size(i, adjusted_cut_point_candidate);
+      last_cut_point = get_last_cut_point();
 
       // TODO: we are discarding the features (if we are computing them) along with the rejected cut point candidate, we need to roll those over
       if (
@@ -363,7 +462,7 @@ uint64_t select_cut_point_candidates(
     // the max_size for chunks, as we did between cut point candidates, just between the actual last candidate and the end of the segment this time
     last_cut_point = get_last_cut_point();
     const auto segment_end_pos = segment_start_offset + segment_data.size();
-    trunc_with_max_size(0, segment_end_pos);
+    trunc_with_max_size(0, segment_end_pos, true);
 
     // If there is more unused data at the end of the segment than the window_size - 1 bytes of the extension, we save that data
     // as it will need to be used for the next chunk
@@ -448,7 +547,7 @@ void cdc_find_cut_points_with_invariance(
   // SuperCDC's even easier "backup mask" and backup result, if mask_easy fails to find a cutoff point before the max_size we use the backup result
   // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
   // which helps better preserve the content defined nature of chunks and thus increase dedup ratios.
-  __m256i mask_b_vec = _mm256_set1_epi32(static_cast<int>(mask_easy >> 1));
+  __m256i mask_b_vec = _mm256_set1_epi32(static_cast<int>(mask_easy << 1));
   __m256i backup_cut_vec = max_size_vec;
 
   // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
@@ -698,7 +797,7 @@ void cdc_find_cut_points_with_invariance(
       // Deal with any trailing data sequentially
       // TODO: Check backup mask? anything else I am missing here?
       while (i < data.size()) {
-        pattern = (pattern >> 1) + GEAR_TABLE[data[i]];
+        pattern = (pattern << 1) + GEAR_TABLE[data[i]];
         if (!(pattern & mask_easy)) process_lane(7, i, CutPointCandidateType::EASY_CUT_MASK);
         ++i;
       }

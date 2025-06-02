@@ -54,5 +54,5 @@ void FakeIOStream::print_hash() {
   const auto hash = XXH64(data.data(), data.size(), 0);
   auto hash_str = std::format("{:x}", hash);
   std::ranges::transform(hash_str, hash_str.begin(), ::toupper);
-  print_to_console("XXH64 hash: " + hash_str + "\n");
+  print_to_console("XXH64 hash: {}\n", hash_str);
 }

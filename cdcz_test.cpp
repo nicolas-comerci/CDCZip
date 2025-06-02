@@ -12,13 +12,20 @@
 #include "utils/console_utils.hpp"
 
 struct ChunkTrace {
-  uint64_t hash;
+  uint64_t offset;
   uint64_t size;
+  uint64_t hash;
 };
 
-void cdcz_test_mode(const std::string& file_path, uint64_t file_size, const std::string& trace_out_path, const std::string& trace_in_path) {
+void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unordered_map<std::string, std::string>& cli_params) {
   print_to_console("TEST MODE\n");
 
+  const uint64_t thread_count = std::stoi(cli_params["threads"]);
+  const bool is_use_mt = thread_count > 1;
+  const bool is_simulate_mt = !cli_params["simulate_mt"].empty();
+  const bool is_use_simd = !cli_params["simd"].empty();
+
+  const std::string trace_out_path = cli_params["trace_out_file_path"];
   auto trace_out = std::fstream();
   if (!trace_out_path.empty()) {
     trace_out.open(trace_out_path, std::ios::out | std::ios::trunc);
@@ -27,6 +34,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, const std:
       exit(1);
     }
   }
+  const std::string trace_in_path = cli_params["trace_in_file_path"];
   std::vector<ChunkTrace> trace_inputs{};
   if (!trace_in_path.empty()) {
     auto trace_in = std::fstream(trace_in_path, std::ios::in);
@@ -37,8 +45,13 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, const std:
     print_to_console("WARNING: using trace input to ensure chunks produced are expected ones, this will penalize Throughput slightly\n");
     std::string line;
     while (std::getline(trace_in, line)) {
-      auto space_pos = line.find(' ');
-      trace_inputs.emplace_back(std::stoull(line.substr(0, space_pos)), std::stoull(line.substr(space_pos + 1, line.size() - space_pos - 1)));
+      auto first_space_pos = line.find(' ');
+      auto second_space_pos = line.find(' ', first_space_pos + 1);
+      trace_inputs.emplace_back(
+        std::stoull(line.substr(0, first_space_pos)),
+        std::stoull(line.substr(first_space_pos + 1, second_space_pos)),
+        std::stoull(line.substr(second_space_pos + 1, line.size() - second_space_pos - 1))
+      );
     }
   }
 
@@ -79,14 +92,11 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, const std:
 
   std::unordered_set<uint64_t> chunk_hashes{};
   uint64_t deduped_size = 0;
-
-  const bool is_use_mt = true;
-  const bool is_use_simd = true;
-  TaskPool threadPool = TaskPool(is_use_mt ? std::thread::hardware_concurrency() : 1);
+  TaskPool threadPool = TaskPool(thread_count);
 
   // For SIMD we are using lanes with signed 32bit integers, if we use segments that are too large we risk overflows, this way we have pretty big segments
   // with no risk of overflows.
-  const uint64_t segment_size = std::min<uint64_t>(std::numeric_limits<int32_t>::max() / 2, file_size / std::thread::hardware_concurrency());
+  const uint64_t segment_size = std::min<uint64_t>(std::numeric_limits<int32_t>::max() / 2, file_size / thread_count);
 
   std::vector<std::span<uint8_t>> segments;
   if (is_use_mt || is_use_simd) {
@@ -141,81 +151,130 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, const std:
   auto chunking_start_time = std::chrono::high_resolution_clock::now();
   auto chunking_end_time = std::chrono::high_resolution_clock::now();
 
+  const bool do_trace_input_check = !trace_inputs.empty();
+  // If no form of parallelism was used then chunks resulting from select_cut_point_candidates should just be the candidates
+  const bool do_all_candidates_selected_check = !is_use_mt && !is_use_simd;
+  auto do_chunk_correctness_checks = [&process_pending_chunks, &trace_inputs, do_trace_input_check, do_all_candidates_selected_check]
+  (uint64_t& chunk_idx, uint64_t last_chunk_size, CdcCandidatesResult& result, uint64_t segment_i, uint64_t last_cut_offset, uint64_t curr_segment_start_offset) {
+      if (do_trace_input_check || do_all_candidates_selected_check) {
+          while (chunk_idx != process_pending_chunks.size()) {
+              const uint64_t next_chunk_idx = chunk_idx + 1;
+              const uint64_t pending_chunk_size = next_chunk_idx == process_pending_chunks.size() ? last_chunk_size : process_pending_chunks[next_chunk_idx].offset - process_pending_chunks[chunk_idx].offset;
+              if (do_all_candidates_selected_check) {
+                  const uint64_t prev_candidate_offset = chunk_idx >= 1 ? result.candidates[chunk_idx - 1].offset : 0;
+                  const uint64_t candidate_chunk_size = result.candidates[chunk_idx].offset - prev_candidate_offset;
+                  if (candidate_chunk_size != pending_chunk_size) {
+                      print_to_console(
+                        "select_cut_point_candidates messed up candidate selection on segment {} chunk {}, we needed chunk_size of {} but got {}",
+                        segment_i, chunk_idx, candidate_chunk_size, pending_chunk_size
+                      );
+                      exit(1);
+                  }
+              }
+              if (do_trace_input_check && (pending_chunk_size != trace_inputs[chunk_idx].size || process_pending_chunks[chunk_idx].offset != trace_inputs[chunk_idx].offset)) {
+                  print_to_console(
+                    "Chunk size mismatch for chunk idx {}. Actual: {}, Expected: {}.\nOn segment {}, last_cut_offset: {}, segment offset: {}\n",
+                    chunk_idx, pending_chunk_size, trace_inputs[chunk_idx].size, segment_i, last_cut_offset, curr_segment_start_offset
+                  );
+                  exit(1);
+              }
+              ++chunk_idx;
+          }
+      }
+  };
+
   {
-    std::deque<std::future<CdcCandidatesResult>> cdc_candidates_futures;
+    std::deque<std::future<CdcCandidatesResult>> cdc_candidates_futures{};
+    std::queue<uint64_t> supercdc_backup_pos{};
     CdcCandidatesResult result;
     bool is_first_segment = true;
     uint64_t curr_segment_start_offset = 0;
-    uint64_t current_offset = 0;
+    uint64_t last_cut_offset = 0;
 
     uint64_t chunk_idx = 0;
-    auto pending_chunks_iter = process_pending_chunks.cbegin();
 
     chunking_start_time = std::chrono::high_resolution_clock::now();
-    for (uint64_t i = 0; i < segments.size(); i++) {
-      cdc_candidates_futures.emplace_back(
-        threadPool.addTask(
-          [&segments, is_first_segment, i, &min_size, &avg_size, &max_size, &is_use_simd]() {
-            const CDCZ_CONFIG cfg{ .avx2_allowed = is_use_simd};
-            return find_cdc_cut_candidates(segments[i], min_size, avg_size, max_size, cfg, is_first_segment);
-          }
-        )
-      );
-      is_first_segment = false;
-    }
-
-    for (uint64_t i = 0; i < segments.size(); i++) {
-      auto& future = cdc_candidates_futures.front();
-      result = future.get();
-
-      auto last_chunk_size = select_cut_point_candidates(
-        result.candidates,
-        result.candidatesFeatureResults,
-        process_pending_chunks,
-        current_offset,
-        curr_segment_start_offset,
-        segments[i],
-        prev_segment_remaining_data,
-        min_size,
-        avg_size,
-        max_size,
-        i == segments.size() - 1,
-        false,
-#ifdef NDEBUG
-        false
-#else
-        true
-#endif
-      );
-
-      if (!trace_inputs.empty()) {
-        if (i == 0) {
-          pending_chunks_iter = process_pending_chunks.cbegin();
-        }
-        else {
-          ++pending_chunks_iter;
-        }
-        while (pending_chunks_iter != process_pending_chunks.cend()) {
-          auto next_pending_chunk_iter = pending_chunks_iter + 1;
-          uint64_t chunk_size = next_pending_chunk_iter == process_pending_chunks.cend() ? last_chunk_size : next_pending_chunk_iter->offset - pending_chunks_iter->offset;
-          if (chunk_size != trace_inputs[chunk_idx].size) {
-            print_to_console(
-              "Chunk size mismatch for chunk idx " + std::to_string(chunk_idx) + ". Actual: " + std::to_string(chunk_size) +
-              ", Expected: " + std::to_string(trace_inputs[chunk_idx].size) + ".\n" +
-              "On segment " + std::to_string(i) + ", current_offset: " + std::to_string(current_offset) + ", segment offset: " + std::to_string(curr_segment_start_offset) + "\n"
-            );
-            exit(1);
-          }
-          pending_chunks_iter = next_pending_chunk_iter;
-          ++chunk_idx;
-        }
-        --pending_chunks_iter;  // leave the iter pointing to the last actual chunk, so for next segment when there are new chunks we can get to them from here
+    if (!is_simulate_mt) {
+      for (uint64_t i = 0; i < segments.size(); i++) {
+        cdc_candidates_futures.emplace_back(
+          threadPool.addTask(
+            [&segments, is_first_segment, i, &min_size, &avg_size, &max_size, &is_use_simd]() {
+              const CDCZ_CONFIG cfg{ .avx2_allowed = is_use_simd };
+              return find_cdc_cut_candidates(segments[i], min_size, avg_size, max_size, cfg, is_first_segment);
+            }
+          )
+        );
+        is_first_segment = false;
       }
 
-      current_offset = process_pending_chunks.back().offset + last_chunk_size;
-      curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
+      for (uint64_t i = 0; i < segments.size(); i++) {
+        auto& future = cdc_candidates_futures.front();
+        result = future.get();
 
-      cdc_candidates_futures.pop_front();
+        auto last_chunk_size = select_cut_point_candidates(
+          result.candidates,
+          result.candidatesFeatureResults,
+          process_pending_chunks,
+          supercdc_backup_pos,
+          last_cut_offset,
+          curr_segment_start_offset,
+          segments[i],
+          prev_segment_remaining_data,
+          min_size,
+          avg_size,
+          max_size,
+          i == segments.size() - 1,
+          false,
+          is_first_segment,
+#ifdef NDEBUG
+          false
+#else
+          true
+#endif
+        );
+
+        do_chunk_correctness_checks(chunk_idx, last_chunk_size, result, i, last_cut_offset, curr_segment_start_offset);
+
+        last_cut_offset = process_pending_chunks.back().offset + last_chunk_size;
+        curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
+
+        cdc_candidates_futures.pop_front();
+      }
+    }
+    else {
+      const CDCZ_CONFIG cfg{ .avx2_allowed = is_use_simd };
+      for (uint64_t i = 0; i < segments.size(); i++) {
+        result = find_cdc_cut_candidates(segments[i], min_size, avg_size, max_size, cfg, is_first_segment);
+
+        auto last_chunk_size = select_cut_point_candidates(
+          result.candidates,
+          result.candidatesFeatureResults,
+          process_pending_chunks,
+          supercdc_backup_pos,
+          last_cut_offset,
+          curr_segment_start_offset,
+          segments[i],
+          prev_segment_remaining_data,
+          min_size,
+          avg_size,
+          max_size,
+          i == segments.size() - 1,
+          false,
+          is_first_segment,
+#ifdef NDEBUG
+          false
+#else
+          true
+#endif
+        );
+
+        do_chunk_correctness_checks(chunk_idx, last_chunk_size, result, i, last_cut_offset, curr_segment_start_offset);
+
+        last_cut_offset = process_pending_chunks.back().offset + last_chunk_size;
+        curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
+
+        is_first_segment = false;
+      }
     }
     chunking_end_time = std::chrono::high_resolution_clock::now();
   }
@@ -232,24 +291,24 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, const std:
     const uint64_t chunk_size = next_chunk_offset - chunk.offset;
     const uint64_t hash = make_chunk_hash(chunk_size, hash_state);
 #ifndef NDEBUG
-    auto hash_from_chunk_data = XXH3_64bits(prevChunk->chunk_data->data.data(), prevChunk->chunk_data->data.size());
+    auto hash_from_chunk_data = XXH3_64bits(chunk.chunk_data->data.data(), chunk.chunk_data->data.size());
     if (hash != hash_from_chunk_data) {
       print_to_console("ERROR: BAD CHUNK HASH, WILL MESS UP DEDUPLICATION\n");
     }
 #endif
     if (!trace_inputs.empty() && trace_inputs.size() <= chunk_idx) {
-      print_to_console("Chunk idx " + std::to_string(chunk_idx) + " is more than whats available on the trace input.\n");
+      print_to_console("Chunk idx {} is more than whats available on the trace input.\n", chunk_idx);
       exit(1);
     }
     if (!trace_inputs.empty() && trace_inputs.size() > chunk_idx && trace_inputs[chunk_idx].hash != hash) {
       print_to_console(
-        "Chunk idx " + std::to_string(chunk_idx) + " has hash " + std::to_string(trace_inputs[chunk_idx].hash) + " and it should have " + std::to_string(hash) + ".\n"
+        "Chunk idx {} has hash {} and it should have {}.\n", chunk_idx, trace_inputs[chunk_idx].hash, hash
       );
       exit(1);
     }
     ++chunk_idx;
     if (!trace_out_path.empty()) {
-      const std::string trace_line = std::to_string(hash) + " " + std::to_string(chunk_size) + std::string("\n");
+      const std::string trace_line = std::to_string(chunk.offset) + " " + std::to_string(chunk_size) + " " + std::to_string(hash) + std::string("\n");
       trace_out.write(trace_line.c_str(), trace_line.size());
     }
 
@@ -276,18 +335,20 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, const std:
   auto test_elapsed_time_ns = test_elapsed_time.count();
   const auto test_mb_per_nanosecond = file_size_mb / test_elapsed_time_ns;
 
-  print_to_console("Tested file size (bytes):    " + std::to_string(file_size) + "\n");
-  print_to_console("Tested Chunking Throughput:    %.1f MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
-  print_to_console("Tested Dedup Throughput:    %.1f MB/s\n", dedup_mb_per_nanosecond * std::pow(10, 9));
-  print_to_console("Tested Chunking+Dedup Throughput:    %.1f MB/s\n", test_mb_per_nanosecond * std::pow(10, 9));
-  print_to_console("Deduped size (bytes):    " + std::to_string(deduped_size) + "\n");
-  print_to_console("File size after dedup (bytes):    " + std::to_string(file_size - deduped_size) + "\n");
-  print_to_console("DER:    %f\n", static_cast<float>(file_size) / static_cast<float>(file_size - deduped_size));
-  print_to_console("Total chunk count:    " + std::to_string(process_pending_chunks.size()) + "\n");
-  print_to_console("Total chunking runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(chunking_elapsed_time).count()) + " seconds\n");
-  print_to_console("Total dedup runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(dedup_elapsed_time).count()) + " seconds\n");
-  print_to_console("Total test runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(test_elapsed_time).count()) + " seconds\n");
+  print_to_console("Tested file size (bytes):            {}\n", file_size);
+  print_to_console("Tested Chunking Throughput:          {:.1f} MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Tested Dedup Throughput:             {:.1f} MB/s\n", dedup_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Tested Chunking+Dedup Throughput:    {:.1f} MB/s\n", test_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Deduped size (bytes):                {}\n", deduped_size);
+  print_to_console("File size after dedup (bytes):       {}\n", file_size - deduped_size);
+  print_to_console("DER:                                 {:f}\n", static_cast<float>(file_size) / static_cast<float>(file_size - deduped_size));
+  print_to_console("Total chunk count:                   {}\n", process_pending_chunks.size());
+  print_to_console("Total chunking runtime:              {} seconds\n", std::chrono::duration_cast<std::chrono::seconds>(chunking_elapsed_time).count());
+  print_to_console("Total dedup runtime:                 {} seconds\n", std::chrono::duration_cast<std::chrono::seconds>(dedup_elapsed_time).count());
+  print_to_console("Total test runtime:                  {} seconds\n", std::chrono::duration_cast<std::chrono::seconds>(test_elapsed_time).count());
 
+  // Bleh, dirty hack for quicker exit
+  exit(0);
 #ifndef __clang__
   _aligned_free(file_data);
 #else

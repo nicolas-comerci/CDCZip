@@ -62,34 +62,51 @@ namespace constants {
 
 int main(int argc, char* argv[]) {
 #ifndef NDEBUG
+  print_to_console("STARTED IN DEBUG MODE, PRESS ENTER TO CONTINUE, NOW WOULD BE A GOOD TIME TO ATTACH A DEBUGGER IF YOU NEED TO.\n");
   get_char_with_echo();
 #endif
   std::string input_path{ argv[1] };
   bool do_decompression = false;
 
   std::unordered_map<std::string, std::string> cli_params;
+  cli_params["threads"] = std::to_string(std::thread::hardware_concurrency());
   for (uint64_t param_idx = 2; param_idx < argc; param_idx++) {
     auto param = std::string(argv[param_idx]);
-    if (param.starts_with("-dict=")) {
-      cli_params["max_dict"] = param.substr(6, param.size() - 6);
+    if (param.starts_with("--threads=")) {
+      constexpr auto opt_size = std::string("--threads=").size();
+      const auto thread_count_str = param.substr(opt_size, param.size() - opt_size);
+	  if (std::stoi(thread_count_str) != 0) {  // if 0 we just keep the auto-detected concurrency count
+          cli_params["threads"] = param.substr(opt_size, param.size() - opt_size);
+	  }
+    }
+    else if (param.starts_with("--simd")) {
+        cli_params["simd"] = "true";
+    }
+    else if (param.starts_with("--dict=")) {
+        constexpr auto opt_size = std::string("--dict=").size();
+        cli_params["max_dict"] = param.substr(opt_size, param.size() - opt_size);
     }
     else if (param.starts_with("-d=")) {
       do_decompression = true;
       cli_params["decomp_file_path"] = param.substr(3, param.size() - 3);
     }
-    else if (param.starts_with("-test")) {
+    else if (param.starts_with("--test")) {
       cli_params["test_mode"] = "true";
     }
-    else if (param.starts_with("-trace-out=")) {
-      constexpr auto opt_size = std::string("-trace-out=").size();
+    else if (param.starts_with("--trace-out=")) {
+      constexpr auto opt_size = std::string("--trace-out=").size();
       cli_params["trace_out_file_path"] = param.substr(opt_size, param.size() - opt_size);
     }
-    else if (param.starts_with("-trace-in=")) {
-      constexpr auto opt_size = std::string("-trace-in=").size();
+    else if (param.starts_with("--trace-in=")) {
+      constexpr auto opt_size = std::string("--trace-in=").size();
       cli_params["trace_in_file_path"] = param.substr(opt_size, param.size() - opt_size);
     }
+    else if (param.starts_with("--simulate-mt")) {
+        cli_params["simulate_mt"] = "true";
+    }
     else {
-      print_to_console("Bad arg: " + param + "\n");
+      print_to_console("Bad arg: {}\n", param);
+      exit(1);
     }
   }
 
@@ -113,6 +130,7 @@ int main(int argc, char* argv[]) {
       print_to_console("Input is not a CDCZip deduplicated stream!\n");
       exit(1);
     }
+    print_to_console("Decompressing...\n");
     uint64_t dict_size = *reinterpret_cast<uint64_t*>(&header[4]);
 
     uint8_t flags;
@@ -151,14 +169,14 @@ int main(int argc, char* argv[]) {
     }
 
     auto decompress_end_time = std::chrono::high_resolution_clock::now();
-    print_to_console("Decompression finished in " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(decompress_end_time - decompress_start_time).count()) + " seconds!\n");
+    print_to_console("Decompression finished in {} seconds!\n", std::chrono::duration_cast<std::chrono::seconds>(decompress_end_time - decompress_start_time).count());
     return 0;
   }
 
   uint64_t file_size = input_path == "-" ? 0 : std::filesystem::file_size(input_path);
 
   if (cli_params["test_mode"] == "true") {
-    cdcz_test_mode(input_path, file_size, cli_params["trace_out_file_path"], cli_params["trace_in_file_path"]);
+    cdcz_test_mode(input_path, file_size, cli_params);
     exit(0);
   }
 
@@ -204,7 +222,7 @@ int main(int argc, char* argv[]) {
   // Find chunk_i that has a given SuperFeature
   std::unordered_map<uint32_t, std::list<uint64_t>> superfeatures_dict{};
 
-  const auto cdc_thread_count = std::thread::hardware_concurrency();
+  const auto cdc_thread_count = std::stoi(cli_params["threads"]);
 
   const uint32_t simhash_chunk_size = std::max<uint32_t>(16, min_size / 8);
   const uint32_t max_allowed_dist = 32;
@@ -323,6 +341,7 @@ int main(int argc, char* argv[]) {
   std::vector<uint8_t> prev_segment_remaining_data{};
   uint64_t segment_start_offset = 0;
   std::deque<utility::ChunkEntry> process_pending_chunks{};
+  std::queue<uint64_t> supercdc_backup_pos{};
 
   uint64_t current_offset = 0;
 
@@ -331,7 +350,7 @@ int main(int argc, char* argv[]) {
     CdcCandidatesResult cdc_candidates_result;
     const CDCZ_CONFIG cfg{ .compute_features = use_feature_extraction};
     cdc_candidates_result = find_cdc_cut_candidates(segment_data, min_size, avg_size, max_size, cfg, is_first_segment);
-    return std::tuple(std::move(cdc_candidates_result), std::move(segment_data), segment_start_offset, is_eof_segment);
+    return std::tuple(std::move(cdc_candidates_result), std::move(segment_data), segment_start_offset, is_eof_segment, is_first_segment);
   };
 
   std::deque<std::future<decltype(std::function{find_cdc_cut_candidates_in_thread})::result_type>> cdc_candidates_futures;
@@ -398,7 +417,7 @@ int main(int argc, char* argv[]) {
   };
 
   auto get_more_pending_chunks_from_cdc_futures =
-  [&cdc_candidates_futures, &process_pending_chunks, &prev_segment_remaining_data, &current_offset, min_size, avg_size, max_size]
+  [&cdc_candidates_futures, &process_pending_chunks, &prev_segment_remaining_data, &current_offset, &supercdc_backup_pos, min_size, avg_size, max_size]
   (bool force_wait) {
     if (cdc_candidates_futures.size() > 0) {
       auto candidate_future_status = cdc_candidates_futures.front().wait_for(std::chrono::nanoseconds::zero());
@@ -408,7 +427,8 @@ int main(int argc, char* argv[]) {
           new_cut_points_results,
           segment_data,
           curr_segment_start_offset,
-          segments_eof
+          segments_eof,
+          is_first_segment
         ] = future.get();
         cdc_candidates_futures.pop_front();
 
@@ -416,6 +436,7 @@ int main(int argc, char* argv[]) {
           new_cut_points_results.candidates,
           new_cut_points_results.candidatesFeatureResults,
           process_pending_chunks,
+          supercdc_backup_pos,
           !process_pending_chunks.empty() ? process_pending_chunks.back().offset + process_pending_chunks.back().chunk_data->data.size() : current_offset,
           curr_segment_start_offset,
           segment_data,
@@ -424,7 +445,8 @@ int main(int argc, char* argv[]) {
           avg_size,
           max_size,
           segments_eof && cdc_candidates_futures.size() == 0,
-          use_feature_extraction
+          use_feature_extraction,
+          is_first_segment
         );
       }
     }
@@ -512,7 +534,7 @@ int main(int argc, char* argv[]) {
 
     std::optional<uint64_t> prev_similarity_locality_anchor_i = similarity_locality_anchor_i;
     similarity_locality_anchor_i = std::nullopt;
-    if (chunk_i % 50000 == 0) print_to_console("\n%" + std::to_string((static_cast<float>(current_offset) / file_size) * 100) + "\n");
+    if (chunk_i % 50000 == 0) print_to_console("\n%{}\n", (static_cast<float>(current_offset) / file_size) * 100);
 
     std::span<uint8_t> data_span = chunk.chunk_data->data;
     total_size += data_span.size();
@@ -528,7 +550,7 @@ int main(int argc, char* argv[]) {
       verify_file.read(reinterpret_cast<char*>(verify_buffer_orig_data.data()), data_span.size());
       // Ensure data matches
       if (std::memcmp(verify_buffer_orig_data.data(), data_span.data(), data_span.size()) != 0) {
-        print_to_console("Error while verifying current_offset at offset " + std::to_string(current_offset) + "\n");
+        print_to_console("Error while verifying current_offset at offset {}\n", current_offset);
         throw std::runtime_error("Verification error");
       }
     }
@@ -788,7 +810,7 @@ int main(int argc, char* argv[]) {
           chunk_offset_pos += instruction.size;
         }
         if (chunk_offset_pos != chunk.chunk_data->data.size()) {
-          print_to_console("Delta coding size mismatch: chunk_size/delta size " + std::to_string(chunk.chunk_data->data.size()) + "/" + std::to_string(chunk_offset_pos) + "\n");
+          print_to_console("Delta coding size mismatch: chunk_size/delta size {}/{}\n", chunk.chunk_data->data.size(), chunk_offset_pos);
           throw std::runtime_error("Verification error");
         }
       }
@@ -1001,11 +1023,11 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  print_to_console("Final offset: " + std::to_string(current_offset) + "\n");
+  print_to_console("Final offset: {}\n", current_offset);
 
   auto total_dedup_end_time = std::chrono::high_resolution_clock::now();
 
-  print_to_console("Total dedup time:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(total_dedup_end_time - total_runtime_start_time).count()) + " seconds\n");
+  print_to_console("Total dedup time:    {} seconds\n", std::chrono::duration_cast<std::chrono::seconds>(total_dedup_end_time - total_runtime_start_time).count());
 
   // Dump any remaining data
   if (!output_disabled) lz_manager.dump(verify_file_stream, verify_dumps, std::nullopt, true);
@@ -1013,48 +1035,48 @@ int main(int argc, char* argv[]) {
   auto dump_end_time = std::chrono::high_resolution_clock::now();
 
   // Chunk stats
-  print_to_console(std::string("Chunk Sizes:    min ") + std::to_string(min_size) + " - avg " + std::to_string(avg_size) + " - max " + std::to_string(max_size) + "\n");
-  print_to_console("Total chunk count: " + std::to_string(chunks.fullSize()) + "\n");
-  print_to_console("In dictionary chunk count: " + std::to_string(chunks.size()) + "\n");
-  print_to_console("In memory chunk count: " + std::to_string(chunks.innerVecSize()) + "\n");
-  print_to_console("Real AVG chunk size: " + std::to_string(total_size / chunks.fullSize()) + "\n");
-  print_to_console("Total unique chunk count: " + std::to_string(chunk_id) + "\n");
-  print_to_console("Total delta compressed chunk count: " + std::to_string(delta_compressed_chunk_count) + "\n");
+  print_to_console("Chunk Sizes:    min {} - avg {} - max {}\n", min_size, avg_size, max_size);
+  print_to_console("Total chunk count: {}\n", chunks.fullSize());
+  print_to_console("In dictionary chunk count: {}\n", chunks.size());
+  print_to_console("In memory chunk count: {}\n", chunks.innerVecSize());
+  print_to_console("Real AVG chunk size: {}\n", total_size / chunks.fullSize());
+  print_to_console("Total unique chunk count: {}\n", chunk_id);
+  print_to_console("Total delta compressed chunk count: {}\n", delta_compressed_chunk_count);
 
   const auto total_accumulated_savings = lz_manager.accumulatedSavings();
   const auto match_omitted_size = lz_manager.omittedSmallMatchSize();
   const auto match_extension_saved_size = lz_manager.accumulatedExtendedBackwardsSavings() + lz_manager.accumulatedExtendedForwardsSavings();
   // Results stats
   const auto total_size_mbs = total_size / (1024.0 * 1024);
-  print_to_console("Chunk data total size:    %.1f MB\n", total_size_mbs);
+  print_to_console("Chunk data total size:    {:.1f} MB\n", total_size_mbs);
   const auto deduped_size_mbs = deduped_size / (1024.0 * 1024);
-  print_to_console("Chunk data deduped size:    %.1f MB\n", deduped_size_mbs);
+  print_to_console("Chunk data deduped size:    {:.1f} MB\n", deduped_size_mbs);
   const auto deltaed_size_mbs = delta_compressed_approx_size / (1024.0 * 1024);
-  print_to_console("Chunk data delta compressed size:    %.1f MB\n", deltaed_size_mbs);
+  print_to_console("Chunk data delta compressed size:    {:.1f} MB\n", deltaed_size_mbs);
   const auto extension_size_mbs = match_extension_saved_size / (1024.0 * 1024);
-  print_to_console("Match extended size:    %.1f MB\n", extension_size_mbs);
+  print_to_console("Match extended size:    {:.1f} MB\n", extension_size_mbs);
   const auto omitted_size_mbs = match_omitted_size / (1024.0 * 1024);
-  print_to_console("Match omitted size (matches too small):    %.1f MB\n", omitted_size_mbs);
+  print_to_console("Match omitted size (matches too small):    {:.1f} MB\n", omitted_size_mbs);
   const auto total_accummulated_savings_mbs = total_accumulated_savings / (1024.0 * 1024);
-  print_to_console("Total estimated reduced size:    %.1f MB\n", total_accummulated_savings_mbs);
-  print_to_console("Final size:    %.1f MB\n", total_size_mbs - total_accummulated_savings_mbs);
+  print_to_console("Total estimated reduced size:    {:.1f} MB\n", total_accummulated_savings_mbs);
+  print_to_console("Final size:    {:.1f} MB\n", total_size_mbs - total_accummulated_savings_mbs);
 
   print_to_console("\n");
 
   // Throughput stats
   const auto chunking_mb_per_nanosecond = total_size_mbs / chunk_generator_execution_time_ns;
-  print_to_console("Chunking Throughput:    %.1f MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Chunking Throughput:    {:.1f} MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
   const auto hashing_mb_per_nanosecond = total_size_mbs / hashing_execution_time_ns;
-  print_to_console("Hashing Throughput:    %.1f MB/s\n", hashing_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Hashing Throughput:    {:.1f} MB/s\n", hashing_mb_per_nanosecond * std::pow(10, 9));
   const auto simhashing_mb_per_nanosecond = total_size_mbs / simhashing_execution_time_ns;
-  print_to_console("SimHashing Throughput:    %.1f MB/s\n", simhashing_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("SimHashing Throughput:    {:.1f} MB/s\n", simhashing_mb_per_nanosecond * std::pow(10, 9));
   const auto total_elapsed_nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(total_dedup_end_time - total_runtime_start_time).count();
   const auto total_mb_per_nanosecond = total_size_mbs / total_elapsed_nanoseconds;
-  print_to_console("Total Throughput:    %.1f MB/s\n", total_mb_per_nanosecond * std::pow(10, 9));
-  print_to_console("Total LZ instructions:    " + std::to_string(lz_manager.instructionCount()) + "\n");
-  print_to_console("Total dedup time:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(total_dedup_end_time - total_runtime_start_time).count()) + " seconds\n");
-  print_to_console("Dump time:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_dedup_end_time).count()) + " seconds\n");
-  print_to_console("Total runtime:    " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_runtime_start_time).count()) + " seconds\n");
+  print_to_console("Total Throughput:    {:.1f} MB/s\n", total_mb_per_nanosecond * std::pow(10, 9));
+  print_to_console("Total LZ instructions:    {}\n", lz_manager.instructionCount());
+  print_to_console("Total dedup time:    {} seconds\n", std::chrono::duration_cast<std::chrono::seconds>(total_dedup_end_time - total_runtime_start_time).count());
+  print_to_console("Dump time:    {} seconds\n", std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_dedup_end_time).count());
+  print_to_console("Total runtime:    {} seconds\n", std::chrono::duration_cast<std::chrono::seconds>(dump_end_time - total_runtime_start_time).count());
 
   print_to_console("Processing finished, press enter to quit.\n");
   //get_char_with_echo();

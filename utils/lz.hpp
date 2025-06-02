@@ -256,20 +256,20 @@ class LZInstructionManager {
 
       if (std::memcmp(curr_chunk_data, verify_buffer_ptr, cmp_size) != 0) {
         print_to_console("ERROR ON CURR CHUNK DATA!\n");
-        print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
+        print_to_console("With prev offset {}\n", prev_outputted_up_to_offset);
         throw std::runtime_error("Verification error");
       }
       verify_buffer_ptr += cmp_size;
       if (std::memcmp(copy_chunk_data, buffer_ptr, cmp_size) != 0) {
         print_to_console("ERROR ON COPY CHUNK DATA!\n");
-        print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
+        print_to_console("With prev offset {}\n", prev_outputted_up_to_offset);
         throw std::runtime_error("Verification error");
       }
       buffer_ptr += cmp_size;
 
       if (std::memcmp(copy_chunk_data, curr_chunk_data, cmp_size) != 0) {
-        print_to_console("Error while verifying outputted match with chunk data at offset " + std::to_string(outputted_up_to_offset) + "\n");
-        print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
+        print_to_console("Error while verifying outputted match with chunk data at offset {}\n", outputted_up_to_offset);
+        print_to_console("With prev offset {}\n", prev_outputted_up_to_offset);
         throw std::runtime_error("Verification error");
       }
       remaining_size -= cmp_size;
@@ -349,7 +349,7 @@ public:
         verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()), prevInstruction->size);
         // Ensure data matches
         if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), prevInstruction->size) != 0) {
-          print_to_console("Error while verifying addInstruction prevInstruction at offset " + std::to_string(current_offset) + "\n");
+          print_to_console("Error while verifying addInstruction prevInstruction at offset {}\n", current_offset);
           throw std::runtime_error("Verification error");
         }
 
@@ -363,7 +363,7 @@ public:
         verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()), instruction.size);
         // Ensure data matches
         if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), instruction.size) != 0) {
-          print_to_console("Error while verifying addInstruction instruction at offset " + std::to_string(current_offset) + "\n");
+          print_to_console("Error while verifying addInstruction instruction at offset {}\n", current_offset);
           throw std::runtime_error("Verification error");
         }
       }
@@ -447,7 +447,7 @@ public:
         verify_file.read(reinterpret_cast<char*>(verify_buffer_instruction_data.data()) + prevInstruction->size, instruction.size);
         // Ensure data matches
         if (std::memcmp(verify_buffer_orig_data.data(), verify_buffer_instruction_data.data(), data_count) != 0) {
-          print_to_console("Error while verifying addInstruction at offset " + std::to_string(current_offset) + "\n");
+          print_to_console("Error while verifying addInstruction at offset {}\n", current_offset);
           throw std::runtime_error("Verification error");
         }
       }
@@ -529,8 +529,8 @@ public:
           istream.read(verify_buffer.data(), instruction.size);
 
           if (std::memcmp(verify_buffer.data(), buffer.data(), instruction.size) != 0) {
-            print_to_console("Error while verifying outputted match at offset " + std::to_string(outputted_up_to_offset) + "\n");
-            print_to_console("With prev offset " + std::to_string(prev_outputted_up_to_offset) + "\n");
+            print_to_console("Error while verifying outputted match at offset {}\n", outputted_up_to_offset);
+            print_to_console("With prev offset {}\n", prev_outputted_up_to_offset);
             throw std::runtime_error("Verification error");
           }
 
