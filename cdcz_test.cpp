@@ -156,31 +156,31 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
   const bool do_all_candidates_selected_check = !is_use_mt && !is_use_simd;
   auto do_chunk_correctness_checks = [&process_pending_chunks, &trace_inputs, do_trace_input_check, do_all_candidates_selected_check]
   (uint64_t& chunk_idx, uint64_t last_chunk_size, CdcCandidatesResult& result, uint64_t segment_i, uint64_t last_cut_offset, uint64_t curr_segment_start_offset) {
-      if (do_trace_input_check || do_all_candidates_selected_check) {
-          while (chunk_idx != process_pending_chunks.size()) {
-              const uint64_t next_chunk_idx = chunk_idx + 1;
-              const uint64_t pending_chunk_size = next_chunk_idx == process_pending_chunks.size() ? last_chunk_size : process_pending_chunks[next_chunk_idx].offset - process_pending_chunks[chunk_idx].offset;
-              if (do_all_candidates_selected_check) {
-                  const uint64_t prev_candidate_offset = chunk_idx >= 1 ? result.candidates[chunk_idx - 1].offset : 0;
-                  const uint64_t candidate_chunk_size = result.candidates[chunk_idx].offset - prev_candidate_offset;
-                  if (candidate_chunk_size != pending_chunk_size) {
-                      print_to_console(
-                        "select_cut_point_candidates messed up candidate selection on segment {} chunk {}, we needed chunk_size of {} but got {}",
-                        segment_i, chunk_idx, candidate_chunk_size, pending_chunk_size
-                      );
-                      exit(1);
-                  }
-              }
-              if (do_trace_input_check && (pending_chunk_size != trace_inputs[chunk_idx].size || process_pending_chunks[chunk_idx].offset != trace_inputs[chunk_idx].offset)) {
-                  print_to_console(
-                    "Chunk size mismatch for chunk idx {}. Actual: {}, Expected: {}.\nOn segment {}, last_cut_offset: {}, segment offset: {}\n",
-                    chunk_idx, pending_chunk_size, trace_inputs[chunk_idx].size, segment_i, last_cut_offset, curr_segment_start_offset
-                  );
-                  exit(1);
-              }
-              ++chunk_idx;
+    if (do_trace_input_check || do_all_candidates_selected_check) {
+      while (chunk_idx != process_pending_chunks.size()) {
+        const uint64_t next_chunk_idx = chunk_idx + 1;
+        const uint64_t pending_chunk_size = next_chunk_idx == process_pending_chunks.size() ? last_chunk_size : process_pending_chunks[next_chunk_idx].offset - process_pending_chunks[chunk_idx].offset;
+        if (do_all_candidates_selected_check) {
+          const uint64_t prev_candidate_offset = chunk_idx >= 1 ? result.candidates[chunk_idx - 1].offset : 0;
+          const uint64_t candidate_chunk_size = result.candidates[chunk_idx].offset - prev_candidate_offset;
+          if (candidate_chunk_size != pending_chunk_size) {
+            print_to_console(
+              "select_cut_point_candidates messed up candidate selection on segment {} chunk {}, we needed chunk_size of {} but got {}",
+              segment_i, chunk_idx, candidate_chunk_size, pending_chunk_size
+            );
+            exit(1);
           }
+        }
+        if (do_trace_input_check && (pending_chunk_size != trace_inputs[chunk_idx].size || process_pending_chunks[chunk_idx].offset != trace_inputs[chunk_idx].offset)) {
+          print_to_console(
+            "Chunk size mismatch for chunk idx {}. Actual: {}, Expected: {}.\nOn segment {}, last_cut_offset: {}, segment offset: {}\n",
+            chunk_idx, pending_chunk_size, trace_inputs[chunk_idx].size, segment_i, last_cut_offset, curr_segment_start_offset
+          );
+          exit(1);
+        }
+        ++chunk_idx;
       }
+    }
   };
 
   {
