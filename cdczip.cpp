@@ -93,6 +93,10 @@ int main(int argc, char* argv[]) {
     else if (param.starts_with("--test")) {
       cli_params["test_mode"] = "true";
     }
+    else if (param.starts_with("--gear-at-pos=")) {
+      constexpr auto opt_size = std::string("--gear-at-pos=").size();
+      cli_params["calc_gear_at_pos"] = param.substr(opt_size, param.size() - opt_size);
+    }
     else if (param.starts_with("--trace-out=")) {
       constexpr auto opt_size = std::string("--trace-out=").size();
       cli_params["trace_out_file_path"] = param.substr(opt_size, param.size() - opt_size);
@@ -177,6 +181,10 @@ int main(int argc, char* argv[]) {
 
   if (cli_params["test_mode"] == "true") {
     cdcz_test_mode(input_path, file_size, cli_params);
+    exit(0);
+  }
+  if (!cli_params["calc_gear_at_pos"].empty()) {
+    calc_gear_at_pos(input_path, file_size, std::stoull(cli_params["calc_gear_at_pos"]));
     exit(0);
   }
 

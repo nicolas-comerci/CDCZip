@@ -48,8 +48,8 @@ CutPointCandidateWithContext cdc_next_cutpoint(
 );
 
 struct CdcCandidatesResult {
-  std::vector<CutPointCandidate> candidates;
-  std::vector<std::vector<uint32_t>> candidatesFeatureResults;
+  std::vector<CutPointCandidate> candidates{};
+  std::vector<std::vector<uint32_t>> candidatesFeatureResults{};
 };
 
 CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, const uint32_t min_size, const uint32_t avg_size, const uint32_t max_size, const CDCZ_CONFIG& cdcz_cfg, bool is_first_segment = true);

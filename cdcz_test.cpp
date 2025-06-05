@@ -6,6 +6,7 @@
 #include <span>
 #include <unordered_set>
 
+#include "cdc_algos/gear.hpp"
 #include "contrib/task_pool.h"
 #include "contrib/xxHash/xxhash.h"
 #include "utils/chunks.hpp"
@@ -155,7 +156,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
   // If no form of parallelism was used then chunks resulting from select_cut_point_candidates should just be the candidates
   const bool do_all_candidates_selected_check = !is_use_mt && !is_use_simd;
   auto do_chunk_correctness_checks = [&process_pending_chunks, &trace_inputs, do_trace_input_check, do_all_candidates_selected_check]
-  (uint64_t& chunk_idx, uint64_t last_chunk_size, CdcCandidatesResult& result, uint64_t segment_i, uint64_t last_cut_offset, uint64_t curr_segment_start_offset) {
+  (uint64_t& chunk_idx, uint64_t last_chunk_size, CdcCandidatesResult& result, uint64_t segment_i, uint64_t segment_size, uint64_t last_cut_offset, uint64_t curr_segment_start_offset) {
     if (do_trace_input_check || do_all_candidates_selected_check) {
       while (chunk_idx != process_pending_chunks.size()) {
         const uint64_t next_chunk_idx = chunk_idx + 1;
@@ -165,16 +166,20 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
           const uint64_t candidate_chunk_size = result.candidates[chunk_idx].offset - prev_candidate_offset;
           if (candidate_chunk_size != pending_chunk_size) {
             print_to_console(
-              "select_cut_point_candidates messed up candidate selection on segment {} chunk {}, we needed chunk_size of {} but got {}",
-              segment_i, chunk_idx, candidate_chunk_size, pending_chunk_size
+              "select_cut_point_candidates messed up candidate selection on segment {} with size {}, chunk {}, we needed chunk_size of {} but got {}",
+              segment_i, segment_size, chunk_idx, candidate_chunk_size, pending_chunk_size
             );
             exit(1);
           }
         }
         if (do_trace_input_check && (pending_chunk_size != trace_inputs[chunk_idx].size || process_pending_chunks[chunk_idx].offset != trace_inputs[chunk_idx].offset)) {
           print_to_console(
-            "Chunk size mismatch for chunk idx {}. Actual: {}, Expected: {}.\nOn segment {}, last_cut_offset: {}, segment offset: {}\n",
-            chunk_idx, pending_chunk_size, trace_inputs[chunk_idx].size, segment_i, last_cut_offset, curr_segment_start_offset
+            "Chunk size mismatch for chunk idx {}. Actual: {}, Expected: {}.\n",
+            chunk_idx, pending_chunk_size, trace_inputs[chunk_idx].size
+          );
+          print_to_console(
+            "On segment {} with size {}, last_cut_offset: {}, segment offset: {}, chunk offset: {}\n",
+            segment_i, segment_size, last_cut_offset, curr_segment_start_offset, trace_inputs[chunk_idx].offset
           );
           exit(1);
         }
@@ -233,7 +238,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
 #endif
         );
 
-        do_chunk_correctness_checks(chunk_idx, last_chunk_size, result, i, last_cut_offset, curr_segment_start_offset);
+        do_chunk_correctness_checks(chunk_idx, last_chunk_size, result, i, segments[i].size(), last_cut_offset, curr_segment_start_offset);
 
         last_cut_offset = process_pending_chunks.back().offset + last_chunk_size;
         curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
@@ -268,7 +273,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
 #endif
         );
 
-        do_chunk_correctness_checks(chunk_idx, last_chunk_size, result, i, last_cut_offset, curr_segment_start_offset);
+        do_chunk_correctness_checks(chunk_idx, last_chunk_size, result, i, segments[i].size(), last_cut_offset, curr_segment_start_offset);
 
         last_cut_offset = process_pending_chunks.back().offset + last_chunk_size;
         curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
@@ -354,4 +359,32 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
 #else
   std::free(file_data);
 #endif
+}
+
+void calc_gear_at_pos(const std::string& file_path, uint64_t file_size, uint64_t pos) {
+  auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
+  if (!file_stream.is_open()) {
+    print_to_console("Can't read test input file\n");
+    exit(1);
+  }
+
+  auto minmax_adjustment = std::min<uint64_t>(pos, 31);
+  file_stream.seekg(pos - minmax_adjustment);
+  std::vector<uint8_t> data{};
+  data.resize(minmax_adjustment + 1);
+
+  file_stream.read(reinterpret_cast<char*>(data.data()), minmax_adjustment + 1);
+  if (file_stream.gcount() != minmax_adjustment + 1) {
+    print_to_console("Can't read test input file\n");
+    exit(1);
+  }
+
+  uint32_t pattern = 0;
+  for (uint64_t i = 0; i < minmax_adjustment + 1; i++) {
+    pattern = (pattern << 1) + GEAR_TABLE[data[i]];
+  }
+
+  std::bitset<32> pattern_bitset = pattern;
+  print_to_console("The GEAR hash at requested position {} is {}\n", pos, pattern_bitset.to_string());
+  exit(0);
 }

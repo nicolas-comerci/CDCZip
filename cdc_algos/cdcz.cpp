@@ -140,6 +140,28 @@ CutPointCandidateWithContext cdc_next_cutpoint(
   return result;
 }
 
+inline auto promote_cut_candidate(const CDCZ_CONFIG& cdcz_cfg, uint32_t pattern, uint32_t mask_hard, uint32_t mask_medium, uint32_t mask_easy) -> CutPointCandidateType {
+  // Set the candidate type according to the condition_mask we used
+  CutPointCandidateType promoted_cut_type = cdcz_cfg.use_supercdc_backup_mask
+    ? CutPointCandidateType::SUPERCDC_BACKUP_MASK
+    : cdcz_cfg.use_fastcdc_normalized_chunking ? CutPointCandidateType::EASY_CUT_MASK : CutPointCandidateType::HARD_CUT_MASK;
+  // Now we need to "promote" the cut condition if possible, that is, if we found a cut candidate that satisfied SuperCDC's backup mask,
+  // but it also satisfies FastCDC's normalized chunking easy mask, or even the hard mask, we return it for the hardest condition available
+  if (promoted_cut_type == CutPointCandidateType::SUPERCDC_BACKUP_MASK) {
+    if (cdcz_cfg.use_fastcdc_normalized_chunking && !(pattern & mask_easy)) {
+      promoted_cut_type = CutPointCandidateType::EASY_CUT_MASK;
+    }
+    else if (!cdcz_cfg.use_fastcdc_normalized_chunking && !(pattern & mask_medium)) {
+      promoted_cut_type = CutPointCandidateType::HARD_CUT_MASK;
+    }
+  }
+  // Note that the type can only be EASY here if normalized chunking is on, so no need for extra check
+  if (promoted_cut_type == CutPointCandidateType::EASY_CUT_MASK && !(pattern & mask_hard)) {
+    promoted_cut_type = CutPointCandidateType::HARD_CUT_MASK;
+  }
+  return promoted_cut_type;
+}
+
 CutPointCandidateWithContext cdc_next_cutpoint_candidate(
   const std::span<uint8_t> data,
   uint32_t mask_hard,
@@ -167,41 +189,10 @@ CutPointCandidateWithContext cdc_next_cutpoint_candidate(
     condition_mask, condition_mask, condition_mask,
     all_candidates_cfg, initial_pattern
   );
-  // Set the candidate type according to the condition_mask we used
-  result.candidate.type = cdcz_cfg.use_supercdc_backup_mask ?
-    CutPointCandidateType::SUPERCDC_BACKUP_MASK
-    : cdcz_cfg.use_fastcdc_normalized_chunking ? CutPointCandidateType::EASY_CUT_MASK : CutPointCandidateType::HARD_CUT_MASK;
-  // Now we need to "promote" the cut condition if possible, that is, if we found a cut candidate that satisfied SuperCDC's backup mask,
-  // but it also satisfies FastCDC's normalized chunking easy mask, or even the hard mask, we return it for the hardest condition available
-  if (result.candidate.type == CutPointCandidateType::SUPERCDC_BACKUP_MASK) {
-    if (cdcz_cfg.use_fastcdc_normalized_chunking && !(result.pattern & mask_easy)) {
-      result.candidate.type = CutPointCandidateType::EASY_CUT_MASK;
-    }
-    else if (!cdcz_cfg.use_fastcdc_normalized_chunking && !(result.pattern & mask_medium)) {
-      result.candidate.type = CutPointCandidateType::HARD_CUT_MASK;
-    }
-  }
-  // Note that the type can only be EASY here if normalized chunking is on, so no need for extra check
-  if (result.candidate.type == CutPointCandidateType::EASY_CUT_MASK && !(result.pattern & mask_hard)) {
-    result.candidate.type = CutPointCandidateType::HARD_CUT_MASK;
-  }
+  result.candidate.type = result.candidate.type == CutPointCandidateType::MAX_SIZE
+		? CutPointCandidateType::EOF_CUT
+		: promote_cut_candidate(cdcz_cfg, result.pattern, mask_hard, mask_medium, mask_easy);
   return result;
-}
-
-#if defined(__AVX2__)
-int32_t _mm256_extract_epi32_var_indx(const __m256i vec, const unsigned int i) {
-  const __m128i indx = _mm_cvtsi32_si128(i);
-  const __m256i val = _mm256_permutevar8x32_epi32(vec, _mm256_castsi128_si256(indx));
-  return _mm_cvtsi128_si32(_mm256_castsi256_si128(val));
-}
-
-__m256i _mm256_insert_epi32_var_indx(const __m256i vec, int32_t val, const uint8_t lane_i) {
-  const auto val_vec = _mm256_set1_epi32(val);
-  auto lane_flag = [&lane_i](const uint8_t lane_pos) -> int32_t {
-    return lane_i == lane_pos ? static_cast<int32_t>(0xFFFFFFFF) : 0;
-    };
-  const auto lane_vec = _mm256_setr_epi32(lane_flag(0), lane_flag(1), lane_flag(2), lane_flag(3), lane_flag(4), lane_flag(5), lane_flag(6), lane_flag(7));
-  return _mm256_castps_si256(_mm256_blendv_ps(_mm256_castsi256_ps(vec), _mm256_castsi256_ps(val_vec), _mm256_castsi256_ps(lane_vec)));
 }
 
 inline auto is_chunk_invariance_condition_satisfied(
@@ -221,7 +212,23 @@ inline auto is_chunk_invariance_condition_satisfied(
       // candidate in that case
       (new_candidate_type == CutPointCandidateType::HARD_CUT_MASK && dist_with_prev >= min_size) ||
       (new_candidate_type == CutPointCandidateType::EASY_CUT_MASK && dist_with_prev >= avg_size)
-    );
+      );
+}
+
+#if defined(__AVX2__)
+int32_t _mm256_extract_epi32_var_indx(const __m256i vec, const unsigned int i) {
+  const __m128i indx = _mm_cvtsi32_si128(i);
+  const __m256i val = _mm256_permutevar8x32_epi32(vec, _mm256_castsi128_si256(indx));
+  return _mm_cvtsi128_si32(_mm256_castsi256_si128(val));
+}
+
+__m256i _mm256_insert_epi32_var_indx(const __m256i vec, int32_t val, const uint8_t lane_i) {
+  const auto val_vec = _mm256_set1_epi32(val);
+  auto lane_flag = [&lane_i](const uint8_t lane_pos) -> int32_t {
+    return lane_i == lane_pos ? static_cast<int32_t>(0xFFFFFFFF) : 0;
+  };
+  const auto lane_vec = _mm256_setr_epi32(lane_flag(0), lane_flag(1), lane_flag(2), lane_flag(3), lane_flag(4), lane_flag(5), lane_flag(6), lane_flag(7));
+  return _mm256_castps_si256(_mm256_blendv_ps(_mm256_castsi256_ps(vec), _mm256_castsi256_ps(val_vec), _mm256_castsi256_ps(lane_vec)));
 }
 
 // Precondition: Chunk invariance condition satisfied, that is, the data starts from the very beginning of the stream or after a chunk cutpoint we know for sure will be used
@@ -250,7 +257,7 @@ void cdc_find_cut_points_avx2(
     mask_easy_vec = _mm256_set1_epi32(static_cast<int>(mask_medium));
   }
   __m256i cmask = _mm256_set1_epi32(0xff);
-  __m256i hash = _mm256_set1_epi32(0);
+  __m256i hash_vec = _mm256_set1_epi32(0);
   const __m256i zero_vec = _mm256_set1_epi32(0);
   const __m256i ones_vec = _mm256_set1_epi32(1);
   const __m256i window_size_minus_one_vec = _mm256_set1_epi32(31);
@@ -270,16 +277,14 @@ void cdc_find_cut_points_avx2(
 
   // For each lane, the last index they are allowed to access
   __m256i vindex_max = _mm256_add_epi32(vindex, _mm256_set1_epi32(bytes_per_lane));
-  vindex_max = _mm256_insert_epi32(vindex_max, static_cast<int32_t>(data.size()), 7);
   // Because we read 4bytes at a time we need to ensure we are not reading past the data end
-  __m256i vindex_max_avx2 = vindex_max;
-  vindex_max_avx2 = _mm256_sub_epi32(vindex_max_avx2, _mm256_set_epi32(0, 0, 0, 0, 0, 0, 0, -4));
+  vindex_max = _mm256_insert_epi32(vindex_max, static_cast<int32_t>(data.size()) - 4, 7);
 
   // SuperCDC's even easier "backup mask" and backup result, if mask_easy fails to find a cutoff point before the max_size we use the backup result
   // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
   // which helps better preserve the content defined nature of chunks and thus increase dedup ratios.
   __m256i mask_b_vec = _mm256_set1_epi32(static_cast<int>(mask_easy << 1));
-  std::array<int32_t, 8> backup_cut_vec = { 0, 0, 0, 0, 0, 0, 0, 0 };
+  std::array<std::queue<int32_t>, 8> backup_cut_vec{};
 
   // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
   // the content defined nature of the Hashes.
@@ -310,22 +315,16 @@ void cdc_find_cut_points_avx2(
   __m256i cds_mask_vec = _mm256_set1_epi32(delta_comp_constants::CDS_SAMPLING_MASK);
 
   bool any_lane_marked_for_jump = false;
-  __m256i subminimum_skip_pos_vec = zero_vec;
-  auto mark_lane_for_jump = [&subminimum_skip_pos_vec, &any_lane_marked_for_jump](const int32_t pos, const uint8_t lane_i) {
-    subminimum_skip_pos_vec = _mm256_insert_epi32_var_indx(subminimum_skip_pos_vec, pos, lane_i);
+  std::array<int32_t, 8> jump_pos_vec = { 0, 0, 0, 0, 0, 0, 0, 0 };
+  auto mark_lane_for_jump = [&jump_pos_vec, &any_lane_marked_for_jump, &cdcz_cfg](const int32_t pos, const uint8_t lane_i) {
+    if (!cdcz_cfg.use_fastcdc_subminimum_skipping) return;
+    jump_pos_vec[lane_i] = pos;
     any_lane_marked_for_jump = true;
   };
 
-  auto get_result_type_for_lane = [&cdcz_cfg, &mask_easy, &mask_hard](int32_t pattern) {
+  auto get_result_type_for_lane = [&cdcz_cfg, &mask_hard, &mask_medium, &mask_easy](int32_t pattern) {
     // Do the cut candidate promoting behavior
-    auto cut_type = CutPointCandidateType::SUPERCDC_BACKUP_MASK;
-    if (!cdcz_cfg.use_supercdc_backup_mask || !(pattern & mask_easy)) {
-      cut_type = CutPointCandidateType::EASY_CUT_MASK;
-    }
-    if (!cdcz_cfg.use_fastcdc_normalized_chunking || !(pattern & mask_hard)) {
-      cut_type = CutPointCandidateType::HARD_CUT_MASK;
-    }
-    return cut_type;
+    return promote_cut_candidate(cdcz_cfg, pattern, mask_hard, mask_medium, mask_easy);
   };
 
   auto process_lane = [&](const uint8_t lane_i, int32_t pos, const CutPointCandidateType result_type) {
@@ -336,32 +335,49 @@ void cdc_find_cut_points_avx2(
       if (pos < minmax_adjustment_vec[lane_i]) return;
     }
     // if the lane is marked for jump already then ignore the cut as well
-    if (_mm256_extract_epi32_var_indx(subminimum_skip_pos_vec, lane_i) != 0) return;
+    if (jump_pos_vec[lane_i] != 0) return;
 
     if (lane_achieved_chunk_invariance[lane_i]) {
-      const int32_t prev_cut_pos = lane_results[lane_i].empty() ? lane_i * bytes_per_lane : static_cast<int32_t>(lane_results[lane_i].back().offset);
-      const int32_t dist_with_prev = pos - prev_cut_pos;
+      int32_t prev_cut_pos = lane_results[lane_i].empty() ? lane_i * bytes_per_lane : static_cast<int32_t>(lane_results[lane_i].back().offset);
+      int32_t dist_with_prev = pos - prev_cut_pos;
+
+      // >= max_size and not > max_size here even if it would be theoretically unnecessary because that's what we do on single threaded FastCDC as well
+      while (dist_with_prev >= max_size) {
+        if (!backup_cut_vec[lane_i].empty() && pos > backup_cut_vec[lane_i].front()) {
+          prev_cut_pos = backup_cut_vec[lane_i].front();
+          backup_cut_vec[lane_i].pop();
+          lane_results[lane_i].emplace_back(CutPointCandidateType::SUPERCDC_BACKUP_MASK, prev_cut_pos);
+        }
+        else {
+          prev_cut_pos = pos - dist_with_prev + max_size;
+          lane_results[lane_i].emplace_back(CutPointCandidateType::MAX_SIZE, prev_cut_pos);
+        }
+        // Clear any pending backup cut candidate that is now invalid, that is, before the new prev_cut_pos + avg_size
+        while (!backup_cut_vec[lane_i].empty() && backup_cut_vec[lane_i].front() < prev_cut_pos + avg_size) {
+          backup_cut_vec[lane_i].pop();
+        }
+        dist_with_prev = pos - prev_cut_pos;
+      }
 
       if (result_type == CutPointCandidateType::SUPERCDC_BACKUP_MASK) {
-        backup_cut_vec[lane_i] = pos < backup_cut_vec[lane_i] ? pos : backup_cut_vec[lane_i];
+        if (dist_with_prev < avg_size) return;
+        backup_cut_vec[lane_i].emplace(pos);
         return;
       }
       else if (result_type == CutPointCandidateType::EASY_CUT_MASK && dist_with_prev < avg_size) {
         return;
       }
-
-      if (dist_with_prev >= min_size) {
-        if (cdcz_cfg.use_supercdc_backup_mask && (pos == prev_cut_pos + max_size) && pos > backup_cut_vec[lane_i]) {
-          pos = backup_cut_vec[lane_i];
-        }
-        lane_results[lane_i].emplace_back(result_type, pos);
-        if (cdcz_cfg.compute_features) {
-          lane_features_results[lane_i].emplace_back(std::move(lane_current_features[lane_i]));
-          lane_current_features[lane_i] = std::vector<uint32_t>();
-        }
-        backup_cut_vec[lane_i] = pos + max_size;
-        mark_lane_for_jump(pos, lane_i);
+      else if (dist_with_prev < min_size) {
+        return;
       }
+
+      lane_results[lane_i].emplace_back(result_type, pos);
+      if (cdcz_cfg.compute_features) {
+        lane_features_results[lane_i].emplace_back(std::move(lane_current_features[lane_i]));
+        lane_current_features[lane_i] = std::vector<uint32_t>();
+      }
+      while (!backup_cut_vec[lane_i].empty()) backup_cut_vec[lane_i].pop();
+      mark_lane_for_jump(pos, lane_i);
     }
     else {
       if (!lane_results[lane_i].empty()) {
@@ -371,7 +387,6 @@ void cdc_find_cut_points_avx2(
         // if this happens this lane is back in sync with non-segmented processing!
         if (is_chunk_invariance_condition_satisfied(is_prev_candidate_hard, dist_with_prev, result_type, min_size, avg_size, max_size)) {
           lane_achieved_chunk_invariance[lane_i] = true;
-          backup_cut_vec[lane_i] = pos + max_size;
           mark_lane_for_jump(pos, lane_i);
         }
       }
@@ -383,15 +398,18 @@ void cdc_find_cut_points_avx2(
     }
   };
 
-  auto sample_feature_value = [&lane_current_features, &hash, &vindex, &minmax_adjustment_vec, &subminimum_skip_pos_vec, &cdcz_cfg] (uint32_t lane_i) {
+  auto sample_feature_value = [&lane_current_features, &hash_vec, &vindex, &minmax_adjustment_vec, &jump_pos_vec, &vindex_max, &cdcz_cfg] (uint32_t lane_i) {
+    const auto lane_pos = _mm256_extract_epi32_var_indx(vindex, lane_i);
+    // Lane already finished, and we are on a pos for another lane (or after data end)!
+    if (lane_pos >= _mm256_extract_epi32_var_indx(vindex_max, lane_i)) return;
+    // If we are still doing minmax adjustment ignore the feature sampling match
     if (cdcz_cfg.use_supercdc_minmax_adjustment) {
-      const auto lane_pos = _mm256_extract_epi32_var_indx(vindex, lane_i);
       if (lane_pos < minmax_adjustment_vec[lane_i]) return;
     }
     // if the lane is marked for jump already then ignore feature sampling match
-    if (_mm256_extract_epi32_var_indx(subminimum_skip_pos_vec, lane_i) != 0) return;
+    if (jump_pos_vec[lane_i] != 0) return;
 
-    uint32_t pattern = _mm256_extract_epi32_var_indx(hash, lane_i);
+    uint32_t pattern = _mm256_extract_epi32_var_indx(hash_vec, lane_i);
     if (lane_current_features[lane_i].empty()) {
       lane_current_features[lane_i].resize(16);
       lane_current_features[lane_i].shrink_to_fit();
@@ -402,27 +420,27 @@ void cdc_find_cut_points_avx2(
     }
   };
 
-  auto adjust_lane_for_jump = [&minmax_adjustment_vec, &subminimum_skip_pos_vec, &vindex, &min_size, &cdcz_cfg]
-    (const uint8_t lane_i) {
-    int32_t new_lane_pos = _mm256_extract_epi32_var_indx(subminimum_skip_pos_vec, lane_i);
+  auto adjust_lane_for_jump = [&minmax_adjustment_vec, &jump_pos_vec, &vindex, &hash_vec, &min_size, &cdcz_cfg] (const uint8_t lane_i) {
+    int32_t new_lane_pos = jump_pos_vec[lane_i];
     if (new_lane_pos == 0) return;
-    if (cdcz_cfg.use_fastcdc_subminimum_skipping) {
-      new_lane_pos += min_size;
-    }
+    new_lane_pos += min_size;
 
     if (cdcz_cfg.use_supercdc_minmax_adjustment) {
       minmax_adjustment_vec[lane_i] = new_lane_pos;
       auto adjustment = std::min(31, new_lane_pos);
       new_lane_pos -= adjustment;
     }
+    else {
+      hash_vec = _mm256_insert_epi32_var_indx(hash_vec, 0, lane_i);
+    }
 
     vindex = _mm256_insert_epi32_var_indx(vindex, new_lane_pos, lane_i);
   };
 
   while (true) {
-    vindex = _mm256_min_epi32(vindex, vindex_max_avx2);
-    __m256i is_finish_vmask = _mm256_cmpgt_epi32(vindex_max_avx2, vindex);
-    int is_lane_not_finished = _mm256_movemask_ps(_mm256_castsi256_ps(is_finish_vmask));
+    vindex = _mm256_min_epi32(vindex, vindex_max);  // prevent vindex from pointing to invalid memory
+    const __m256i is_finished_vmask = _mm256_cmpgt_epi32(vindex_max, vindex);
+    const int is_lane_not_finished = _mm256_movemask_ps(_mm256_castsi256_ps(is_finished_vmask));
     // If all lanes are finished, we break, else we continue and lanes that are already finished will ignore results
     if (is_lane_not_finished == 0) break;
 
@@ -430,20 +448,20 @@ void cdc_find_cut_points_avx2(
 
     uint32_t j = 0;
     while (j < 4) {
-      hash = _mm256_slli_epi32(hash, 1);  // Shift all the hash values for each lane at the same time
+      hash_vec = _mm256_slli_epi32(hash_vec, 1);  // Shift all the hash values for each lane at the same time
       __m256i idx = _mm256_and_si256(cbytes, cmask);  // Get byte on the lower bits of the packed 32bit lanes
       cbytes = _mm256_srli_epi32(cbytes, 8);  // We already got the byte on the lower bits, we can shift right to later get the next byte
       // This gives us the GEAR hash values for each of the bytes we just got, scale by 4 because 32bits=4bytes
       __m256i tentry = _mm256_i32gather_epi32(reinterpret_cast<int const*>(GEAR_TABLE), idx, 4);
-      hash = _mm256_add_epi32(hash, tentry);  // Add the values we got from the GEAR hash values to the values on the hash
+      hash_vec = _mm256_add_epi32(hash_vec, tentry);  // Add the values we got from the GEAR hash values to the values on the hash
 
       // Compare each packed int by bitwise AND with the mask and checking that its 0
-      const __m256i hash_eq_mask = _mm256_cmpeq_epi32(_mm256_and_si256(hash, mask_vec), zero_vec);
+      const __m256i hash_eq_mask = _mm256_cmpeq_epi32(_mm256_and_si256(hash_vec, mask_vec), zero_vec);
       int lane_has_result = _mm256_movemask_ps(_mm256_castsi256_ps(hash_eq_mask));
 
       if (cdcz_cfg.compute_features) {
         // Check if content defined sampling condition is satisfied and we should sample feature values for some lane
-        __m256i hash_cds_masked = _mm256_and_si256(hash, cds_mask_vec);
+        __m256i hash_cds_masked = _mm256_and_si256(hash_vec, cds_mask_vec);
         __m256i hash_cds_eq_vmask = _mm256_cmpeq_epi32(hash_cds_masked, zero_vec);
 
         const int hash_cds_eq_mask = _mm256_movemask_ps(_mm256_castsi256_ps(hash_cds_eq_vmask));
@@ -463,14 +481,14 @@ void cdc_find_cut_points_avx2(
         lane_has_result &= is_lane_not_finished;
 
         if (lane_has_result != 0) {
-          if (lane_has_result & 0b00000001) process_lane(0, _mm256_extract_epi32(vindex, 0), get_result_type_for_lane(_mm256_extract_epi32(hash, 0)));
-          if (lane_has_result & 0b00000010) process_lane(1, _mm256_extract_epi32(vindex, 1), get_result_type_for_lane(_mm256_extract_epi32(hash, 1)));
-          if (lane_has_result & 0b00000100) process_lane(2, _mm256_extract_epi32(vindex, 2), get_result_type_for_lane(_mm256_extract_epi32(hash, 2)));
-          if (lane_has_result & 0b00001000) process_lane(3, _mm256_extract_epi32(vindex, 3), get_result_type_for_lane(_mm256_extract_epi32(hash, 3)));
-          if (lane_has_result & 0b00010000) process_lane(4, _mm256_extract_epi32(vindex, 4), get_result_type_for_lane(_mm256_extract_epi32(hash, 4)));
-          if (lane_has_result & 0b00100000) process_lane(5, _mm256_extract_epi32(vindex, 5), get_result_type_for_lane(_mm256_extract_epi32(hash, 5)));
-          if (lane_has_result & 0b01000000) process_lane(6, _mm256_extract_epi32(vindex, 6), get_result_type_for_lane(_mm256_extract_epi32(hash, 6)));
-          if (lane_has_result & 0b10000000) process_lane(7, _mm256_extract_epi32(vindex, 7), get_result_type_for_lane(_mm256_extract_epi32(hash, 7)));
+          if (lane_has_result & 0b00000001) process_lane(0, _mm256_extract_epi32(vindex, 0), get_result_type_for_lane(_mm256_extract_epi32(hash_vec, 0)));
+          if (lane_has_result & 0b00000010) process_lane(1, _mm256_extract_epi32(vindex, 1), get_result_type_for_lane(_mm256_extract_epi32(hash_vec, 1)));
+          if (lane_has_result & 0b00000100) process_lane(2, _mm256_extract_epi32(vindex, 2), get_result_type_for_lane(_mm256_extract_epi32(hash_vec, 2)));
+          if (lane_has_result & 0b00001000) process_lane(3, _mm256_extract_epi32(vindex, 3), get_result_type_for_lane(_mm256_extract_epi32(hash_vec, 3)));
+          if (lane_has_result & 0b00010000) process_lane(4, _mm256_extract_epi32(vindex, 4), get_result_type_for_lane(_mm256_extract_epi32(hash_vec, 4)));
+          if (lane_has_result & 0b00100000) process_lane(5, _mm256_extract_epi32(vindex, 5), get_result_type_for_lane(_mm256_extract_epi32(hash_vec, 5)));
+          if (lane_has_result & 0b01000000) process_lane(6, _mm256_extract_epi32(vindex, 6), get_result_type_for_lane(_mm256_extract_epi32(hash_vec, 6)));
+          if (lane_has_result & 0b10000000) process_lane(7, _mm256_extract_epi32(vindex, 7), get_result_type_for_lane(_mm256_extract_epi32(hash_vec, 7)));
         }
       }
 
@@ -488,34 +506,58 @@ void cdc_find_cut_points_avx2(
       adjust_lane_for_jump(6);
       adjust_lane_for_jump(7);
 
-      subminimum_skip_pos_vec = zero_vec;
+      jump_pos_vec = { 0, 0, 0, 0, 0, 0, 0, 0 };
       any_lane_marked_for_jump = false;
     }
   }
 
-  uint64_t i = _mm256_extract_epi32(vindex, 7);
-  auto pattern = _mm256_extract_epi32(hash, 7);  // Recover hash value from last lane
-  // Deal with any trailing data sequentially
-  // TODO: Check backup mask? anything else I am missing here?
-  while (i < data.size()) {
-    pattern = (pattern << 1) + GEAR_TABLE[data[i]];
-    if (!(pattern & mask_easy)) process_lane(7, i, CutPointCandidateType::EASY_CUT_MASK);
-    ++i;
+  {
+    // Deal with any trailing data sequentially
+    uint64_t i = _mm256_extract_epi32(vindex_max, 7) - 31;
+    // The hash might be nonsense if the last lane finished before the others, so we just recover it
+    uint64_t remaining_minmax_adjustment = 31;
+    uint32_t pattern = 0;
+
+    // TODO: Check backup mask? anything else I am missing here?
+    // TODO: Can trunc for max_size, though it should be handled by select cut point candidates anyway
+
+    const auto mask = cdcz_cfg.use_supercdc_backup_mask
+      ? mask_easy << 1
+      : cdcz_cfg.use_fastcdc_normalized_chunking ? mask_easy : mask_medium;
+    while (i < data.size()) {
+      pattern = (pattern << 1) + GEAR_TABLE[data[i]];
+      if (remaining_minmax_adjustment > 0) {
+        --remaining_minmax_adjustment;
+        ++i;
+        continue;
+      }
+      if (!(pattern & mask)) process_lane(7, i, get_result_type_for_lane(pattern));
+      ++i;
+    }
   }
 
-  for (uint64_t lane = 0; lane < 8; lane++) {
-    auto& cut_points_list = lane_results[lane];
+  for (uint64_t lane_i = 0; lane_i < 8; lane_i++) {
+    auto& cut_points_list = lane_results[lane_i];
     for (uint64_t n = 0; n < cut_points_list.size(); n++) {
-      auto& cut_point_candidate = cut_points_list[n];
+      const auto& cut_point_candidate = cut_points_list[n];
       candidates.emplace_back(cut_point_candidate.type, base_offset + cut_point_candidate.offset);
       if (cdcz_cfg.compute_features) {
-        candidate_features.emplace_back(std::move(lane_features_results[lane][n]));
+        candidate_features.emplace_back(std::move(lane_features_results[lane_i][n]));
+      }
+    }
+
+    // There might be some leftover SuperCDC backup cut candidates on the lane, just emit them and let the cut selection step fix it
+    while (!backup_cut_vec[lane_i].empty()) {
+      candidates.emplace_back(CutPointCandidateType::SUPERCDC_BACKUP_MASK, base_offset + backup_cut_vec[lane_i].front());
+      backup_cut_vec[lane_i].pop();
+      // TODO: This is nonsense!
+      if (cdcz_cfg.compute_features) {
+        candidate_features.emplace_back();
       }
     }
   }
 
   if (candidates.empty() || candidates.back().offset != base_offset + data.size()) {
-    // TODO: EOF_CUT and MAX_SIZE_CUT ARE THE SAME? SHOULDN'T THEY BE DIFFERENT?
     candidates.emplace_back(CutPointCandidateType::EOF_CUT, base_offset + data.size());
     if (cdcz_cfg.compute_features) {
       candidate_features.emplace_back();
@@ -525,7 +567,7 @@ void cdc_find_cut_points_avx2(
 #endif
 
 CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, const uint32_t min_size, const uint32_t avg_size, const uint32_t max_size, const CDCZ_CONFIG& cdcz_cfg, bool is_first_segment) {
-  CdcCandidatesResult result;
+  CdcCandidatesResult result{};
   if (data.empty()) return result;
 
   const auto make_mask = [](uint32_t bits) { return 0xFFFFFFFF << (32 - bits); };

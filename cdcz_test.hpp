@@ -7,4 +7,6 @@
 
 void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unordered_map<std::string, std::string>& cli_params);
 
+void calc_gear_at_pos(const std::string& file_path, uint64_t file_size, uint64_t pos);
+
 #endif
