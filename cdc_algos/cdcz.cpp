@@ -327,9 +327,9 @@ void cdc_find_cut_points_avx2(
     return promote_cut_candidate(cdcz_cfg, pattern, mask_hard, mask_medium, mask_easy);
   };
 
-  auto process_lane = [&](const uint8_t lane_i, int32_t pos, const CutPointCandidateType result_type) {
+  auto process_lane = [&](const uint8_t lane_i, int32_t pos, const CutPointCandidateType result_type, bool ignore_max_pos = false) {
     // Lane already finished, and we are on a pos for another lane (or after data end)!
-    if (pos >= _mm256_extract_epi32_var_indx(vindex_max, lane_i)) return;
+    if (!ignore_max_pos && pos >= _mm256_extract_epi32_var_indx(vindex_max, lane_i)) return;
     // If we are still doing minmax adjustment ignore the cut
     if (cdcz_cfg.use_supercdc_minmax_adjustment) {
       if (pos < minmax_adjustment_vec[lane_i]) return;
@@ -531,7 +531,7 @@ void cdc_find_cut_points_avx2(
         ++i;
         continue;
       }
-      if (!(pattern & mask)) process_lane(7, i, get_result_type_for_lane(pattern));
+      if (!(pattern & mask)) process_lane(7, i, get_result_type_for_lane(pattern), true);
       ++i;
     }
   }
