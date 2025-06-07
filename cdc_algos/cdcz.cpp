@@ -232,6 +232,7 @@ __m256i _mm256_insert_epi32_var_indx(const __m256i vec, int32_t val, const uint8
 }
 
 // Precondition: Chunk invariance condition satisfied, that is, the data starts from the very beginning of the stream or after a chunk cutpoint we know for sure will be used
+// Precondition 2: data either has size multiple of 4, or can be safely extended to be (extra data will be ignored)
 void cdc_find_cut_points_avx2(
   std::vector<CutPointCandidate>& candidates,
   std::vector<std::vector<uint32_t>>& candidate_features,
@@ -243,13 +244,14 @@ void cdc_find_cut_points_avx2(
   uint32_t mask_hard,
   uint32_t mask_medium,
   uint32_t mask_easy,
-  const CDCZ_CONFIG& cdcz_cfg
+  const CDCZ_CONFIG& cdcz_cfg,
+  bool is_first_segment
 ) {
   std::array<std::vector<CutPointCandidate>, 8> lane_results{};
   std::array<std::vector<std::vector<uint32_t>>, 8> lane_features_results{};
   std::array<std::vector<uint32_t>, 8> lane_current_features{};
 
-  std::array<bool, 8> lane_achieved_chunk_invariance{ true, false, false, false, false, false, false, false };
+  std::array<bool, 8> lane_achieved_chunk_invariance{ is_first_segment, false, false, false, false, false, false, false };
   __m256i mask_hard_vec = _mm256_set1_epi32(static_cast<int>(mask_hard));
   __m256i mask_easy_vec = _mm256_set1_epi32(static_cast<int>(mask_easy));
   if (!cdcz_cfg.use_fastcdc_normalized_chunking) {
@@ -262,23 +264,28 @@ void cdc_find_cut_points_avx2(
   const __m256i ones_vec = _mm256_set1_epi32(1);
   const __m256i window_size_minus_one_vec = _mm256_set1_epi32(31);
 
+  constexpr int32_t lane_count = 8;
+
+  // Highway's portable GatherIndex requires we read with 32bit/4byte alignment as we have int32_t vectors.
+  // This way we ensure we never attempt to Gather from outside the data boundaries, the last < 4 bytes can be finished off manually.
+  const auto data_adjusted_size = pad_size_for_alignment(data.size(), 4) - 4;
   {
-	  const uint64_t bytes_per_lane_u64 = data.size() / 8ULL;
+	  const uint64_t bytes_per_lane_u64 = data_adjusted_size / lane_count;
 	  if (bytes_per_lane_u64 > std::numeric_limits<int32_t>::max()) {
 	    throw std::runtime_error("Unable to process data such that lanes positions would overflow");
 	  }
   }
-  int32_t bytes_per_lane = static_cast<int32_t>(data.size() / 8ULL);
+  int32_t bytes_per_lane = pad_size_for_alignment(static_cast<int32_t>(data_adjusted_size / lane_count), 4) - 4;  // Idem 32bit alignment for Gathers
   __m256i vindex = _mm256_setr_epi32(0, bytes_per_lane, 2 * bytes_per_lane, 3 * bytes_per_lane, 4 * bytes_per_lane, 5 * bytes_per_lane, 6 * bytes_per_lane, 7 * bytes_per_lane);
 
-  if (cdcz_cfg.use_fastcdc_subminimum_skipping) {
+  if (cdcz_cfg.use_fastcdc_subminimum_skipping && is_first_segment) {
     vindex = _mm256_insert_epi32(vindex, static_cast<int32_t>(min_size), 0);
   }
 
   // For each lane, the last index they are allowed to access
   __m256i vindex_max = _mm256_add_epi32(vindex, _mm256_set1_epi32(bytes_per_lane));
   // Because we read 4bytes at a time we need to ensure we are not reading past the data end
-  vindex_max = _mm256_insert_epi32(vindex_max, static_cast<int32_t>(data.size()) - 4, 7);
+  vindex_max = _mm256_insert_epi32(vindex_max, static_cast<int32_t>(data_adjusted_size), 7);
 
   // SuperCDC's even easier "backup mask" and backup result, if mask_easy fails to find a cutoff point before the max_size we use the backup result
   // gotten with the easier to meet mask_b cutoff point. This should make it much more unlikely that we have to forcefully end chunks at max_size,
@@ -331,9 +338,7 @@ void cdc_find_cut_points_avx2(
     // Lane already finished, and we are on a pos for another lane (or after data end)!
     if (!ignore_max_pos && pos >= _mm256_extract_epi32_var_indx(vindex_max, lane_i)) return;
     // If we are still doing minmax adjustment ignore the cut
-    if (cdcz_cfg.use_supercdc_minmax_adjustment) {
-      if (pos < minmax_adjustment_vec[lane_i]) return;
-    }
+    if (pos < minmax_adjustment_vec[lane_i]) return;
     // if the lane is marked for jump already then ignore the cut as well
     if (jump_pos_vec[lane_i] != 0) return;
 
@@ -403,9 +408,7 @@ void cdc_find_cut_points_avx2(
     // Lane already finished, and we are on a pos for another lane (or after data end)!
     if (lane_pos >= _mm256_extract_epi32_var_indx(vindex_max, lane_i)) return;
     // If we are still doing minmax adjustment ignore the feature sampling match
-    if (cdcz_cfg.use_supercdc_minmax_adjustment) {
-      if (lane_pos < minmax_adjustment_vec[lane_i]) return;
-    }
+    if (lane_pos < minmax_adjustment_vec[lane_i]) return;
     // if the lane is marked for jump already then ignore feature sampling match
     if (jump_pos_vec[lane_i] != 0) return;
 
@@ -420,7 +423,7 @@ void cdc_find_cut_points_avx2(
     }
   };
 
-  auto adjust_lane_for_jump = [&minmax_adjustment_vec, &jump_pos_vec, &vindex, &hash_vec, &min_size, &cdcz_cfg] (const uint8_t lane_i) {
+  auto adjust_lane_for_jump = [&minmax_adjustment_vec, &jump_pos_vec, &vindex, &hash_vec, &min_size, &cdcz_cfg, &data] (const uint8_t lane_i) {
     int32_t new_lane_pos = jump_pos_vec[lane_i];
     if (new_lane_pos == 0) return;
     new_lane_pos += min_size;
@@ -432,6 +435,23 @@ void cdc_find_cut_points_avx2(
     }
     else {
       hash_vec = _mm256_insert_epi32_var_indx(hash_vec, 0, lane_i);
+    }
+
+    // We might not be able to actually do a portable GatherIndex from this position, we adjust if necessary to align to 32bit boundary
+    const int32_t aligned_new_lane_pos = pad_size_for_alignment(new_lane_pos, 4);
+    const auto bytes_to_alignment = aligned_new_lane_pos - new_lane_pos;
+    if (cdcz_cfg.use_supercdc_minmax_adjustment) {
+      // This is fine, doing adjustment for more than 31 bytes won't change the GEAR hashing result
+      new_lane_pos -= bytes_to_alignment > 0 ? 4 - bytes_to_alignment : 0;
+    }
+    else {
+	    // If we are not doing minmax adjustment we need to serially calculate the GEAR hash until we are aligned so SIMD processing can continue
+      int32_t pattern = 0;
+      for (int32_t i = new_lane_pos; i < new_lane_pos + bytes_to_alignment; i++) {
+        pattern = (pattern << 1) + GEAR_TABLE[data[i]];
+      }
+      hash_vec = _mm256_insert_epi32_var_indx(hash_vec, pattern, lane_i);
+      new_lane_pos += bytes_to_alignment;
     }
 
     vindex = _mm256_insert_epi32_var_indx(vindex, new_lane_pos, lane_i);
@@ -576,32 +596,18 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, const uint3
   const auto mask_medium = make_mask(bits);
   const auto mask_easy = make_mask(bits - 1);
 
-  CutPointCandidateWithContext cdc_return{};
-  uint64_t base_offset = 0;
+  if (
+    data.size() < 1024 || !cdcz_cfg.avx2_allowed
+#ifndef __AVX2__
+    || true
+#endif
+    ) {
+    CutPointCandidateWithContext cdc_return{};
+    uint64_t base_offset = 0;
 
-  // If this is not the first segment then we need to deal with the previous segment extended data and attempt to recover chunk invariance
-  if (!is_first_segment) {
-    cdc_return = cdc_next_cutpoint_candidate(data, mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern);
-
-    base_offset += cdc_return.candidate.offset;
-    result.candidates.emplace_back(cdc_return.candidate.type, base_offset);
-    if (cdcz_cfg.compute_features) {
-      result.candidatesFeatureResults.emplace_back(std::move(cdc_return.features));
-    }
-    data = std::span(data.data() + cdc_return.candidate.offset, data.size() - cdc_return.candidate.offset);
-    bool is_prev_candidate_hard = cdc_return.candidate.type == CutPointCandidateType::HARD_CUT_MASK;
-
-    // And now we need to recover chunk invariance in accordance to the chunk invariance recovery condition.
-    // We are guaranteed to be back in sync with what non-segmented CDC would have done as soon as we find a cut candidate with
-    // distance_w_prev_cut_candidate >= min_size and distance_w_prev_cut_candidate + min_size <= max_size.
-    // As soon as we find that, we can break from here and keep processing as if we were processing without segments,
-    // which in particular means we can exploit jumps to min_size again.
-    while (!data.empty()) {
-      // We need to skip processing the first byte as we already have the pattern with GEAR having processed that byte.
-      cdc_return = cdc_next_cutpoint_candidate(
-        std::span(data.data() + 1, data.size() - 1), mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern
-      );
-      cdc_return.candidate.offset = cdc_return.candidate.offset + 1; // +1 because of the first byte that we skipped
+    // If this is not the first segment then we need to deal with the previous segment extended data and attempt to recover chunk invariance
+    if (!is_first_segment) {
+      cdc_return = cdc_next_cutpoint_candidate(data, mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern);
 
       base_offset += cdc_return.candidate.offset;
       result.candidates.emplace_back(cdc_return.candidate.type, base_offset);
@@ -609,23 +615,37 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, const uint3
         result.candidatesFeatureResults.emplace_back(std::move(cdc_return.features));
       }
       data = std::span(data.data() + cdc_return.candidate.offset, data.size() - cdc_return.candidate.offset);
+      bool is_prev_candidate_hard = cdc_return.candidate.type == CutPointCandidateType::HARD_CUT_MASK;
 
-      // For a more in depth explanation of the chunk invariance recovery condition please refer to my CDCZ paper
-      if (is_chunk_invariance_condition_satisfied(is_prev_candidate_hard, cdc_return.candidate.offset, cdc_return.candidate.type, min_size, avg_size, max_size)) {
-        // We demonstrated the current cut candidate will be used!, no more uncertainty, back in sync with non-segmented processing!
-        break;
+      // And now we need to recover chunk invariance in accordance to the chunk invariance recovery condition.
+      // We are guaranteed to be back in sync with what non-segmented CDC would have done as soon as we find a cut candidate with
+      // distance_w_prev_cut_candidate >= min_size and distance_w_prev_cut_candidate + min_size <= max_size.
+      // As soon as we find that, we can break from here and keep processing as if we were processing without segments,
+      // which in particular means we can exploit jumps to min_size again.
+      while (!data.empty()) {
+        // We need to skip processing the first byte as we already have the pattern with GEAR having processed that byte.
+        cdc_return = cdc_next_cutpoint_candidate(
+          std::span(data.data() + 1, data.size() - 1), mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern
+        );
+        cdc_return.candidate.offset = cdc_return.candidate.offset + 1; // +1 because of the first byte that we skipped
+
+        base_offset += cdc_return.candidate.offset;
+        result.candidates.emplace_back(cdc_return.candidate.type, base_offset);
+        if (cdcz_cfg.compute_features) {
+          result.candidatesFeatureResults.emplace_back(std::move(cdc_return.features));
+        }
+        data = std::span(data.data() + cdc_return.candidate.offset, data.size() - cdc_return.candidate.offset);
+
+        // For a more in depth explanation of the chunk invariance recovery condition please refer to my CDCZ paper
+        if (is_chunk_invariance_condition_satisfied(is_prev_candidate_hard, cdc_return.candidate.offset, cdc_return.candidate.type, min_size, avg_size, max_size)) {
+          // We demonstrated the current cut candidate will be used!, no more uncertainty, back in sync with non-segmented processing!
+          break;
+        }
+
+        is_prev_candidate_hard = cdc_return.candidate.type == CutPointCandidateType::HARD_CUT_MASK;
       }
-
-      is_prev_candidate_hard = cdc_return.candidate.type == CutPointCandidateType::HARD_CUT_MASK;
     }
-  }
 
-  if (
-    data.size() < 1024 || !cdcz_cfg.avx2_allowed
-#ifndef __AVX2__
-    || true
-#endif
-    ) {
     while (!data.empty()) {
       if (base_offset == 0) {
         cdc_return = cdc_next_cutpoint(data, min_size, avg_size, max_size, mask_hard, mask_medium, mask_easy, cdcz_cfg, cdc_return.pattern);
@@ -649,9 +669,10 @@ CdcCandidatesResult find_cdc_cut_candidates(std::span<uint8_t> data, const uint3
   }
 #ifdef __AVX2__
   else {
+    uint64_t base_offset = 0;
     cdc_find_cut_points_avx2(
       result.candidates, result.candidatesFeatureResults, data, base_offset,
-      min_size, avg_size, max_size, mask_hard, mask_medium, mask_easy, cdcz_cfg
+      min_size, avg_size, max_size, mask_hard, mask_medium, mask_easy, cdcz_cfg, is_first_segment
     );
   }
 #endif

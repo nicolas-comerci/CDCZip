@@ -63,7 +63,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
   const auto file_size_mb = file_size / (1024.0 * 1024);
   const int alignment = 32;
 
-#ifndef __clang__
+#if defined(_MSC_VER)
   auto file_data = static_cast<uint8_t*>(_aligned_malloc(file_size, alignment));
 #else
   const uint64_t adjusted_file_size = ((file_size + alignment - 1) / alignment) * alignment;

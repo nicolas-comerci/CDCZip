@@ -34,6 +34,8 @@ struct CDCZ_CONFIG {
   bool avx2_allowed = false;
 };
 
+inline uint64_t pad_size_for_alignment(uint64_t size, uint64_t alignment) { return ((size + alignment - 1) / alignment) * alignment; }
+
 // Precondition: Chunk invariance condition satisfied, that is, the data starts from the very beginning of the stream or after a chunk cutpoint we know for sure will be used
 CutPointCandidateWithContext cdc_next_cutpoint(
   const std::span<uint8_t> data,
