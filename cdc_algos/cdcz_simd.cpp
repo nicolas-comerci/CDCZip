@@ -75,19 +75,26 @@ static void find_cdc_cut_candidates_simd_impl(
   std::array<std::queue<int32_t>, lane_count> backup_cut_vec{};
 
   // SuperCDC's Min-Max adjustment of the Gear Hash on jump to minimum chunk size, should improve deduplication ratios by better preserving
-  // the content defined nature of the Hashes.
-  // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
+  // the content defined nature of the Hashes
   std::array<int32_t, lane_count> minmax_adjustment_vec{};
   for (int32_t i = 0; i < lane_count; i++) {
     minmax_adjustment_vec[i] = hn::ExtractLane(vindex, i);
   }
-  if (cdcz_cfg.use_supercdc_minmax_adjustment) {
-    vindex = hn::Sub(vindex, window_size_minus_one_vec);
-    // HACK FOR REALLY LOW min_size or use_fastcdc_subminimum_skipping = false
-    if (hn::ExtractLane(vindex, 0) < 0) {
-      vindex = hn::InsertLane(vindex, 0, 0);
-      minmax_adjustment_vec[0] = 0;
-    }
+  // We backtrack a little to ensure when we get to the i we actually wanted we have the exact same hash as if we hadn't skipped anything.
+  // Note that we do minmax adjustment at the start, even if it's off. Otherwise, we would get different results than serial version.
+  vindex = hn::Sub(vindex, window_size_minus_one_vec);
+  // If min_size is really low or use_fastcdc_subminimum_skipping = false then the first lane's pos might be negative now, fix.
+  if (hn::ExtractLane(vindex, 0) < 0) {
+    vindex = hn::InsertLane(vindex, 0, 0);
+    minmax_adjustment_vec[0] = 0;
+  }
+  // We need again to ensure the lane positions are 32bit aligned
+  for (int32_t i = 0; i < lane_count; i++) {
+    auto lane_pos = hn::ExtractLane(vindex, i);
+    const int32_t aligned_lane_pos = pad_size_for_alignment(lane_pos, 4);
+    const auto bytes_to_alignment = aligned_lane_pos - lane_pos;
+    lane_pos -= bytes_to_alignment > 0 ? 4 - bytes_to_alignment : 0;
+    vindex = hn::InsertLane(vindex, i, lane_pos);
   }
 
   i32Vec cds_mask_vec = hn::Set(i32VecD, delta_comp_constants::CDS_SAMPLING_MASK);
@@ -200,8 +207,8 @@ static void find_cdc_cut_candidates_simd_impl(
     if (new_lane_pos == 0) return;
     new_lane_pos += min_size;
 
+    minmax_adjustment_vec[lane_i] = new_lane_pos;
     if (cdcz_cfg.use_supercdc_minmax_adjustment) {
-      minmax_adjustment_vec[lane_i] = new_lane_pos;
       auto adjustment = std::min(31, new_lane_pos);
       new_lane_pos -= adjustment;
     }
