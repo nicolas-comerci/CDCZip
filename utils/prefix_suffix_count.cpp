@@ -11,8 +11,7 @@ inline unsigned long trailingZeroesCount32(uint32_t mask) {
   result = _BitScanForward(&result, mask) ? result : 0;
   return result;
 #else
-  // TODO: This requires BMI instruction set, is there not a better way to do it?
-  return _tzcnt_u32(mask);
+  return __builtin_ctz(mask);
 #endif
 }
 
@@ -23,8 +22,7 @@ inline unsigned long leadingZeroesCount32(uint32_t mask) {
   result = _BitScanReverse(&result, mask) ? 31 - result : 0;
   return result;
 #else
-  // TODO: This requires BMI instruction set, is there not a better way to do it?
-  return _lzcnt_u32(mask);
+  return (mask == 0) ? 32 : __builtin_clz(mask);
 #endif
 }
 #endif

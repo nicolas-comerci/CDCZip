@@ -18,6 +18,30 @@ struct ChunkTrace {
   uint64_t hash;
 };
 
+inline void* portable_aligned_alloc(std::size_t alignment, std::size_t size) {
+#ifdef _WIN32
+  return _aligned_malloc(size, alignment);
+#elif defined(__APPLE__) || defined(__MACH__)
+  // macOS: posix_memalign is safest
+  void* ptr = nullptr;
+  if (posix_memalign(&ptr, alignment, size) != 0) {
+    return nullptr;
+  }
+  return ptr;
+#else
+  // Linux and others with C11 support
+  return std::aligned_alloc(alignment, size);
+#endif
+}
+
+inline void portable_aligned_free(void* ptr) {
+#ifdef _WIN32
+  _aligned_free(ptr);
+#else
+  std::free(ptr);
+#endif
+}
+
 void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unordered_map<std::string, std::string>& cli_params) {
   print_to_console("TEST MODE\n");
 
@@ -63,12 +87,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
   const auto file_size_mb = file_size / (1024.0 * 1024);
   const int alignment = 32;
 
-#if defined(_MSC_VER)
-  auto file_data = static_cast<uint8_t*>(_aligned_malloc(file_size, alignment));
-#else
-  const uint64_t adjusted_file_size = ((file_size + alignment - 1) / alignment) * alignment;
-  auto file_data = static_cast<uint8_t*>(std::aligned_alloc(32, adjusted_file_size));
-#endif
+  auto file_data = static_cast<uint8_t*>(portable_aligned_alloc(alignment, file_size));
 
   auto file_stream = std::fstream(file_path, std::ios::in | std::ios::binary);
   if (!file_stream.is_open()) {
@@ -354,11 +373,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
 
   // Bleh, dirty hack for quicker exit
   exit(0);
-#ifndef __clang__
-  _aligned_free(file_data);
-#else
-  std::free(file_data);
-#endif
+  portable_aligned_free(file_data);
 }
 
 void calc_gear_at_pos(const std::string& file_path, uint64_t file_size, uint64_t pos) {

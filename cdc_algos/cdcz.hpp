@@ -20,9 +20,9 @@ struct CutPointCandidate {
 };
 
 struct CutPointCandidateWithContext {
-  CutPointCandidate candidate;
+  CutPointCandidate candidate{};
   uint32_t pattern = 0;
-  std::vector<uint32_t> features;
+  std::vector<uint32_t> features{};
 };
 
 struct CDCZ_CONFIG {
@@ -35,19 +35,6 @@ struct CDCZ_CONFIG {
 };
 
 inline uint64_t pad_size_for_alignment(uint64_t size, uint64_t alignment) { return ((size + alignment - 1) / alignment) * alignment; }
-
-// Precondition: Chunk invariance condition satisfied, that is, the data starts from the very beginning of the stream or after a chunk cutpoint we know for sure will be used
-CutPointCandidateWithContext cdc_next_cutpoint(
-  const std::span<uint8_t> data,
-  uint32_t min_size,
-  uint32_t avg_size,
-  uint32_t max_size,
-  uint32_t mask_hard,
-  uint32_t mask_medium,
-  uint32_t mask_easy,
-  const CDCZ_CONFIG& cdcz_cfg,
-  uint32_t initial_pattern = 0
-);
 
 struct CdcCandidatesResult {
   std::vector<CutPointCandidate> candidates{};
@@ -73,5 +60,47 @@ uint64_t select_cut_point_candidates(
   bool is_first_segment,
   bool copy_chunk_data = true
 );
+
+inline auto promote_cut_candidate(const CDCZ_CONFIG& cdcz_cfg, uint32_t pattern, uint32_t mask_hard, uint32_t mask_medium, uint32_t mask_easy) -> CutPointCandidateType {
+  // Set the candidate type according to the condition_mask we used
+  CutPointCandidateType promoted_cut_type = cdcz_cfg.use_supercdc_backup_mask
+    ? CutPointCandidateType::SUPERCDC_BACKUP_MASK
+    : cdcz_cfg.use_fastcdc_normalized_chunking ? CutPointCandidateType::EASY_CUT_MASK : CutPointCandidateType::HARD_CUT_MASK;
+  // Now we need to "promote" the cut condition if possible, that is, if we found a cut candidate that satisfied SuperCDC's backup mask,
+  // but it also satisfies FastCDC's normalized chunking easy mask, or even the hard mask, we return it for the hardest condition available
+  if (promoted_cut_type == CutPointCandidateType::SUPERCDC_BACKUP_MASK) {
+    if (cdcz_cfg.use_fastcdc_normalized_chunking && !(pattern & mask_easy)) {
+      promoted_cut_type = CutPointCandidateType::EASY_CUT_MASK;
+    }
+    else if (!cdcz_cfg.use_fastcdc_normalized_chunking && !(pattern & mask_medium)) {
+      promoted_cut_type = CutPointCandidateType::HARD_CUT_MASK;
+    }
+  }
+  // Note that the type can only be EASY here if normalized chunking is on, so no need for extra check
+  if (promoted_cut_type == CutPointCandidateType::EASY_CUT_MASK && !(pattern & mask_hard)) {
+    promoted_cut_type = CutPointCandidateType::HARD_CUT_MASK;
+  }
+  return promoted_cut_type;
+}
+
+inline auto is_chunk_invariance_condition_satisfied(
+  bool is_prev_candidate_hard, uint64_t dist_with_prev, CutPointCandidateType new_candidate_type,
+  uint64_t min_size, uint64_t avg_size, uint64_t max_size
+) -> bool {
+  return is_prev_candidate_hard &&
+    // Given that the previous candidate is of HARD type, either it will be used, or it will be discarded which can only happen
+    // if a cut was used with at most min_size distance before the previous candidate. Knowing the previous cut to be used is
+    // at most at distance_w_prev_cut_candidate + min_size distance we can ensure we don't violate max_size if we use the current candidate.
+    (dist_with_prev + min_size <= max_size) &&
+    (
+      // We also need to check that the current candidate is actually eligible, a HARD type cut needs to be at least min_size from the previous
+      // cut to be valid, whereas an EASY cut needs to be at least avg_size from it.
+      // Note that we check using distance_w_prev_cut_candidate, with the same logic as the check we did for the max_size, if it won't be used
+      // then the actual distance to the previous cut will be even larger so these conditions will also validate the eligibility of the current
+      // candidate in that case
+      (new_candidate_type == CutPointCandidateType::HARD_CUT_MASK && dist_with_prev >= min_size) ||
+      (new_candidate_type == CutPointCandidateType::EASY_CUT_MASK && dist_with_prev >= avg_size)
+      );
+}
 
 #endif
