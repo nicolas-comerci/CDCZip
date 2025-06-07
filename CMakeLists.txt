@@ -24,6 +24,8 @@ if (UNIX)
   find_package(Threads REQUIRED)
 endif()
 
+#[[
+# Removed since now we let Highway handle SIMD config
 include(CheckCXXCompilerFlag)
 CHECK_CXX_COMPILER_FLAG("-march=native" COMPILER_OPT_ARCH_NATIVE_SUPPORTED)
 if (COMPILER_OPT_ARCH_NATIVE_SUPPORTED)
@@ -39,6 +41,7 @@ else()
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX")
     endif()
 endif()
+]]
 
 if (MSVC)
     # Disabling Incremental Linking might be useful for example to use SizeBench to analyze compiled binary size contributions from different parts of the code
@@ -50,6 +53,9 @@ if (MSVC)
         add_link_options($<$<CONFIG:Debug>:/INCREMENTAL>)
         add_compile_options($<$<CONFIG:Debug>:/Zi>)
     endif()
+
+    # Highway recommends this
+    add_compile_options(/Gv)
 endif()
 
 add_compile_options("$<$<CONFIG:DEBUG>:-DDEBUG>")
@@ -84,6 +90,15 @@ if ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
   add_definitions(-DBIT64)
 endif ("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
 
+# Highway library config, for portable SIMD
+set(HWY_ENABLE_ALL_TARGETS ON CACHE BOOL "" FORCE)
+# Only build the core Highway target
+set(HWY_ENABLE_CONTRIB OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(HWY_ENABLE_WARNINGS OFF CACHE BOOL "" FORCE)  # optional: skip strict warnings
+add_subdirectory(contrib/highway-1.2.0)
+
 set(XXHASH_SRC "${SRCDIR}/contrib/xxHash/xxhash.c")
 
 set(BITSTREAM_HDR "")
@@ -92,7 +107,7 @@ set(BITSTREAM_SRC "")
 add_stem2file(BITSTREAM_SRC "${SRCDIR}/contrib/%STEM%.cpp" "bit_helper;bitstream;task_pool;")
 
 set(CDCZIP_ALGOS_SRC "")
-add_stem2file(CDCZIP_ALGOS_SRC "${SRCDIR}/cdc_algos/%STEM%.cpp" "cdcz;")
+add_stem2file(CDCZIP_ALGOS_SRC "${SRCDIR}/cdc_algos/%STEM%.cpp" "cdcz_serial;cdcz_simd;cdcz;")
 
 set(CDCZIP_UTILS_SRC "")
 add_stem2file(CDCZIP_UTILS_SRC "${SRCDIR}/utils/%STEM%.cpp" "chunks;console_utils;io_utils;prefix_suffix_count;")
@@ -104,5 +119,6 @@ set(CDCZIP_SRC "${SRCDIR}/cdczip.cpp")
 set(CDCZ_TEST_SRC "${SRCDIR}/cdcz_test.cpp")
 
 add_executable(cdczip ${CDCZIP_SRC} ${CDCZ_TEST_SRC} ${CDCZIP_UTILS_SRC} ${CDCZIP_DELTA_SRC} ${CDCZIP_ALGOS_SRC} ${XXHASH_SRC} ${BITSTREAM_HDR} ${BITSTREAM_SRC} )
+target_link_libraries(cdczip PRIVATE hwy)
 
 install(TARGETS cdczip DESTINATION bin)
