@@ -58,6 +58,12 @@ if (MSVC)
     add_compile_options(/Gv)
 endif()
 
+# This is probably a bad idea as the binary will be gigantic, but for our tests for now its fine
+if (MINGW)
+    set(CMAKE_CXX_STANDARD_LIBRARIES "-static-libgcc -static-libstdc++ ${CMAKE_CXX_STANDARD_LIBRARIES}")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive")
+endif()
+
 add_compile_options("$<$<CONFIG:DEBUG>:-DDEBUG>")
 
 include_directories(AFTER ${SRCDIR})
