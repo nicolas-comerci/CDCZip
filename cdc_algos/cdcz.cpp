@@ -18,7 +18,7 @@
 
 HWY_BEFORE_NAMESPACE();
 
-namespace CDCZ_SIMD {
+namespace CDCZ {
 namespace HWY_NAMESPACE {
 namespace hn = hwy::HWY_NAMESPACE;
 
@@ -63,14 +63,14 @@ HWY_AFTER_NAMESPACE();
 
 #if HWY_ONCE
 
-namespace CDCZ_SIMD {
+namespace CDCZ {
   HWY_EXPORT(find_cdc_cut_candidates_impl);
 }
 
 CdcCandidatesResult find_cdc_cut_candidates(
   std::span<uint8_t> data, const uint32_t min_size, const uint32_t avg_size, const uint32_t max_size, const CDCZ_CONFIG& cdcz_cfg, bool is_first_segment
 ) {
-  return HWY_DYNAMIC_DISPATCH(CDCZ_SIMD::find_cdc_cut_candidates_impl)(data, min_size, avg_size, max_size, cdcz_cfg, is_first_segment);
+  return HWY_DYNAMIC_DISPATCH(CDCZ::find_cdc_cut_candidates_impl)(data, min_size, avg_size, max_size, cdcz_cfg, is_first_segment);
 }
 
 uint64_t select_cut_point_candidates(
