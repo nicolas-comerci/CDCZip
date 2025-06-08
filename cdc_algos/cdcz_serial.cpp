@@ -1,7 +1,21 @@
 #include "cdcz_serial.hpp"
 
+// In case you are wondering why use Highway on the serial version, it's because most compilers are likely going to be able to do
+// a good deal of optimization and autovectorization on their own, but if we are using a baseline target like SSE2, we lose on these
+// "free" performance gains, so we do this to have them anyways
+#undef HWY_TARGET_INCLUDE
+#define HWY_TARGET_INCLUDE "cdc_algos/cdcz_serial.cpp" 
+#include <hwy/foreach_target.h>
+#include <hwy/highway.h>
+
 #include "cdc_algos/gear.hpp"
 #include "delta_compression/delta.hpp"
+
+HWY_BEFORE_NAMESPACE();
+
+namespace CDCZ_SERIAL {
+namespace HWY_NAMESPACE {
+namespace hn = hwy::HWY_NAMESPACE;
 
 CutPointCandidateWithContext cdc_next_cutpoint(
   const std::span<uint8_t> data,
@@ -163,7 +177,7 @@ CutPointCandidateWithContext cdc_next_cutpoint_candidate(
   return result;
 }
 
-void find_cdc_cut_candidates_serial(
+static void find_cdc_cut_candidates_serial_impl(
   std::vector<CutPointCandidate>& candidates,
   std::vector<std::vector<uint32_t>>& candidate_features,
   std::span<uint8_t> data,
@@ -241,3 +255,32 @@ void find_cdc_cut_candidates_serial(
     data = std::span(data.data() + cdc_return.candidate.offset, data.size() - cdc_return.candidate.offset);
   }
 }
+
+}
+}
+
+HWY_AFTER_NAMESPACE();
+
+#if HWY_ONCE
+
+namespace CDCZ_SERIAL {
+  HWY_EXPORT(find_cdc_cut_candidates_serial_impl);
+}
+
+void find_cdc_cut_candidates_serial(
+  std::vector<CutPointCandidate>& candidates,
+  std::vector<std::vector<uint32_t>>& candidate_features,
+  std::span<uint8_t> data,
+  int32_t min_size,
+  int32_t avg_size,
+  int32_t max_size,
+  uint32_t mask_hard,
+  uint32_t mask_medium,
+  uint32_t mask_easy,
+  const CDCZ_CONFIG& cdcz_cfg,
+  bool is_first_segment
+) {
+  HWY_DYNAMIC_DISPATCH(CDCZ_SERIAL::find_cdc_cut_candidates_serial_impl)(candidates, candidate_features, data, min_size, avg_size, max_size, mask_hard, mask_medium, mask_easy, cdcz_cfg, is_first_segment);
+}
+
+#endif
