@@ -14,6 +14,40 @@ namespace CDCZ_SIMD {
 namespace HWY_NAMESPACE {
 namespace hn = hwy::HWY_NAMESPACE;
 
+constexpr HWY_FULL(int32_t) i32VecD {};
+
+#ifndef NDEBUG
+constexpr int32_t lane_count = hn::MaxLanes(i32VecD);
+#else
+constexpr int32_t lane_count = hn::Lanes(i32VecD);
+#endif
+using i32Vec = decltype(hn::Set(i32VecD, 0));
+
+#define CDC_SIMD_ITER(cbytes)                                                                                                           \
+do {                                                                                                                                    \
+  hash_vec = hn::Shl(hash_vec, ones_vec);  /* Shift all the hash values for each lane at the same time */                               \
+  i32Vec idx = hn::And(cbytes, cmask);  /* Get byte on the lower bits of the packed 32bit lanes */                                      \
+  /* This gives us the GEAR hash values for each of the bytes we just got */                                                            \
+  i32Vec tentry = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(GEAR_TABLE), idx);                                              \
+  cbytes = hn::Shr(cbytes, eights_vec);  /* We already got the byte on the lower bits, we can shift right to later get the next byte */ \
+  hash_vec = hn::Add(hash_vec, tentry);  /* Add the values we got from the GEAR hash values to the values on the hash */                \
+																																																																				\
+  /* Compare each packed int by bitwise AND with the masks and checking that its 0 */                                                   \
+  const auto hash_bck_eq_mask = hn::Eq(hn::And(hash_vec, mask_backup_vec), zero_vec);                                                   \
+  const auto hash_easy_eq_mask = hn::Eq(hn::And(hash_vec, mask_easy_vec), zero_vec);                                                    \
+  const auto hash_hard_eq_mask = hn::Eq(hn::And(hash_vec, mask_hard_vec), zero_vec);                                                    \
+  /*const auto hash_cds_eq_mask = hn::Eq(hn::And(hash_vec, mask_cds_vec), zero_vec);*/                                                  \
+																																																																				\
+  candidates_backup_vmask = hn::Shl(candidates_backup_vmask, ones_vec);                                                                 \
+	candidates_backup_vmask = hn::MaskedAddOr(candidates_backup_vmask, hash_bck_eq_mask, candidates_backup_vmask, ones_vec);              \
+  candidates_easy_vmask = hn::Shl(candidates_easy_vmask, ones_vec);                                                                     \
+  candidates_easy_vmask = hn::MaskedAddOr(candidates_easy_vmask, hash_easy_eq_mask, candidates_easy_vmask, ones_vec);                   \
+  candidates_hard_vmask = hn::Shl(candidates_hard_vmask, ones_vec);                                                                     \
+  candidates_hard_vmask = hn::MaskedAddOr(candidates_hard_vmask, hash_hard_eq_mask, candidates_hard_vmask, ones_vec);                   \
+  /*candidates_cds_vmask = hn::Shl(candidates_cds_vmask, ones_vec);*/                                                                   \
+  /*candidates_cds_vmask = hn::MaskedAddOr(candidates_cds_vmask, hash_cds_eq_mask, candidates_cds_vmask, ones_vec);*/                   \
+} while (0)
+
 static void find_cdc_cut_candidates_simd_impl(
   std::vector<CutPointCandidate>& candidates,
   std::vector<std::vector<uint32_t>>& candidate_features,
@@ -27,21 +61,17 @@ static void find_cdc_cut_candidates_simd_impl(
   const CDCZ_CONFIG& cdcz_cfg,
   bool is_first_segment
 ) {
-  constexpr HWY_FULL(int32_t) i32VecD{};
-  constexpr int32_t lane_count = hn::Lanes(i32VecD);
-  using i32Vec = decltype(hn::Set(i32VecD, 0));
-
   std::array<std::vector<CutPointCandidate>, lane_count> lane_results{};
   std::array<bool, lane_count> lane_achieved_chunk_invariance{};
   lane_achieved_chunk_invariance.fill(false);
   lane_achieved_chunk_invariance[0] = is_first_segment;
   std::array<std::vector<std::vector<uint32_t>>, lane_count> lane_features_results{};
   std::array<std::vector<uint32_t>, lane_count> lane_current_features{};
-
-  const auto mask = cdcz_cfg.use_supercdc_backup_mask
-    ? mask_easy << 1
-    : cdcz_cfg.use_fastcdc_normalized_chunking ? mask_easy : mask_medium;
-  i32Vec mask_vec = hn::Set(i32VecD, static_cast<int32_t>(mask));
+  
+  i32Vec mask_backup_vec = hn::Set(i32VecD, static_cast<int32_t>(mask_easy << 1));
+  i32Vec mask_easy_vec = hn::Set(i32VecD, static_cast<int32_t>(mask_easy));
+  // If we are not using normalized chunking then all of these cuts will be HARD candidates
+  i32Vec mask_hard_vec = hn::Set(i32VecD, static_cast<int32_t>(cdcz_cfg.use_fastcdc_normalized_chunking ? mask_hard : mask_medium));
 
   const i32Vec cmask = hn::Set(i32VecD, 0xff);
   i32Vec hash_vec = hn::Set(i32VecD, 0);
@@ -68,7 +98,7 @@ static void find_cdc_cut_candidates_simd_impl(
   // For each lane, the last index they are allowed to access
   i32Vec vindex_max = hn::Add(vindex, hn::Set(i32VecD, bytes_per_lane));
   // Because we read 4bytes at a time we need to ensure we are not reading past the data end
-  vindex_max = hn::InsertLane(vindex_max, lane_count - 1, static_cast<int32_t>(data_adjusted_size));
+  vindex_max = hn::InsertLane(vindex_max, lane_count - 1, static_cast<int32_t>(data_adjusted_size) - 32);
 
   // SuperCDC's backup results, for each lane we need to save any valid ones until we reach a valid cut so we don't need them,
   // or reach max_size for a chunk and thus use the earliest backup.
@@ -242,45 +272,59 @@ static void find_cdc_cut_candidates_simd_impl(
     // If all lanes are finished, we break, else we continue and lanes that are already finished will ignore results
     if (hn::AllFalse(i32VecD, is_lane_not_finished_mask)) break;
 
-    i32Vec cbytes = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Shr(vindex, twos_vec));
+    auto vindex_int32_elem = hn::Shr(vindex, twos_vec);
+    i32Vec bytes_1to4 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), vindex_int32_elem);
+    i32Vec bytes_5to8 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, ones_vec));
+    i32Vec bytes_9to12 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, twos_vec));
+    i32Vec bytes_13to16 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 3)));
+    i32Vec bytes_17to20 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 4)));
+    i32Vec bytes_21to24 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 5)));
+    i32Vec bytes_25to28 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 6)));
+    i32Vec bytes_29to32 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 7)));
 
-    uint32_t j = 0;
-    while (j < 4) {
-      hash_vec = hn::Shl(hash_vec, ones_vec);  // Shift all the hash values for each lane at the same time
-      i32Vec idx = hn::And(cbytes, cmask);  // Get byte on the lower bits of the packed 32bit lanes
-      // This gives us the GEAR hash values for each of the bytes we just got
-      i32Vec tentry = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(GEAR_TABLE), idx);
-      cbytes = hn::Shr(cbytes, eights_vec);  // We already got the byte on the lower bits, we can shift right to later get the next byte
-      hash_vec = hn::Add(hash_vec, tentry);  // Add the values we got from the GEAR hash values to the values on the hash
+    auto candidates_backup_vmask = hn::Set(i32VecD, 0);
+    auto candidates_easy_vmask = hn::Set(i32VecD, 0);
+    auto candidates_hard_vmask = hn::Set(i32VecD, 0);
+    auto candidates_cds_vmask = hn::Set(i32VecD, 0);
 
-      // Compare each packed int by bitwise AND with the mask and checking that its 0
-      const auto hash_eq_mask = hn::Eq(hn::And(hash_vec, mask_vec), zero_vec);
+    // Oh lord please forgive me, there has to be a better way of unrolling this thing
+    CDC_SIMD_ITER(bytes_1to4);    CDC_SIMD_ITER(bytes_1to4);   CDC_SIMD_ITER(bytes_1to4);    CDC_SIMD_ITER(bytes_1to4);
+    CDC_SIMD_ITER(bytes_5to8);    CDC_SIMD_ITER(bytes_5to8);   CDC_SIMD_ITER(bytes_5to8);    CDC_SIMD_ITER(bytes_5to8);
+    CDC_SIMD_ITER(bytes_9to12);   CDC_SIMD_ITER(bytes_9to12);  CDC_SIMD_ITER(bytes_9to12);   CDC_SIMD_ITER(bytes_9to12);
+    CDC_SIMD_ITER(bytes_13to16);  CDC_SIMD_ITER(bytes_13to16); CDC_SIMD_ITER(bytes_13to16);  CDC_SIMD_ITER(bytes_13to16);
+    CDC_SIMD_ITER(bytes_17to20);  CDC_SIMD_ITER(bytes_17to20); CDC_SIMD_ITER(bytes_17to20);  CDC_SIMD_ITER(bytes_17to20);
+    CDC_SIMD_ITER(bytes_21to24);  CDC_SIMD_ITER(bytes_21to24); CDC_SIMD_ITER(bytes_21to24);  CDC_SIMD_ITER(bytes_21to24);
+    CDC_SIMD_ITER(bytes_25to28);  CDC_SIMD_ITER(bytes_25to28); CDC_SIMD_ITER(bytes_25to28);  CDC_SIMD_ITER(bytes_25to28);
+    CDC_SIMD_ITER(bytes_29to32);  CDC_SIMD_ITER(bytes_29to32); CDC_SIMD_ITER(bytes_29to32);  CDC_SIMD_ITER(bytes_29to32);
 
-      if (cdcz_cfg.compute_features) {
-        // Check if content defined sampling condition is satisfied and we should sample feature values for some lane
-        auto hash_cds_eq_mask = hn::Eq(hn::And(hash_vec, cds_mask_vec), zero_vec);
+    // TODO: Compute features stuff here
+    //auto candidates_backup_mask = hn::IfThenElseZero(is_lane_not_finished_mask, candidates_backup_vmask);
 
-        if (!hn::AllFalse(i32VecD, hash_cds_eq_mask)) {
-          const auto lane_result_vec = hn::VecFromMask(hash_cds_eq_mask);
-          for (int32_t lane_i = 0; lane_i < lane_count; lane_i++) {
-            if (hn::ExtractLane(lane_result_vec, lane_i)) sample_feature_value(lane_i);
+    candidates_backup_vmask = hn::IfThenElseZero(is_lane_not_finished_mask, candidates_backup_vmask);
+    if (!hn::AllTrue(i32VecD, hn::Eq(candidates_backup_vmask, zero_vec))) {
+      for (int32_t lane_i = 0; lane_i < lane_count; lane_i++) {
+        int32_t candidates_backup_bits = hn::ExtractLane(candidates_backup_vmask, lane_i);
+        if (candidates_backup_bits == 0) continue;
+        int32_t candidates_easy_bits = hn::ExtractLane(candidates_easy_vmask, lane_i);
+        int32_t candidates_hard_bits = hn::ExtractLane(candidates_hard_vmask, lane_i);
+        const int32_t lane_pos = hn::ExtractLane(vindex, lane_i);
+        int32_t bit = 0;
+        while (candidates_backup_bits != 0) {
+          if (candidates_backup_bits & (0b1 << 31)) {
+            CutPointCandidateType cut_type = CutPointCandidateType::SUPERCDC_BACKUP_MASK;
+            if (candidates_easy_bits & (0b1 << 31)) cut_type = CutPointCandidateType::EASY_CUT_MASK;
+            if (candidates_hard_bits & (0b1 << 31)) cut_type = CutPointCandidateType::HARD_CUT_MASK;
+            process_lane(lane_i, lane_pos + bit, cut_type);
           }
+          candidates_backup_bits <<= 1;
+          candidates_easy_bits <<= 1;
+          candidates_hard_bits <<= 1;
+          bit++;
         }
       }
-
-      const auto lane_result_and_not_finished_mask = hn::And(hash_eq_mask, is_lane_not_finished_mask);
-      if (!hn::AllFalse(i32VecD, lane_result_and_not_finished_mask)) {
-        const auto lane_result_vec = hn::VecFromMask(lane_result_and_not_finished_mask);
-        for (int32_t lane_i = 0; lane_i < lane_count; lane_i++) {
-          if (hn::ExtractLane(lane_result_vec, lane_i)) {
-            process_lane(lane_i, hn::ExtractLane(vindex, lane_i), get_result_type_for_lane(hn::ExtractLane(hash_vec, lane_i)));
-          }
-        }
-      }
-
-      ++j;
-      vindex = hn::Add(vindex, ones_vec);  // advance 1 byte in the data for each lane
     }
+
+    vindex = hn::Add(vindex, hn::Set(i32VecD, 32));
 
     if (any_lane_marked_for_jump) {
       for (int32_t lane_i = 0; lane_i < lane_count; lane_i++) {
@@ -299,8 +343,9 @@ static void find_cdc_cut_candidates_simd_impl(
     // The hash might be nonsense if the last lane finished before the others, so we just recover it
     uint64_t remaining_minmax_adjustment = 31;
     uint32_t pattern = 0;
-
-    // TODO: Check backup mask? anything else I am missing here?
+    const auto mask = cdcz_cfg.use_supercdc_backup_mask
+      ? mask_easy << 1
+      : cdcz_cfg.use_fastcdc_normalized_chunking ? mask_easy : mask_medium;
     // TODO: Can trunc for max_size, though it should be handled by select cut point candidates anyway
 
     while (i < data.size()) {
