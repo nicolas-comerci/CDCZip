@@ -34,7 +34,11 @@ static CdcCandidatesResult find_cdc_cut_candidates_impl(
   const auto mask_medium = make_mask(bits);
   const auto mask_easy = make_mask(bits - 1);
 
+#ifndef NDEBUG
+  constexpr auto lane_count = hn::MaxLanes(HWY_FULL(int32_t){});
+#else
   constexpr auto lane_count = hn::Lanes(HWY_FULL(int32_t){});
+#endif
 
   if (data.size() < 1024 || !cdcz_cfg.avx2_allowed || lane_count < 8) {
     find_cdc_cut_candidates_serial(

@@ -103,7 +103,7 @@ set(HWY_ENABLE_CONTRIB OFF CACHE BOOL "" FORCE)
 set(HWY_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
 set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(HWY_ENABLE_WARNINGS OFF CACHE BOOL "" FORCE)  # optional: skip strict warnings
-add_subdirectory(contrib/highway-1.2.0)
+add_subdirectory(contrib/highway)
 
 set(XXHASH_SRC "${SRCDIR}/contrib/xxHash/xxhash.c")
 
