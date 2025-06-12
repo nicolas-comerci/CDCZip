@@ -100,7 +100,7 @@ inline auto is_chunk_invariance_condition_satisfied(
       // candidate in that case
       (new_candidate_type == CutPointCandidateType::HARD_CUT_MASK && dist_with_prev >= min_size) ||
       (new_candidate_type == CutPointCandidateType::EASY_CUT_MASK && dist_with_prev >= avg_size)
-      );
+    );
 }
 
 #endif

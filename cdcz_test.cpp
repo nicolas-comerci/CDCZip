@@ -359,14 +359,17 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
   auto test_elapsed_time_ns = test_elapsed_time.count();
   const auto test_mb_per_nanosecond = file_size_mb / test_elapsed_time_ns;
 
+  const auto file_size_after_dedup = file_size - deduped_size;
+
   print_to_console("Tested file size (bytes):            {}\n", file_size);
   print_to_console("Tested Chunking Throughput:          {:.1f} MB/s\n", chunking_mb_per_nanosecond * std::pow(10, 9));
   print_to_console("Tested Dedup Throughput:             {:.1f} MB/s\n", dedup_mb_per_nanosecond * std::pow(10, 9));
   print_to_console("Tested Chunking+Dedup Throughput:    {:.1f} MB/s\n", test_mb_per_nanosecond * std::pow(10, 9));
   print_to_console("Deduped size (bytes):                {}\n", deduped_size);
-  print_to_console("File size after dedup (bytes):       {}\n", file_size - deduped_size);
-  print_to_console("DER:                                 {:f}\n", static_cast<float>(file_size) / static_cast<float>(file_size - deduped_size));
+  print_to_console("File size after dedup (bytes):       {}\n", file_size_after_dedup);
+  print_to_console("DER:                                 {:f}\n", static_cast<float>(file_size) / static_cast<float>(file_size_after_dedup));
   print_to_console("Total chunk count:                   {}\n", process_pending_chunks.size());
+  print_to_console("Average chunk size:                  {}\n", file_size_after_dedup/ process_pending_chunks.size());
   print_to_console("Total chunking runtime:              {} seconds\n", std::chrono::duration_cast<std::chrono::seconds>(chunking_elapsed_time).count());
   print_to_console("Total dedup runtime:                 {} seconds\n", std::chrono::duration_cast<std::chrono::seconds>(dedup_elapsed_time).count());
   print_to_console("Total test runtime:                  {} seconds\n", std::chrono::duration_cast<std::chrono::seconds>(test_elapsed_time).count());
