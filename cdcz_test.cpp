@@ -85,7 +85,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
   const uint64_t max_size = 64ull * 1024;
 
   const auto file_size_mb = file_size / (1024.0 * 1024);
-  const int alignment = 32;
+  const int alignment = 64;  // TODO: use proper alignment for arch, hardcoding 64 as it works well for most cases I am using
 
   auto file_data = static_cast<uint8_t*>(portable_aligned_alloc(alignment, file_size));
 
