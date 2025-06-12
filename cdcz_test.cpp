@@ -116,7 +116,8 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
 
   // For SIMD we are using lanes with signed 32bit integers, if we use segments that are too large we risk overflows, this way we have pretty big segments
   // with no risk of overflows.
-  const uint64_t segment_size = std::min<uint64_t>(std::numeric_limits<int32_t>::max() / 2, file_size / thread_count);
+  // On my tests (x86 intel and amd only) 128mb segments seem to perform the best.
+  const uint64_t segment_size = std::min<uint64_t>(std::numeric_limits<int32_t>::max() / 16, file_size / thread_count);
 
   std::vector<std::span<uint8_t>> segments;
   if (is_use_mt || is_use_simd) {
