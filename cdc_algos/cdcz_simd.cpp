@@ -67,11 +67,15 @@ static void find_cdc_cut_candidates_simd_impl(
   lane_achieved_chunk_invariance[0] = is_first_segment;
   std::array<std::vector<std::vector<uint32_t>>, lane_count> lane_features_results{};
   std::array<std::vector<uint32_t>, lane_count> lane_current_features{};
-  
+
+  const auto easiest_mask = cdcz_cfg.use_supercdc_backup_mask
+    ? mask_easy << 1
+    : cdcz_cfg.use_fastcdc_normalized_chunking ? mask_easy : mask_medium;
   i32Vec mask_backup_vec = hn::Set(i32VecD, static_cast<int32_t>(mask_easy << 1));
   i32Vec mask_easy_vec = hn::Set(i32VecD, static_cast<int32_t>(mask_easy));
   // If we are not using normalized chunking then all of these cuts will be HARD candidates
   i32Vec mask_hard_vec = hn::Set(i32VecD, static_cast<int32_t>(cdcz_cfg.use_fastcdc_normalized_chunking ? mask_hard : mask_medium));
+  i32Vec mask_cds_vec = hn::Set(i32VecD, static_cast<int32_t>(delta_comp_constants::CDS_SAMPLING_MASK));
 
   const i32Vec cmask = hn::Set(i32VecD, 0xff);
   i32Vec hash_vec = hn::Set(i32VecD, 0);
@@ -266,6 +270,15 @@ static void find_cdc_cut_candidates_simd_impl(
     vindex = hn::InsertLane(vindex, lane_i, new_lane_pos);
   };
 
+  auto candidates_backup_vmask = hn::Set(i32VecD, 0);
+  auto candidates_easy_vmask = hn::Set(i32VecD, 0);
+  auto candidates_hard_vmask = hn::Set(i32VecD, 0);
+  auto candidates_cds_vmask = hn::Set(i32VecD, 0);
+
+  auto& candidates_easiest_vmask = cdcz_cfg.use_supercdc_backup_mask
+    ? candidates_backup_vmask
+    : cdcz_cfg.use_fastcdc_normalized_chunking ? candidates_easy_vmask : candidates_hard_vmask;
+
   while (true) {
     vindex = hn::Min(vindex, vindex_max);  // prevent vindex from pointing to invalid memory
     const auto is_lane_not_finished_mask = hn::Gt(vindex_max, vindex);
@@ -282,11 +295,6 @@ static void find_cdc_cut_candidates_simd_impl(
     i32Vec bytes_25to28 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 6)));
     i32Vec bytes_29to32 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 7)));
 
-    auto candidates_backup_vmask = hn::Set(i32VecD, 0);
-    auto candidates_easy_vmask = hn::Set(i32VecD, 0);
-    auto candidates_hard_vmask = hn::Set(i32VecD, 0);
-    auto candidates_cds_vmask = hn::Set(i32VecD, 0);
-
     // Oh lord please forgive me, there has to be a better way of unrolling this thing
     CDC_SIMD_ITER(bytes_1to4);    CDC_SIMD_ITER(bytes_1to4);   CDC_SIMD_ITER(bytes_1to4);    CDC_SIMD_ITER(bytes_1to4);
     CDC_SIMD_ITER(bytes_5to8);    CDC_SIMD_ITER(bytes_5to8);   CDC_SIMD_ITER(bytes_5to8);    CDC_SIMD_ITER(bytes_5to8);
@@ -297,20 +305,41 @@ static void find_cdc_cut_candidates_simd_impl(
     CDC_SIMD_ITER(bytes_25to28);  CDC_SIMD_ITER(bytes_25to28); CDC_SIMD_ITER(bytes_25to28);  CDC_SIMD_ITER(bytes_25to28);
     CDC_SIMD_ITER(bytes_29to32);  CDC_SIMD_ITER(bytes_29to32); CDC_SIMD_ITER(bytes_29to32);  CDC_SIMD_ITER(bytes_29to32);
 
-    // TODO: Compute features stuff here
-    //auto candidates_backup_mask = hn::IfThenElseZero(is_lane_not_finished_mask, candidates_backup_vmask);
-
-    candidates_backup_vmask = hn::IfThenElseZero(is_lane_not_finished_mask, candidates_backup_vmask);
-    if (!hn::AllTrue(i32VecD, hn::Eq(candidates_backup_vmask, zero_vec))) {
+    // TODO: This is broken! sample_feature_value accesses the hash which might(most likely) not be appropiate for the pos anymore
+    // Proper SIMD implementation probably using hn::IfThenElse or similar inside CDC_SIMD_ITER is required
+    const auto candidates_cds_mask = hn::IfThenElseZero(is_lane_not_finished_mask, candidates_cds_vmask);
+    if (!hn::AllTrue(i32VecD, hn::Eq(candidates_cds_mask, zero_vec))) {
+      int32_t candidates_cds_bits = 0;
       for (int32_t lane_i = 0; lane_i < lane_count; lane_i++) {
-        int32_t candidates_backup_bits = hn::ExtractLane(candidates_backup_vmask, lane_i);
-        if (candidates_backup_bits == 0) continue;
-        int32_t candidates_easy_bits = hn::ExtractLane(candidates_easy_vmask, lane_i);
-        int32_t candidates_hard_bits = hn::ExtractLane(candidates_hard_vmask, lane_i);
+        auto candidates_cds_bits = hn::ExtractLane(candidates_cds_vmask, lane_i);
         const int32_t lane_pos = hn::ExtractLane(vindex, lane_i);
         int32_t bit = 0;
-        while (candidates_backup_bits != 0) {
-          if (candidates_backup_bits & (0b1 << 31)) {
+        while (candidates_cds_bits != 0) {
+          if (candidates_cds_bits & (0b1 << 31)) {
+            sample_feature_value(lane_i);
+          }
+          candidates_cds_bits <<= 1;
+          bit++;
+        }
+      }
+    }
+
+    candidates_easiest_vmask = hn::IfThenElseZero(is_lane_not_finished_mask, candidates_easiest_vmask);
+    if (!hn::AllTrue(i32VecD, hn::Eq(candidates_easiest_vmask, zero_vec))) {
+      int32_t candidates_backup_bits = 0;
+      int32_t candidates_easy_bits = 0;
+      int32_t candidates_hard_bits = 0;
+      const auto& candidates_easiest_bits = cdcz_cfg.use_supercdc_backup_mask
+        ? candidates_backup_bits
+        : cdcz_cfg.use_fastcdc_normalized_chunking ? candidates_easy_bits : candidates_hard_bits;
+      for (int32_t lane_i = 0; lane_i < lane_count; lane_i++) {
+        candidates_backup_bits = hn::ExtractLane(candidates_backup_vmask, lane_i);
+        candidates_easy_bits = hn::ExtractLane(candidates_easy_vmask, lane_i);
+        candidates_hard_bits = hn::ExtractLane(candidates_hard_vmask, lane_i);
+        const int32_t lane_pos = hn::ExtractLane(vindex, lane_i);
+        int32_t bit = 0;
+        while (candidates_easiest_bits != 0) {
+          if (candidates_easiest_bits & (0b1 << 31)) {
             CutPointCandidateType cut_type = CutPointCandidateType::SUPERCDC_BACKUP_MASK;
             if (candidates_easy_bits & (0b1 << 31)) cut_type = CutPointCandidateType::EASY_CUT_MASK;
             if (candidates_hard_bits & (0b1 << 31)) cut_type = CutPointCandidateType::HARD_CUT_MASK;
@@ -343,9 +372,6 @@ static void find_cdc_cut_candidates_simd_impl(
     // The hash might be nonsense if the last lane finished before the others, so we just recover it
     uint64_t remaining_minmax_adjustment = 31;
     uint32_t pattern = 0;
-    const auto mask = cdcz_cfg.use_supercdc_backup_mask
-      ? mask_easy << 1
-      : cdcz_cfg.use_fastcdc_normalized_chunking ? mask_easy : mask_medium;
     // TODO: Can trunc for max_size, though it should be handled by select cut point candidates anyway
 
     while (i < data.size()) {
@@ -355,7 +381,7 @@ static void find_cdc_cut_candidates_simd_impl(
         ++i;
         continue;
       }
-      if (!(pattern & mask)) process_lane(lane_count - 1, i, get_result_type_for_lane(pattern), true);
+      if (!(pattern & easiest_mask)) process_lane(lane_count - 1, i, get_result_type_for_lane(pattern), true);
       ++i;
     }
   }
