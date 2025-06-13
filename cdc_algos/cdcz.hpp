@@ -61,18 +61,21 @@ uint64_t select_cut_point_candidates(
   bool copy_chunk_data = true
 );
 
-inline auto promote_cut_candidate(const CDCZ_CONFIG& cdcz_cfg, uint32_t pattern, uint32_t mask_hard, uint32_t mask_medium, uint32_t mask_easy) -> CutPointCandidateType {
+inline auto promote_cut_candidate(
+  bool use_supercdc_backup_mask, bool use_fastcdc_normalized_chunking,
+  uint32_t pattern, uint32_t mask_hard, uint32_t mask_medium, uint32_t mask_easy
+) -> CutPointCandidateType {
   // Set the candidate type according to the condition_mask we used
-  CutPointCandidateType promoted_cut_type = cdcz_cfg.use_supercdc_backup_mask
+  CutPointCandidateType promoted_cut_type = use_supercdc_backup_mask
     ? CutPointCandidateType::SUPERCDC_BACKUP_MASK
-    : cdcz_cfg.use_fastcdc_normalized_chunking ? CutPointCandidateType::EASY_CUT_MASK : CutPointCandidateType::HARD_CUT_MASK;
+    : use_fastcdc_normalized_chunking ? CutPointCandidateType::EASY_CUT_MASK : CutPointCandidateType::HARD_CUT_MASK;
   // Now we need to "promote" the cut condition if possible, that is, if we found a cut candidate that satisfied SuperCDC's backup mask,
   // but it also satisfies FastCDC's normalized chunking easy mask, or even the hard mask, we return it for the hardest condition available
   if (promoted_cut_type == CutPointCandidateType::SUPERCDC_BACKUP_MASK) {
-    if (cdcz_cfg.use_fastcdc_normalized_chunking && !(pattern & mask_easy)) {
+    if (use_fastcdc_normalized_chunking && !(pattern & mask_easy)) {
       promoted_cut_type = CutPointCandidateType::EASY_CUT_MASK;
     }
-    else if (!cdcz_cfg.use_fastcdc_normalized_chunking && !(pattern & mask_medium)) {
+    else if (!use_fastcdc_normalized_chunking && !(pattern & mask_medium)) {
       promoted_cut_type = CutPointCandidateType::HARD_CUT_MASK;
     }
   }

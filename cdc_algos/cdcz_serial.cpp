@@ -173,7 +173,7 @@ CutPointCandidateWithContext cdc_next_cutpoint_candidate(
   );
   result.candidate.type = result.candidate.type == CutPointCandidateType::MAX_SIZE
     ? CutPointCandidateType::EOF_CUT
-    : promote_cut_candidate(cdcz_cfg, result.pattern, mask_hard, mask_medium, mask_easy);
+    : promote_cut_candidate(cdcz_cfg.use_supercdc_backup_mask, cdcz_cfg.use_fastcdc_normalized_chunking, result.pattern, mask_hard, mask_medium, mask_easy);
   return result;
 }
 
