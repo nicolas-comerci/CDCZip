@@ -356,7 +356,7 @@ int main(int argc, char* argv[]) {
   auto find_cdc_cut_candidates_in_thread = [min_size, avg_size, max_size]
   (std::vector<uint8_t>&& segment_data, uint64_t segment_start_offset, bool is_eof_segment, bool is_first_segment) {
     CdcCandidatesResult cdc_candidates_result;
-    const CDCZ_CONFIG cfg{ .compute_features = use_feature_extraction};
+    const CDCZ_CONFIG cfg{ .compute_features = use_feature_extraction, .avx2_allowed = true };
     cdc_candidates_result = find_cdc_cut_candidates(segment_data, min_size, avg_size, max_size, cfg, is_first_segment);
     return std::tuple(std::move(cdc_candidates_result), std::move(segment_data), segment_start_offset, is_eof_segment, is_first_segment);
   };
@@ -542,7 +542,7 @@ int main(int argc, char* argv[]) {
 
     std::optional<uint64_t> prev_similarity_locality_anchor_i = similarity_locality_anchor_i;
     similarity_locality_anchor_i = std::nullopt;
-    if (chunk_i % 50000 == 0) print_to_console("\n%{}\n", (static_cast<float>(current_offset) / file_size) * 100);
+    if (chunk_i % 50000 == 0) print_to_console(chunk_i == 0 ? "%{:8.4f}" : "\b\b\b\b\b\b\b\b\b%{:8.4f}" , (static_cast<float>(current_offset) / file_size) * 100);
 
     std::span<uint8_t> data_span = chunk.chunk_data->data;
     total_size += data_span.size();
@@ -1031,6 +1031,7 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  print_to_console("\b\b\b\b\b\b\b\b\b");
   print_to_console("Final offset: {}\n", current_offset);
 
   auto total_dedup_end_time = std::chrono::high_resolution_clock::now();

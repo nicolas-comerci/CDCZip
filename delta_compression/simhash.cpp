@@ -94,6 +94,7 @@ std::tuple<std::bitset<64>, std::vector<uint32_t>> simhash_data_xxhash_cdc(uint8
   std::tuple<std::bitset<64>, std::vector<uint32_t>> return_val{};
   auto* simhash = &std::get<0>(return_val);
   auto& minichunks_vec = std::get<1>(return_val);
+  minichunks_vec.reserve(data_len / chunk_size); // pre-alloc expected amount of mini-chunks to prevent many reallocs
 
   SimHahser64Bit simhasher;
 
