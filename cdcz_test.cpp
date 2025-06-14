@@ -208,6 +208,8 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
     }
   };
 
+  const CDCZ_CONFIG cdcz_cfg{ .avx2_allowed = is_use_simd };
+
   {
     std::deque<std::future<CdcCandidatesResult>> cdc_candidates_futures{};
     std::queue<uint64_t> supercdc_backup_pos{};
@@ -223,9 +225,8 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
       for (uint64_t i = 0; i < segments.size(); i++) {
         cdc_candidates_futures.emplace_back(
           threadPool.addTask(
-            [&segments, is_first_segment, i, &min_size, &avg_size, &max_size, &is_use_simd]() {
-              const CDCZ_CONFIG cfg{ .avx2_allowed = is_use_simd };
-              return find_cdc_cut_candidates(segments[i], min_size, avg_size, max_size, cfg, is_first_segment);
+            [&segments, is_first_segment, i, &min_size, &avg_size, &max_size, &cdcz_cfg]() {
+              return find_cdc_cut_candidates(segments[i], min_size, avg_size, max_size, cdcz_cfg, is_first_segment);
             }
           )
         );
@@ -267,9 +268,8 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
       }
     }
     else {
-      const CDCZ_CONFIG cfg{ .avx2_allowed = is_use_simd };
       for (uint64_t i = 0; i < segments.size(); i++) {
-        result = find_cdc_cut_candidates(segments[i], min_size, avg_size, max_size, cfg, is_first_segment);
+        result = find_cdc_cut_candidates(segments[i], min_size, avg_size, max_size, cdcz_cfg, is_first_segment);
 
         auto last_chunk_size = select_cut_point_candidates(
           result.candidates,

@@ -88,11 +88,8 @@ static void find_cdc_cut_candidates_simd_impl(
   // Highway's portable GatherIndex requires we read with 32bit/4byte alignment as we have int32_t vectors.
   // This way we ensure we never attempt to Gather from outside the data boundaries, the last < 4 bytes can be finished off manually.
   const auto data_adjusted_size = pad_size_for_alignment(data.size(), 4) - 4;
-  {
-    const uint64_t bytes_per_lane_u64 = data_adjusted_size / lane_count;
-    if (bytes_per_lane_u64 > std::numeric_limits<int32_t>::max()) {
-      throw std::runtime_error("Unable to process data such that lanes positions would overflow");
-    }
+  if (data_adjusted_size > std::numeric_limits<int32_t>::max()) {
+    throw std::runtime_error("Unable to process data such that lanes positions would overflow");
   }
   int32_t bytes_per_lane = pad_size_for_alignment(static_cast<int32_t>(data_adjusted_size / lane_count), 4) - 4;  // Idem 32bit alignment for Gathers
   i32Vec vindex = hn::Mul(hn::Iota(i32VecD, 0), hn::Set(i32VecD, bytes_per_lane));
@@ -157,6 +154,8 @@ static void find_cdc_cut_candidates_simd_impl(
 
     if (lane_achieved_chunk_invariance[lane_i]) {
       int32_t prev_cut_pos = lane_results[lane_i].empty() ? lane_i * bytes_per_lane : static_cast<int32_t>(lane_results[lane_i].back().offset);
+      // This should pretty much never happen but could happen if min_size < 32 (which you should never use as we use 32bit GEAR but that's besides the point)
+      if (prev_cut_pos >= pos) return;
       int32_t dist_with_prev = pos - prev_cut_pos;
 
       // >= max_size and not > max_size here even if it would be theoretically unnecessary because that's what we do on single threaded FastCDC as well
