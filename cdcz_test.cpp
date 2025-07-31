@@ -49,6 +49,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
   const bool is_use_mt = thread_count > 1;
   const bool is_simulate_mt = !cli_params["simulate_mt"].empty();
   const bool is_use_simd = !cli_params["simd"].empty();
+  const bool is_use_sscdc = !cli_params["ss_cdc"].empty();
 
   const std::string trace_out_path = cli_params["trace_out_file_path"];
   auto trace_out = std::fstream();
@@ -208,9 +209,11 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
     }
   };
 
-  const CDCZ_CONFIG cdcz_cfg{ .avx2_allowed = is_use_simd };
+  //print_to_console("ASDJASD\n");
+  //get_char_with_echo();
+  const CDCZ_CONFIG cdcz_cfg{ .simd_allowed = is_use_simd };
 
-  {
+  if (!is_use_sscdc) {
     std::deque<std::future<CdcCandidatesResult>> cdc_candidates_futures{};
     std::queue<uint64_t> supercdc_backup_pos{};
     CdcCandidatesResult result;
@@ -302,6 +305,14 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
       }
     }
     chunking_end_time = std::chrono::high_resolution_clock::now();
+  }
+  else {
+    uint8_t* sscdc_bitmap = nullptr;
+    if (is_use_sscdc) {
+      sscdc_bitmap = static_cast<uint8_t*>(portable_aligned_alloc(alignment, (file_size / 8u) + 1u));
+    }
+
+    portable_aligned_free(sscdc_bitmap);
   }
 
   XXH3_state_t* hash_state = XXH3_createState();

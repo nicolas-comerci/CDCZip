@@ -23,30 +23,37 @@ constexpr int32_t lane_count = hn::Lanes(i32VecD);
 #endif
 using i32Vec = decltype(hn::Set(i32VecD, 0));
 
-#define CDC_SIMD_ITER(cbytes)                                                                                                           \
+#define CDC_SIMD_ITER_IMPL(vbytes, supercdc_backup, normalized_chunking, features_cds)                                                  \
 do {                                                                                                                                    \
   hash_vec = hn::Shl(hash_vec, ones_vec);  /* Shift all the hash values for each lane at the same time */                               \
-  i32Vec idx = hn::And(cbytes, cmask);  /* Get byte on the lower bits of the packed 32bit lanes */                                      \
+  i32Vec lower_byte_vec = hn::And(vbytes, cmask);  /* Get byte on the lower bits of the packed 32bit lanes */                           \
   /* This gives us the GEAR hash values for each of the bytes we just got */                                                            \
-  i32Vec tentry = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(GEAR_TABLE), idx);                                              \
-  cbytes = hn::Shr(cbytes, eights_vec);  /* We already got the byte on the lower bits, we can shift right to later get the next byte */ \
-  hash_vec = hn::Add(hash_vec, tentry);  /* Add the values we got from the GEAR hash values to the values on the hash */                \
+  i32Vec gear_values = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(GEAR_TABLE), lower_byte_vec);                              \
+  (vbytes) = hn::Shr(vbytes, eights_vec);/* We already got the byte on the lower bits, we can shift right to later get the next byte */ \
+  hash_vec = hn::Add(hash_vec, gear_values);  /* Add the values we got from the GEAR hash values to the values on the hash */           \
 																																																																				\
   /* Compare each packed int by bitwise AND with the masks and checking that its 0 */                                                   \
-  const auto hash_bck_eq_mask = hn::Eq(hn::And(hash_vec, mask_backup_vec), zero_vec);                                                   \
-  const auto hash_easy_eq_mask = hn::Eq(hn::And(hash_vec, mask_easy_vec), zero_vec);                                                    \
+  if (supercdc_backup) {                                                                                                                \
+		const auto hash_bck_eq_mask = hn::Eq(hn::And(hash_vec, mask_backup_vec), zero_vec);                                                 \
+		candidates_backup_vmask = hn::Shl(candidates_backup_vmask, ones_vec);                                                               \
+		candidates_backup_vmask = hn::MaskedAddOr(candidates_backup_vmask, hash_bck_eq_mask, candidates_backup_vmask, ones_vec);            \
+	}                                                                                                                                     \
+  if (normalized_chunking) {                                                                                                            \
+		const auto hash_easy_eq_mask = hn::Eq(hn::And(hash_vec, mask_easy_vec), zero_vec);                                                  \
+		candidates_easy_vmask = hn::Shl(candidates_easy_vmask, ones_vec);                                                                   \
+		candidates_easy_vmask = hn::MaskedAddOr(candidates_easy_vmask, hash_easy_eq_mask, candidates_easy_vmask, ones_vec);                 \
+  }                                                                                                                                     \
   const auto hash_hard_eq_mask = hn::Eq(hn::And(hash_vec, mask_hard_vec), zero_vec);                                                    \
-  /*const auto hash_cds_eq_mask = hn::Eq(hn::And(hash_vec, mask_cds_vec), zero_vec);*/                                                  \
-																																																																				\
-  candidates_backup_vmask = hn::Shl(candidates_backup_vmask, ones_vec);                                                                 \
-	candidates_backup_vmask = hn::MaskedAddOr(candidates_backup_vmask, hash_bck_eq_mask, candidates_backup_vmask, ones_vec);              \
-  candidates_easy_vmask = hn::Shl(candidates_easy_vmask, ones_vec);                                                                     \
-  candidates_easy_vmask = hn::MaskedAddOr(candidates_easy_vmask, hash_easy_eq_mask, candidates_easy_vmask, ones_vec);                   \
   candidates_hard_vmask = hn::Shl(candidates_hard_vmask, ones_vec);                                                                     \
   candidates_hard_vmask = hn::MaskedAddOr(candidates_hard_vmask, hash_hard_eq_mask, candidates_hard_vmask, ones_vec);                   \
-  /*candidates_cds_vmask = hn::Shl(candidates_cds_vmask, ones_vec);*/                                                                   \
-  /*candidates_cds_vmask = hn::MaskedAddOr(candidates_cds_vmask, hash_cds_eq_mask, candidates_cds_vmask, ones_vec);*/                   \
+  if (features_cds) {                                                                                                                   \
+		const auto hash_cds_eq_mask = hn::Eq(hn::And(hash_vec, mask_cds_vec), zero_vec);                                                    \
+		candidates_cds_vmask = hn::Shl(candidates_cds_vmask, ones_vec);                                                                     \
+		candidates_cds_vmask = hn::MaskedAddOr(candidates_cds_vmask, hash_cds_eq_mask, candidates_cds_vmask, ones_vec);                     \
+  }                                                                                                                                     \
 } while (0)
+#define CDC_SIMD_ITER(vbytes) CDC_SIMD_ITER_IMPL(vbytes, true, true, false)
+#define CDC_SIMD_ITER_SSCDC(vbytes) CDC_SIMD_ITER_IMPL(vbytes, false, false, false)
 
 static void find_cdc_cut_candidates_simd_impl(
   std::vector<CutPointCandidate>& candidates,

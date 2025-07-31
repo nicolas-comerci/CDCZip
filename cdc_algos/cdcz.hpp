@@ -31,7 +31,7 @@ struct CDCZ_CONFIG {
   bool use_fastcdc_normalized_chunking = true;
   bool use_supercdc_minmax_adjustment = true;
   bool use_supercdc_backup_mask = true;
-  bool avx2_allowed = false;
+  bool simd_allowed = false;
 };
 
 inline uint64_t pad_size_for_alignment(uint64_t size, uint64_t alignment) { return ((size + alignment - 1) / alignment) * alignment; }
