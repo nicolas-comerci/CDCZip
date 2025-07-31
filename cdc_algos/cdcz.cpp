@@ -28,7 +28,7 @@ static CdcCandidatesResult find_cdc_cut_candidates_impl(
   CdcCandidatesResult result{};
   if (data.empty()) return result;
 
-  const auto make_mask = [](uint32_t bits) { return 0xFFFFFFFF << (32 - bits); };
+  const auto make_mask = [](uint32_t bits) -> uint32_t { return 0xFFFFFFFF << (32 - bits); };
   const auto bits = std::lround(std::log2(avg_size));
   const auto mask_hard = make_mask(bits + 1);
   const auto mask_medium = make_mask(bits);
@@ -40,7 +40,7 @@ static CdcCandidatesResult find_cdc_cut_candidates_impl(
   constexpr auto lane_count = hn::Lanes(HWY_FULL(int32_t){});
 #endif
 
-  if (data.size() < 1024 || !cdcz_cfg.avx2_allowed || lane_count < 8) {
+  if (data.size() < 1024 || !cdcz_cfg.simd_allowed || lane_count < 8) {
     find_cdc_cut_candidates_serial(
       result.candidates, result.candidatesFeatureResults, data,
       min_size, avg_size, max_size, mask_hard, mask_medium, mask_easy, cdcz_cfg, is_first_segment

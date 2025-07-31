@@ -18,4 +18,15 @@ void find_cdc_cut_candidates_simd(
   bool is_first_segment
 );
 
+void sscdc_first_stage(std::span<uint8_t> data, uint8_t* results_bitmap, uint32_t mask);
+void sscdc_second_stage(
+  const uint8_t* segment_results_bitmap,
+  std::deque<utility::ChunkEntry>& process_pending_chunks,
+  const uint64_t min_chunksize,
+  const uint64_t max_chunksize,
+  const uint64_t segment_length,
+  const uint64_t segment_start_offset,
+  uint64_t& prev_cut_offset
+);
+
 #endif

@@ -93,6 +93,9 @@ int main(int argc, char* argv[]) {
     else if (param.starts_with("--test")) {
       cli_params["test_mode"] = "true";
     }
+    else if (param.starts_with("--ss-cdc")) {
+      cli_params["ss_cdc"] = "true";
+    }
     else if (param.starts_with("--gear-at-pos=")) {
       constexpr auto opt_size = std::string("--gear-at-pos=").size();
       cli_params["calc_gear_at_pos"] = param.substr(opt_size, param.size() - opt_size);
@@ -105,8 +108,8 @@ int main(int argc, char* argv[]) {
       constexpr auto opt_size = std::string("--trace-in=").size();
       cli_params["trace_in_file_path"] = param.substr(opt_size, param.size() - opt_size);
     }
-    else if (param.starts_with("--simulate-mt")) {
-        cli_params["simulate_mt"] = "true";
+    else if (param.starts_with("--is-serial-mode")) {
+        cli_params["is_serial_mode"] = "true";
     }
     else {
       print_to_console("Bad arg: {}\n", param);
@@ -356,7 +359,7 @@ int main(int argc, char* argv[]) {
   auto find_cdc_cut_candidates_in_thread = [min_size, avg_size, max_size]
   (std::vector<uint8_t>&& segment_data, uint64_t segment_start_offset, bool is_eof_segment, bool is_first_segment) {
     CdcCandidatesResult cdc_candidates_result;
-    const CDCZ_CONFIG cfg{ .compute_features = use_feature_extraction, .avx2_allowed = true };
+    const CDCZ_CONFIG cfg{ .compute_features = use_feature_extraction };
     cdc_candidates_result = find_cdc_cut_candidates(segment_data, min_size, avg_size, max_size, cfg, is_first_segment);
     return std::tuple(std::move(cdc_candidates_result), std::move(segment_data), segment_start_offset, is_eof_segment, is_first_segment);
   };

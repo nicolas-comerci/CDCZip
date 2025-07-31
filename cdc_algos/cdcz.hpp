@@ -27,11 +27,11 @@ struct CutPointCandidateWithContext {
 
 struct CDCZ_CONFIG {
   bool compute_features = false;
-  bool use_fastcdc_subminimum_skipping = true;
-  bool use_fastcdc_normalized_chunking = true;
-  bool use_supercdc_minmax_adjustment = true;
-  bool use_supercdc_backup_mask = true;
-  bool avx2_allowed = false;
+  bool use_fastcdc_subminimum_skipping = false;
+  bool use_fastcdc_normalized_chunking = false;
+  bool use_supercdc_minmax_adjustment = false;
+  bool use_supercdc_backup_mask = false;
+  bool simd_allowed = false;
 };
 
 inline uint64_t pad_size_for_alignment(uint64_t size, uint64_t alignment) { return ((size + alignment - 1) / alignment) * alignment; }
