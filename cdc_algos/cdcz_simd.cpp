@@ -311,7 +311,7 @@ static void find_cdc_cut_candidates_simd_impl(
     CDC_SIMD_ITER(bytes_25to28);  CDC_SIMD_ITER(bytes_25to28); CDC_SIMD_ITER(bytes_25to28);  CDC_SIMD_ITER(bytes_25to28);
     CDC_SIMD_ITER(bytes_29to32);  CDC_SIMD_ITER(bytes_29to32); CDC_SIMD_ITER(bytes_29to32);  CDC_SIMD_ITER(bytes_29to32);
 
-    // TODO: This is broken! sample_feature_value accesses the hash which might(most likely) not be appropiate for the pos anymore
+    // TODO: This is broken! sample_feature_value accesses the hash which might(most likely) not be appropriate for the pos anymore
     // Proper SIMD implementation probably using hn::IfThenElse or similar inside CDC_SIMD_ITER is required
     const auto candidates_cds_mask = hn::IfThenElseZero(is_lane_not_finished_mask, candidates_cds_vmask);
     if (!hn::AllTrue(i32VecD, hn::Eq(candidates_cds_mask, zero_vec))) {
@@ -417,6 +417,138 @@ static void find_cdc_cut_candidates_simd_impl(
     candidates.emplace_back(CutPointCandidateType::EOF_CUT, data.size());
     if (cdcz_cfg.compute_features) {
       candidate_features.emplace_back();
+    }
+  }
+}
+
+static void sscdc_impl(
+  std::vector<CutPointCandidate>& candidates,
+  std::vector<std::vector<uint32_t>>& candidate_features,
+  std::span<uint8_t> data,
+  int32_t min_size,
+  int32_t avg_size,
+  int32_t max_size,
+  uint32_t mask_hard,
+  uint32_t mask_medium,
+  uint32_t mask_easy,
+  const CDCZ_CONFIG& cdcz_cfg,
+  bool is_first_segment
+) {
+  const auto easiest_mask = cdcz_cfg.use_supercdc_backup_mask
+    ? mask_easy << 1
+    : cdcz_cfg.use_fastcdc_normalized_chunking ? mask_easy : mask_medium;
+  i32Vec mask_backup_vec = hn::Set(i32VecD, static_cast<int32_t>(mask_easy << 1));
+  i32Vec mask_easy_vec = hn::Set(i32VecD, static_cast<int32_t>(mask_easy));
+  // If we are not using normalized chunking then all of these cuts will be HARD candidates
+  i32Vec mask_hard_vec = hn::Set(i32VecD, static_cast<int32_t>(cdcz_cfg.use_fastcdc_normalized_chunking ? mask_hard : mask_medium));
+  i32Vec mask_cds_vec = hn::Set(i32VecD, static_cast<int32_t>(delta_comp_constants::CDS_SAMPLING_MASK));
+
+  const i32Vec cmask = hn::Set(i32VecD, 0xff);
+  i32Vec hash_vec = hn::Set(i32VecD, 0);
+  const i32Vec zero_vec = hn::Set(i32VecD, 0);
+  const i32Vec ones_vec = hn::Set(i32VecD, 1);
+  const i32Vec twos_vec = hn::Set(i32VecD, 2);
+  const i32Vec eights_vec = hn::Set(i32VecD, 8);
+
+  // Highway's portable GatherIndex requires we read with 32bit/4byte alignment as we have int32_t vectors.
+  // This way we ensure we never attempt to Gather from outside the data boundaries, the last < 4 bytes can be finished off manually.
+  const auto data_adjusted_size = pad_size_for_alignment(data.size(), 4) - 4;
+  if (data_adjusted_size > std::numeric_limits<int32_t>::max()) {
+    throw std::runtime_error("Unable to process data such that lanes positions would overflow");
+  }
+  int32_t bytes_per_lane = pad_size_for_alignment(static_cast<int32_t>(data_adjusted_size / lane_count), 4) - 4;  // Idem 32bit alignment for Gathers
+  i32Vec vindex = hn::Mul(hn::Iota(i32VecD, 0), hn::Set(i32VecD, bytes_per_lane));
+
+  // For each lane, the last index they are allowed to access
+  i32Vec vindex_max = hn::Add(vindex, hn::Set(i32VecD, bytes_per_lane));
+  // Because we read 4bytes at a time we need to ensure we are not reading past the data end
+  vindex_max = hn::InsertLane(vindex_max, lane_count - 1, static_cast<int32_t>(data_adjusted_size) - 32);
+
+  auto candidates_backup_vmask = hn::Set(i32VecD, 0);
+  auto candidates_easy_vmask = hn::Set(i32VecD, 0);
+  auto candidates_hard_vmask = hn::Set(i32VecD, 0);
+  auto candidates_cds_vmask = hn::Set(i32VecD, 0);
+
+  auto& candidates_easiest_vmask = cdcz_cfg.use_supercdc_backup_mask
+    ? candidates_backup_vmask
+    : cdcz_cfg.use_fastcdc_normalized_chunking ? candidates_easy_vmask : candidates_hard_vmask;
+
+  while (true) {
+    vindex = hn::Min(vindex, vindex_max);  // prevent vindex from pointing to invalid memory
+    const auto is_lane_not_finished_mask = hn::Gt(vindex_max, vindex);
+    // If all lanes are finished, we break, else we continue and lanes that are already finished will ignore results
+    if (hn::AllFalse(i32VecD, is_lane_not_finished_mask)) break;
+
+    auto vindex_int32_elem = hn::Shr(vindex, twos_vec);
+    i32Vec bytes_1to4 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), vindex_int32_elem);
+    i32Vec bytes_5to8 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, ones_vec));
+    i32Vec bytes_9to12 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, twos_vec));
+    i32Vec bytes_13to16 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 3)));
+    i32Vec bytes_17to20 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 4)));
+    i32Vec bytes_21to24 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 5)));
+    i32Vec bytes_25to28 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 6)));
+    i32Vec bytes_29to32 = hn::GatherIndex(i32VecD, reinterpret_cast<int const*>(data.data()), hn::Add(vindex_int32_elem, hn::Set(i32VecD, 7)));
+
+    // Oh lord please forgive me, there has to be a better way of unrolling this thing
+    CDC_SIMD_ITER_SSCDC(bytes_1to4);    CDC_SIMD_ITER_SSCDC(bytes_1to4);   CDC_SIMD_ITER_SSCDC(bytes_1to4);    CDC_SIMD_ITER_SSCDC(bytes_1to4);
+    CDC_SIMD_ITER_SSCDC(bytes_5to8);    CDC_SIMD_ITER_SSCDC(bytes_5to8);   CDC_SIMD_ITER_SSCDC(bytes_5to8);    CDC_SIMD_ITER_SSCDC(bytes_5to8);
+    CDC_SIMD_ITER_SSCDC(bytes_9to12);   CDC_SIMD_ITER_SSCDC(bytes_9to12);  CDC_SIMD_ITER_SSCDC(bytes_9to12);   CDC_SIMD_ITER_SSCDC(bytes_9to12);
+    CDC_SIMD_ITER_SSCDC(bytes_13to16);  CDC_SIMD_ITER_SSCDC(bytes_13to16); CDC_SIMD_ITER_SSCDC(bytes_13to16);  CDC_SIMD_ITER_SSCDC(bytes_13to16);
+    CDC_SIMD_ITER_SSCDC(bytes_17to20);  CDC_SIMD_ITER_SSCDC(bytes_17to20); CDC_SIMD_ITER_SSCDC(bytes_17to20);  CDC_SIMD_ITER_SSCDC(bytes_17to20);
+    CDC_SIMD_ITER_SSCDC(bytes_21to24);  CDC_SIMD_ITER_SSCDC(bytes_21to24); CDC_SIMD_ITER_SSCDC(bytes_21to24);  CDC_SIMD_ITER_SSCDC(bytes_21to24);
+    CDC_SIMD_ITER_SSCDC(bytes_25to28);  CDC_SIMD_ITER_SSCDC(bytes_25to28); CDC_SIMD_ITER_SSCDC(bytes_25to28);  CDC_SIMD_ITER_SSCDC(bytes_25to28);
+    CDC_SIMD_ITER_SSCDC(bytes_29to32);  CDC_SIMD_ITER_SSCDC(bytes_29to32); CDC_SIMD_ITER_SSCDC(bytes_29to32);  CDC_SIMD_ITER_SSCDC(bytes_29to32);
+
+    candidates_easiest_vmask = hn::IfThenElseZero(is_lane_not_finished_mask, candidates_easiest_vmask);
+    if (!hn::AllTrue(i32VecD, hn::Eq(candidates_easiest_vmask, zero_vec))) {
+      int32_t candidates_backup_bits = 0;
+      int32_t candidates_easy_bits = 0;
+      int32_t candidates_hard_bits = 0;
+      const auto& candidates_easiest_bits = cdcz_cfg.use_supercdc_backup_mask
+        ? candidates_backup_bits
+        : cdcz_cfg.use_fastcdc_normalized_chunking ? candidates_easy_bits : candidates_hard_bits;
+      for (int32_t lane_i = 0; lane_i < lane_count; lane_i++) {
+        candidates_backup_bits = hn::ExtractLane(candidates_backup_vmask, lane_i);
+        candidates_easy_bits = hn::ExtractLane(candidates_easy_vmask, lane_i);
+        candidates_hard_bits = hn::ExtractLane(candidates_hard_vmask, lane_i);
+        const int32_t lane_pos = hn::ExtractLane(vindex, lane_i);
+        int32_t bit = 0;
+        while (candidates_easiest_bits != 0) {
+          if (candidates_easiest_bits & (0b1 << 31)) {
+            CutPointCandidateType cut_type = CutPointCandidateType::SUPERCDC_BACKUP_MASK;
+            if (candidates_easy_bits & (0b1 << 31)) cut_type = CutPointCandidateType::EASY_CUT_MASK;
+            if (candidates_hard_bits & (0b1 << 31)) cut_type = CutPointCandidateType::HARD_CUT_MASK;
+            //process_lane(lane_i, lane_pos + bit, cut_type);
+          }
+          candidates_backup_bits <<= 1;
+          candidates_easy_bits <<= 1;
+          candidates_hard_bits <<= 1;
+          bit++;
+        }
+      }
+    }
+
+    vindex = hn::Add(vindex, hn::Set(i32VecD, 32));
+  }
+
+  {
+    // Deal with any trailing data sequentially
+    int32_t i = hn::ExtractLane(vindex_max, lane_count - 1) - 31;
+    // The hash might be nonsense if the last lane finished before the others, so we just recover it
+    uint64_t remaining_minmax_adjustment = 31;
+    uint32_t pattern = 0;
+
+    while (i < data.size()) {
+      pattern = (pattern << 1) + GEAR_TABLE[data[i]];
+      if (remaining_minmax_adjustment > 0) {
+        --remaining_minmax_adjustment;
+        ++i;
+        continue;
+      }
+      if (!(pattern & easiest_mask)) {
+        //process_lane(lane_count - 1, i, get_result_type_for_lane(pattern), true);
+      }
+      ++i;
     }
   }
 }
