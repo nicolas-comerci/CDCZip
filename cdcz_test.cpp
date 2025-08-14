@@ -1,11 +1,12 @@
 #include "cdcz_test.hpp"
-#include "cdc_algos/cdcz.hpp"
 
 #include <chrono>
 #include <fstream>
 #include <span>
 #include <unordered_set>
 
+#include "cdc_algos/cdcz.hpp"
+#include "cdc_algos/cdcz_simd.hpp"
 #include "cdc_algos/gear.hpp"
 #include "contrib/task_pool.h"
 #include "contrib/xxHash/xxhash.h"
@@ -47,7 +48,8 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
 
   const uint64_t thread_count = std::stoi(cli_params["threads"]);
   const bool is_use_mt = thread_count > 1;
-  const bool is_simulate_mt = !cli_params["simulate_mt"].empty();
+  // thread_count might still be used for creating segments, but processing is done serially if this is enabled (mostly for testing)
+  const bool is_serial_mode = !cli_params["is_serial_mode"].empty();
   const bool is_use_simd = !cli_params["simd"].empty();
   const bool is_use_sscdc = !cli_params["ss_cdc"].empty();
 
@@ -121,7 +123,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
   const uint64_t segment_size = std::min<uint64_t>(std::numeric_limits<int32_t>::max() / 16, file_size / thread_count);
 
   std::vector<std::span<uint8_t>> segments;
-  if (is_use_mt || is_use_simd) {
+  if (is_use_mt || is_use_simd || is_use_sscdc) {
     auto data_span = std::span<uint8_t>(file_data, file_size);
     while (!data_span.empty()) {
       const uint64_t segment_expected_size = segment_size + 31;
@@ -224,7 +226,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
     uint64_t chunk_idx = 0;
 
     chunking_start_time = std::chrono::high_resolution_clock::now();
-    if (!is_simulate_mt) {
+    if (!is_serial_mode) {
       for (uint64_t i = 0; i < segments.size(); i++) {
         cdc_candidates_futures.emplace_back(
           threadPool.addTask(
@@ -307,12 +309,97 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
     chunking_end_time = std::chrono::high_resolution_clock::now();
   }
   else {
-    uint8_t* sscdc_bitmap = nullptr;
-    if (is_use_sscdc) {
-      sscdc_bitmap = static_cast<uint8_t*>(portable_aligned_alloc(alignment, (file_size / 8u) + 1u));
+    std::vector<uint8_t*> sscdc_results_bitmaps{};
+    for (uint64_t i = 0; i < segments.size(); i++) {
+      const auto sscdc_bitmap_size = (segments[i].size() / 8u) + 1u;
+      uint8_t* sscdc_results_bitmap = static_cast<uint8_t*>(portable_aligned_alloc(alignment, sscdc_bitmap_size));
+    }
+    std::deque<std::future<void>> sscdc_futures{};
+    const auto mask = std::lround(std::log2(avg_size));
+    chunking_start_time = std::chrono::high_resolution_clock::now();
+
+    if (!is_serial_mode) {
+      for (uint64_t i = 0; i < segments.size(); i++) {
+        sscdc_futures.emplace_back(
+          threadPool.addTask([&segments, &sscdc_results_bitmaps, i, &min_size, &avg_size, &max_size, &cdcz_cfg]() {
+	          sscdc_first_stage(segments[i], sscdc_results_bitmaps[i], mask);
+	        })
+        );
+      }
+
+      for (uint64_t i = 0; i < segments.size(); i++) {
+        auto& future = cdc_candidates_futures.front();
+        result = future.get();
+
+        auto last_chunk_size = select_cut_point_candidates(
+          result.candidates,
+          result.candidatesFeatureResults,
+          process_pending_chunks,
+          supercdc_backup_pos,
+          last_cut_offset,
+          curr_segment_start_offset,
+          segments[i],
+          prev_segment_remaining_data,
+          min_size,
+          avg_size,
+          max_size,
+          i == segments.size() - 1,
+          false,
+          is_first_segment,
+#ifdef NDEBUG
+          false
+#else
+          true
+#endif
+        );
+
+        do_chunk_correctness_checks(chunk_idx, last_chunk_size, result, i, segments[i].size(), last_cut_offset, curr_segment_start_offset);
+
+        last_cut_offset = process_pending_chunks.back().offset + last_chunk_size;
+        curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
+
+        cdc_candidates_futures.pop_front();
+      }
+    }
+    else {
+      for (uint64_t i = 0; i < segments.size(); i++) {
+        result = find_cdc_cut_candidates(segments[i], min_size, avg_size, max_size, cdcz_cfg, is_first_segment);
+
+        auto last_chunk_size = select_cut_point_candidates(
+          result.candidates,
+          result.candidatesFeatureResults,
+          process_pending_chunks,
+          supercdc_backup_pos,
+          last_cut_offset,
+          curr_segment_start_offset,
+          segments[i],
+          prev_segment_remaining_data,
+          min_size,
+          avg_size,
+          max_size,
+          i == segments.size() - 1,
+          false,
+          is_first_segment,
+#ifdef NDEBUG
+          false
+#else
+          true
+#endif
+        );
+
+        do_chunk_correctness_checks(chunk_idx, last_chunk_size, result, i, segments[i].size(), last_cut_offset, curr_segment_start_offset);
+
+        last_cut_offset = process_pending_chunks.back().offset + last_chunk_size;
+        curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
+
+        is_first_segment = false;
+      }
     }
 
-    portable_aligned_free(sscdc_bitmap);
+    chunking_end_time = std::chrono::high_resolution_clock::now();
+    for (auto sscdc_results_bitmap : sscdc_results_bitmaps) {
+      portable_aligned_free(sscdc_results_bitmap);
+    }
   }
 
   XXH3_state_t* hash_state = XXH3_createState();
