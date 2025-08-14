@@ -18,4 +18,6 @@ void find_cdc_cut_candidates_simd(
   bool is_first_segment
 );
 
+void sscdc_first_stage(std::span<uint8_t> data, uint8_t* results_bitmap, uint32_t mask);
+
 #endif

@@ -17,9 +17,9 @@ namespace hn = hwy::HWY_NAMESPACE;
 constexpr HWY_FULL(int32_t) i32VecD {};
 
 #ifndef NDEBUG
-constexpr int32_t lane_count = hn::MaxLanes(i32VecD);
+constexpr size_t lane_count = hn::MaxLanes(i32VecD);
 #else
-constexpr int32_t lane_count = hn::Lanes(i32VecD);
+constexpr size_t lane_count = hn::Lanes(i32VecD);
 #endif
 using i32Vec = decltype(hn::Set(i32VecD, 0));
 
@@ -421,27 +421,41 @@ static void find_cdc_cut_candidates_simd_impl(
   }
 }
 
-static void sscdc_impl(
-  std::vector<CutPointCandidate>& candidates,
-  std::vector<std::vector<uint32_t>>& candidate_features,
-  std::span<uint8_t> data,
-  int32_t min_size,
-  int32_t avg_size,
-  int32_t max_size,
-  uint32_t mask_hard,
-  uint32_t mask_medium,
-  uint32_t mask_easy,
-  const CDCZ_CONFIG& cdcz_cfg,
-  bool is_first_segment
-) {
-  const auto easiest_mask = cdcz_cfg.use_supercdc_backup_mask
-    ? mask_easy << 1
-    : cdcz_cfg.use_fastcdc_normalized_chunking ? mask_easy : mask_medium;
-  i32Vec mask_backup_vec = hn::Set(i32VecD, static_cast<int32_t>(mask_easy << 1));
-  i32Vec mask_easy_vec = hn::Set(i32VecD, static_cast<int32_t>(mask_easy));
-  // If we are not using normalized chunking then all of these cuts will be HARD candidates
-  i32Vec mask_hard_vec = hn::Set(i32VecD, static_cast<int32_t>(cdcz_cfg.use_fastcdc_normalized_chunking ? mask_hard : mask_medium));
-  i32Vec mask_cds_vec = hn::Set(i32VecD, static_cast<int32_t>(delta_comp_constants::CDS_SAMPLING_MASK));
+HWY_INLINE void i32VecScatter(std::uint8_t* base, const i32Vec& idx_vec, const i32Vec& val_vec, uint8_t scale_bytes) {
+#if !defined(NDEBUG)
+  if (!(scale_bytes == 1 || scale_bytes == 2 || scale_bytes == 4 || scale_bytes == 8)) abort();
+#endif
+
+  alignas(64) int idx_tmp[hn::MaxLanes(i32VecD)];
+  alignas(64) int val_tmp[hn::MaxLanes(i32VecD)];
+  Store(idx_vec, i32VecD, idx_tmp);
+  Store(val_vec, i32VecD, val_tmp);
+
+#if HWY_TARGET == HWY_AVX3 || HWY_TARGET == HWY_AVX3_DL || HWY_TARGET == HWY_AVX3_ZEN4 || HWY_TARGET == HWY_AVX3_SPR
+  // AVX-512 native scatter for 16-lane vectors.
+  if (lane_count == 16) {
+    const __m512i v_idx = _mm512_loadu_si512(idx_tmp);
+    const __m512i v_vals = _mm512_loadu_si512(val_tmp);
+    _mm512_i32scatter_epi32(base, v_idx, v_vals, scale_bytes);
+    return;
+  }
+#endif
+
+  // Generic per-lane stores for any other arch.
+  for (size_t i = 0; i < lane_count; ++i) {
+    *reinterpret_cast<int*>(
+      reinterpret_cast<uint8_t*>(base) + static_cast<size_t>(idx_tmp[i]) * scale_bytes) =
+      val_tmp[i];
+  }
+}
+
+static void sscdc_first_stage_impl(std::span<uint8_t> data, uint8_t* results_bitmap, uint32_t mask) {
+  // For SS-CDC all cuts will be HARD candidates
+  i32Vec mask_hard_vec = hn::Set(i32VecD, static_cast<int32_t>(mask));
+  // All these are not used for SS-CDC so their values don't matter
+  i32Vec mask_backup_vec = hn::Set(i32VecD, static_cast<int32_t>(mask));
+  i32Vec mask_easy_vec = hn::Set(i32VecD, static_cast<int32_t>(mask));
+  i32Vec mask_cds_vec = hn::Set(i32VecD, static_cast<int32_t>(mask));
 
   const i32Vec cmask = hn::Set(i32VecD, 0xff);
   i32Vec hash_vec = hn::Set(i32VecD, 0);
@@ -456,22 +470,26 @@ static void sscdc_impl(
   if (data_adjusted_size > std::numeric_limits<int32_t>::max()) {
     throw std::runtime_error("Unable to process data such that lanes positions would overflow");
   }
-  int32_t bytes_per_lane = pad_size_for_alignment(static_cast<int32_t>(data_adjusted_size / lane_count), 4) - 4;  // Idem 32bit alignment for Gathers
+  // For the bytes_per_lane we also need 32bit alignment for Gathers but also divisible by 8 so we can have each byte represented by a bit of the results_bitmap
+  const int32_t bytes_per_lane = pad_size_for_alignment(static_cast<int32_t>(data_adjusted_size / lane_count), 8) - 8;
   i32Vec vindex = hn::Mul(hn::Iota(i32VecD, 0), hn::Set(i32VecD, bytes_per_lane));
+  const int32_t bitmap_bytes_per_lane = bytes_per_lane / 8;
+  i32Vec bitmap_vindex = hn::Mul(hn::Iota(i32VecD, 0), hn::Set(i32VecD, bitmap_bytes_per_lane));
 
+  // TODO: This should not be necessary for SS-CDC as there are no jumps, we should be easily able to precompute the needed amount of iterations
   // For each lane, the last index they are allowed to access
   i32Vec vindex_max = hn::Add(vindex, hn::Set(i32VecD, bytes_per_lane));
   // Because we read 4bytes at a time we need to ensure we are not reading past the data end
   vindex_max = hn::InsertLane(vindex_max, lane_count - 1, static_cast<int32_t>(data_adjusted_size) - 32);
 
+  // For CDC_SIMD_ITER we will be using the hard vmask as there are no conditional cuts on SS-CDC, all cut candidates have to be honored,
+  // as long as the minimum and maximum chunk size requirements are met
+  auto candidates_hard_vmask = hn::Set(i32VecD, 0);
+
+  // These are unnecessary for SS-CDC and unusued, but still needed for CDC_SIMD_ITER macro
   auto candidates_backup_vmask = hn::Set(i32VecD, 0);
   auto candidates_easy_vmask = hn::Set(i32VecD, 0);
-  auto candidates_hard_vmask = hn::Set(i32VecD, 0);
   auto candidates_cds_vmask = hn::Set(i32VecD, 0);
-
-  auto& candidates_easiest_vmask = cdcz_cfg.use_supercdc_backup_mask
-    ? candidates_backup_vmask
-    : cdcz_cfg.use_fastcdc_normalized_chunking ? candidates_easy_vmask : candidates_hard_vmask;
 
   while (true) {
     vindex = hn::Min(vindex, vindex_max);  // prevent vindex from pointing to invalid memory
@@ -499,36 +517,13 @@ static void sscdc_impl(
     CDC_SIMD_ITER_SSCDC(bytes_25to28);  CDC_SIMD_ITER_SSCDC(bytes_25to28); CDC_SIMD_ITER_SSCDC(bytes_25to28);  CDC_SIMD_ITER_SSCDC(bytes_25to28);
     CDC_SIMD_ITER_SSCDC(bytes_29to32);  CDC_SIMD_ITER_SSCDC(bytes_29to32); CDC_SIMD_ITER_SSCDC(bytes_29to32);  CDC_SIMD_ITER_SSCDC(bytes_29to32);
 
-    candidates_easiest_vmask = hn::IfThenElseZero(is_lane_not_finished_mask, candidates_easiest_vmask);
-    if (!hn::AllTrue(i32VecD, hn::Eq(candidates_easiest_vmask, zero_vec))) {
-      int32_t candidates_backup_bits = 0;
-      int32_t candidates_easy_bits = 0;
-      int32_t candidates_hard_bits = 0;
-      const auto& candidates_easiest_bits = cdcz_cfg.use_supercdc_backup_mask
-        ? candidates_backup_bits
-        : cdcz_cfg.use_fastcdc_normalized_chunking ? candidates_easy_bits : candidates_hard_bits;
-      for (int32_t lane_i = 0; lane_i < lane_count; lane_i++) {
-        candidates_backup_bits = hn::ExtractLane(candidates_backup_vmask, lane_i);
-        candidates_easy_bits = hn::ExtractLane(candidates_easy_vmask, lane_i);
-        candidates_hard_bits = hn::ExtractLane(candidates_hard_vmask, lane_i);
-        const int32_t lane_pos = hn::ExtractLane(vindex, lane_i);
-        int32_t bit = 0;
-        while (candidates_easiest_bits != 0) {
-          if (candidates_easiest_bits & (0b1 << 31)) {
-            CutPointCandidateType cut_type = CutPointCandidateType::SUPERCDC_BACKUP_MASK;
-            if (candidates_easy_bits & (0b1 << 31)) cut_type = CutPointCandidateType::EASY_CUT_MASK;
-            if (candidates_hard_bits & (0b1 << 31)) cut_type = CutPointCandidateType::HARD_CUT_MASK;
-            //process_lane(lane_i, lane_pos + bit, cut_type);
-          }
-          candidates_backup_bits <<= 1;
-          candidates_easy_bits <<= 1;
-          candidates_hard_bits <<= 1;
-          bit++;
-        }
-      }
+    candidates_hard_vmask = hn::IfThenElseZero(is_lane_not_finished_mask, candidates_hard_vmask);
+    if (!hn::AllTrue(i32VecD, hn::Eq(candidates_hard_vmask, zero_vec))) {
+      i32VecScatter(results_bitmap, bitmap_vindex, candidates_hard_vmask, 1);
     }
 
     vindex = hn::Add(vindex, hn::Set(i32VecD, 32));
+    bitmap_vindex = hn::Add(bitmap_vindex, hn::Set(i32VecD, 4));  // 32bits for 32 results = 4bytes per lane
   }
 
   {
@@ -545,7 +540,10 @@ static void sscdc_impl(
         ++i;
         continue;
       }
-      if (!(pattern & easiest_mask)) {
+      if (!(pattern & mask)) {
+        const uint32_t byte_pos = i / 8u;
+        const uint8_t bit_pos = i % 8u;
+        data[byte_pos] = data[byte_pos] | static_cast<uint8_t>(1u << bit_pos);
         //process_lane(lane_count - 1, i, get_result_type_for_lane(pattern), true);
       }
       ++i;
@@ -562,6 +560,7 @@ HWY_AFTER_NAMESPACE();
 
 namespace CDCZ_SIMD {
 	HWY_EXPORT(find_cdc_cut_candidates_simd_impl);
+	HWY_EXPORT(sscdc_first_stage_impl);
 }
 
 void find_cdc_cut_candidates_simd(
@@ -578,6 +577,10 @@ void find_cdc_cut_candidates_simd(
   bool is_first_segment
 ) {
   HWY_DYNAMIC_DISPATCH(CDCZ_SIMD::find_cdc_cut_candidates_simd_impl)(candidates, candidate_features, data, min_size, avg_size, max_size, mask_hard, mask_medium, mask_easy, cdcz_cfg, is_first_segment);
+}
+
+void sscdc_first_stage(std::span<uint8_t> data, uint8_t* results_bitmap, uint32_t mask) {
+  HWY_DYNAMIC_DISPATCH(CDCZ_SIMD::sscdc_first_stage_impl)(data, results_bitmap, mask);
 }
 
 #endif
