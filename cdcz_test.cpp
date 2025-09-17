@@ -179,7 +179,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
   // If no form of parallelism was used then chunks resulting from select_cut_point_candidates should just be the candidates
   const bool do_all_candidates_selected_check = !is_use_mt && !is_use_simd;
   auto do_chunk_correctness_checks = [&process_pending_chunks, &trace_inputs, &segments, do_trace_input_check, do_all_candidates_selected_check]
-  (uint64_t& chunk_idx, uint64_t segment_i, uint64_t last_cut_offset, uint64_t curr_segment_start_offset, std::vector<CutPointCandidate>* result_candidates = nullptr) {
+  (uint64_t& chunk_idx, uint64_t segment_i, uint64_t last_cut_offset, uint64_t curr_segment_start_offset, const bool is_last_segment, std::vector<CutPointCandidate>* result_candidates = nullptr) {
     if (!do_trace_input_check && !do_all_candidates_selected_check) return;
     while (chunk_idx != process_pending_chunks.size()) {
       const uint64_t process_pending_chunk_offset = process_pending_chunks[chunk_idx].offset;
@@ -208,6 +208,13 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
         }
       }
       ++chunk_idx;
+    }
+    if (is_last_segment && trace_inputs.size() > chunk_idx) {
+      print_to_console(
+        "Last segment {} with size {} at offset {}, last_cut_offset: {}, no more chunks processed yet trace has another cut at chunk offset: {}\n",
+        segment_i, segments[segment_i].size(), curr_segment_start_offset, last_cut_offset, trace_inputs[chunk_idx].offset
+      );
+      exit(1);
     }
   };
 
@@ -264,7 +271,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
 #endif
         );
 
-        do_chunk_correctness_checks(chunk_idx, i, last_cut_offset, curr_segment_start_offset, &result.candidates);
+        do_chunk_correctness_checks(chunk_idx, i, last_cut_offset, curr_segment_start_offset, i == segments.size() - 1 , &result.candidates);
 
         last_cut_offset = process_pending_chunks.back().offset + last_chunk_size;
         curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
@@ -298,7 +305,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
 #endif
         );
 
-        do_chunk_correctness_checks(chunk_idx, i, last_cut_offset, curr_segment_start_offset, &result.candidates);
+        do_chunk_correctness_checks(chunk_idx, i, last_cut_offset, curr_segment_start_offset, i == segments.size() - 1 , &result.candidates);
 
         last_cut_offset = process_pending_chunks.back().offset + last_chunk_size;
         curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
@@ -344,10 +351,11 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
           max_size,
           segments[i].size(),
           curr_segment_start_offset,
+          i == segments.size() - 1,
           last_cut_offset
         );
 
-        do_chunk_correctness_checks(chunk_idx, i, last_cut_offset, curr_segment_start_offset);
+        do_chunk_correctness_checks(chunk_idx, i, last_cut_offset, curr_segment_start_offset, i == segments.size() - 1);
 
         last_cut_offset = process_pending_chunks.back().offset;
         curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
@@ -366,10 +374,11 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
           max_size,
           segments[i].size(),
           curr_segment_start_offset,
+          i == segments.size() - 1,
           last_cut_offset
         );
 
-        do_chunk_correctness_checks(chunk_idx, i, last_cut_offset, curr_segment_start_offset);
+        do_chunk_correctness_checks(chunk_idx, i, last_cut_offset, curr_segment_start_offset, i == segments.size() - 1);
 
         last_cut_offset = process_pending_chunks.back().offset;
         curr_segment_start_offset += std::min<uint64_t>(segments[i].size(), segment_size);
@@ -394,9 +403,11 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
     const uint64_t chunk_size = next_chunk_offset - chunk.offset;
     const uint64_t hash = make_chunk_hash(chunk_size, hash_state);
 #ifndef NDEBUG
-    auto hash_from_chunk_data = XXH3_64bits(chunk.chunk_data->data.data(), chunk.chunk_data->data.size());
-    if (hash != hash_from_chunk_data) {
-      print_to_console("ERROR: BAD CHUNK HASH, WILL MESS UP DEDUPLICATION\n");
+    if (!is_use_sscdc) {
+      auto hash_from_chunk_data = XXH3_64bits(chunk.chunk_data->data.data(), chunk.chunk_data->data.size());
+      if (hash != hash_from_chunk_data) {
+        print_to_console("ERROR: BAD CHUNK HASH, WILL MESS UP DEDUPLICATION\n");
+      }
     }
 #endif
     if (!trace_inputs.empty() && trace_inputs.size() <= chunk_idx) {
@@ -405,7 +416,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
     }
     if (!trace_inputs.empty() && trace_inputs.size() > chunk_idx && trace_inputs[chunk_idx].hash != hash) {
       print_to_console(
-        "Chunk idx {} has hash {} and it should have {}.\n", chunk_idx, trace_inputs[chunk_idx].hash, hash
+        "Chunk idx {} has hash {} and it should have {}.\n", chunk_idx, hash, trace_inputs[chunk_idx].hash
       );
       exit(1);
     }

@@ -568,6 +568,7 @@ static void sscdc_second_stage_impl(
   const uint64_t max_chunksize,
   const uint64_t segment_length,
   const uint64_t segment_start_offset,
+  const bool is_last_segment,
   uint64_t& prev_cut_offset
 ) {
   const auto vec_bit_width = lane_count * 32; // lanes of 32bit ints
@@ -609,7 +610,11 @@ static void sscdc_second_stage_impl(
         }
       }
     }
-    if (!valid_cutoff_found) {
+    if (
+      !valid_cutoff_found ||
+      // If it's not the first segment, the first 31 bytes have invalid results as the GEAR hash hasn't had a full data window processed yet
+      (segment_start_offset != 0 && in_segment_candidate_offset <= 31)
+    ) {
       in_segment_current_offset += vec_bit_width;
       continue;
     }
@@ -636,6 +641,14 @@ static void sscdc_second_stage_impl(
       continue;
     }
     in_segment_current_offset++;
+  }
+
+  if (is_last_segment) {
+    const auto last_offset = segment_start_offset + segment_length;
+    while (prev_cut_offset + max_chunksize < last_offset) {
+      prev_cut_offset = prev_cut_offset + max_chunksize;
+      process_pending_chunks.emplace_back(prev_cut_offset);
+    }
   }
 }
 
@@ -679,10 +692,11 @@ void sscdc_second_stage(
   const uint64_t max_chunksize,
   const uint64_t segment_length,
   const uint64_t segment_start_offset,
+  const bool is_last_segment,
   uint64_t& prev_cut_offset
 ) {
   HWY_DYNAMIC_DISPATCH(CDCZ_SIMD::sscdc_second_stage_impl)(
-    segment_results_bitmap, process_pending_chunks, min_chunksize, max_chunksize, segment_length, segment_start_offset, prev_cut_offset
+    segment_results_bitmap, process_pending_chunks, min_chunksize, max_chunksize, segment_length, segment_start_offset, is_last_segment, prev_cut_offset
   );
 }
 

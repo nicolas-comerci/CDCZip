@@ -26,6 +26,7 @@ void sscdc_second_stage(
   const uint64_t max_chunksize,
   const uint64_t segment_length,
   const uint64_t segment_start_offset,
+  const bool is_last_segment,
   uint64_t& prev_cut_offset
 );
 
