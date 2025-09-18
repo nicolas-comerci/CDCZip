@@ -1,11 +1,13 @@
 #include "cdcz_test.hpp"
 
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <span>
 #include <unordered_set>
 
 #include "cdc_algos/cdcz.hpp"
+
 #include "cdc_algos/cdcz_simd.hpp"
 #include "cdc_algos/gear.hpp"
 #include "contrib/task_pool.h"
