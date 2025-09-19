@@ -32,25 +32,33 @@ do {                                                                            
   (vbytes) = hn::Shr(vbytes, eights_vec);/* We already got the byte on the lower bits, we can shift right to later get the next byte */ \
   hash_vec = hn::Add(hash_vec, gear_values);  /* Add the values we got from the GEAR hash values to the values on the hash */           \
 																																																																				\
-  /* Compare each packed int by bitwise AND with the masks and checking that its 0 */                                                   \
-  if (supercdc_backup) {                                                                                                                \
-		const auto hash_bck_eq_mask = hn::Eq(hn::And(hash_vec, mask_backup_vec), zero_vec);                                                 \
-		candidates_backup_vmask = hn::Shl(candidates_backup_vmask, ones_vec);                                                               \
-		candidates_backup_vmask = hn::IfThenElse(hash_bck_eq_mask, hn::Or(candidates_backup_vmask, ones_vec), candidates_backup_vmask);     \
-	}                                                                                                                                     \
-  if (normalized_chunking) {                                                                                                            \
-		const auto hash_easy_eq_mask = hn::Eq(hn::And(hash_vec, mask_easy_vec), zero_vec);                                                  \
-		candidates_easy_vmask = hn::Shl(candidates_easy_vmask, ones_vec);                                                                   \
-		candidates_easy_vmask = hn::IfThenElse(hash_easy_eq_mask, hn::Or(candidates_easy_vmask, ones_vec), candidates_easy_vmask);          \
-  }                                                                                                                                     \
-  const auto hash_hard_eq_mask = hn::Eq(hn::And(hash_vec, mask_hard_vec), zero_vec);                                                    \
-  candidates_hard_vmask = hn::Shl(candidates_hard_vmask, ones_vec);                                                                     \
-  candidates_hard_vmask = hn::IfThenElse(hash_hard_eq_mask, hn::Or(candidates_hard_vmask, ones_vec), candidates_hard_vmask);            \
   if (features_cds) {                                                                                                                   \
 		const auto hash_cds_eq_mask = hn::Eq(hn::And(hash_vec, mask_cds_vec), zero_vec);                                                    \
 		candidates_cds_vmask = hn::Shl(candidates_cds_vmask, ones_vec);                                                                     \
 		candidates_cds_vmask = hn::IfThenElse(hash_cds_eq_mask, hn::Or(candidates_cds_vmask, ones_vec), candidates_cds_vmask);              \
   }                                                                                                                                     \
+  																																																																		  \
+	candidates_backup_vmask = hn::Shl(candidates_backup_vmask, ones_vec);                                                                 \
+  candidates_easy_vmask = hn::Shl(candidates_easy_vmask, ones_vec);                                                                     \
+  candidates_hard_vmask = hn::Shl(candidates_hard_vmask, ones_vec);                                                                     \
+  																																																																		  \
+  /* Compare each packed int by bitwise AND with the masks and checking that its 0 */                                                   \
+  if (supercdc_backup) {                                                                                                                \
+		const auto hash_bck_eq_mask = hn::Eq(hn::And(hash_vec, mask_backup_vec), zero_vec);                                                 \
+    /* Quitting early if possible to skip harder hash checks if those are bound to not find anything */                                 \
+    if (hn::AllFalse(i32VecD, hash_bck_eq_mask)) continue;                                                                              \
+		candidates_backup_vmask = hn::IfThenElse(hash_bck_eq_mask, hn::Or(candidates_backup_vmask, ones_vec), candidates_backup_vmask);     \
+	}                                                                                                                                     \
+  if (normalized_chunking) {                                                                                                            \
+		const auto hash_easy_eq_mask = hn::Eq(hn::And(hash_vec, mask_easy_vec), zero_vec);                                                  \
+    /* Quitting early as above */                                                                                                       \
+    if (hn::AllFalse(i32VecD, hash_easy_eq_mask)) continue;                                                                             \
+		candidates_easy_vmask = hn::IfThenElse(hash_easy_eq_mask, hn::Or(candidates_easy_vmask, ones_vec), candidates_easy_vmask);          \
+  }                                                                                                                                     \
+  const auto hash_hard_eq_mask = hn::Eq(hn::And(hash_vec, mask_hard_vec), zero_vec);                                                    \
+  /* Quitting early as above */                                                                                                         \
+  if (hn::AllFalse(i32VecD, hash_hard_eq_mask)) continue;                                                                               \
+  candidates_hard_vmask = hn::IfThenElse(hash_hard_eq_mask, hn::Or(candidates_hard_vmask, ones_vec), candidates_hard_vmask);            \
 } while (0)
 #define CDC_SIMD_ITER(vbytes) CDC_SIMD_ITER_IMPL(vbytes, true, true, false)
 #define CDC_SIMD_ITER_SSCDC(vbytes) CDC_SIMD_ITER_IMPL(vbytes, false, false, false)

@@ -27,10 +27,10 @@ struct CutPointCandidateWithContext {
 
 struct CDCZ_CONFIG {
   bool compute_features = false;
-  bool use_fastcdc_subminimum_skipping = false;
-  bool use_fastcdc_normalized_chunking = false;
-  bool use_supercdc_minmax_adjustment = false;
-  bool use_supercdc_backup_mask = false;
+  bool use_fastcdc_subminimum_skipping = true;
+  bool use_fastcdc_normalized_chunking = true;
+  bool use_supercdc_minmax_adjustment = true;
+  bool use_supercdc_backup_mask = true;
   bool simd_allowed = false;
 };
 
