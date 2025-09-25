@@ -261,8 +261,8 @@ int main(int argc, char* argv[]) {
 
   const bool output_disabled = false;
 
-  const bool use_dupadj = true;
-  const bool use_dupadj_backwards = true;
+  const bool use_dupadj = false;
+  const bool use_dupadj_backwards = false;
   // If enabled then DupAdj will attempt other chunks with the same hashes as the adjacent ones in an attempt to find other possible similar chunks
   const bool exhaustive_dupadj = false;
   const bool use_generalized_resemblance_detection = false;
@@ -369,17 +369,17 @@ int main(int argc, char* argv[]) {
 
   std::future<std::vector<uint8_t>> load_next_segment_batch_future;
   auto load_next_segment_batch = [&wrapped_input_stream, segment_batch_size]
-  (std::array<uint8_t, 31>&& _prev_segment_extend_data) -> std::vector<uint8_t> {
-    std::array<uint8_t, 31> prev_segment_extend_data = std::move(_prev_segment_extend_data);
+  (std::array<uint8_t, 63>&& _prev_segment_extend_data) -> std::vector<uint8_t> {
+    std::array<uint8_t, 63> prev_segment_extend_data = std::move(_prev_segment_extend_data);
     std::vector<uint8_t> new_segment_batch_data;
-    new_segment_batch_data.resize(segment_batch_size + 31);  // +31 bytes (our GEAR window size - 1) at the end so it overlaps with next segment as described in SS-CDC
+    new_segment_batch_data.resize(segment_batch_size + 63);  // +63 bytes (our GEAR window size - 1) at the end so it overlaps with next segment as described in SS-CDC
 
-    // We get the 31byte extension to be at the start of the new segment data
-    std::copy_n(prev_segment_extend_data.data(), 31, new_segment_batch_data.data());
+    // We get the 63byte extension to be at the start of the new segment data
+    std::copy_n(prev_segment_extend_data.data(), 63, new_segment_batch_data.data());
 
     // And attempt to load remaining data for the new segments including next segment extension
-    wrapped_input_stream.read(new_segment_batch_data.data() + 31, segment_batch_size);
-    new_segment_batch_data.resize(31 + wrapped_input_stream.gcount());
+    wrapped_input_stream.read(new_segment_batch_data.data() + 63, segment_batch_size);
+    new_segment_batch_data.resize(63 + wrapped_input_stream.gcount());
 
     new_segment_batch_data.shrink_to_fit();
     return new_segment_batch_data;
@@ -394,10 +394,10 @@ int main(int argc, char* argv[]) {
     for (uint64_t i = 0; i < cdc_thread_count; i++) {
       if (segment_batch_data_span.empty()) break;
       auto current_segment_data = std::vector<uint8_t>();
-      current_segment_data.resize(std::min<uint64_t>(segment_batch_data_span.size(), segment_size + 31));
+      current_segment_data.resize(std::min<uint64_t>(segment_batch_data_span.size(), segment_size + 63));
       current_segment_data.shrink_to_fit();
       std::copy_n(segment_batch_data_span.data(), current_segment_data.size(), current_segment_data.data());
-      bool segments_eof = current_segment_data.size() != segment_size + 31;
+      bool segments_eof = current_segment_data.size() != segment_size + 63;
 
       const auto span_advance_size = std::min<uint64_t>(current_segment_data.size(), segment_size);
 
@@ -416,9 +416,9 @@ int main(int argc, char* argv[]) {
     chunk_generator_execution_time_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(chunk_generator_end_time - chunk_generator_start_time).count();
 
     // If not at EOF we already start loading the next segment batch data
-    if (segment_batch_data.size() == segment_batch_size + 31) {
-      std::array<uint8_t, 31> segment_extend_data;
-      std::copy_n(segment_batch_data.data() + segment_batch_size, 31, segment_extend_data.data());
+    if (segment_batch_data.size() == segment_batch_size + 63) {
+      std::array<uint8_t, 63> segment_extend_data;
+      std::copy_n(segment_batch_data.data() + segment_batch_size, 63, segment_extend_data.data());
       load_next_segment_batch_future = globalTaskPool.addTask(
         [segment_extend_data = std::move(segment_extend_data), &load_next_segment_batch]() mutable {
           return load_next_segment_batch(std::move(segment_extend_data));
@@ -467,8 +467,8 @@ int main(int argc, char* argv[]) {
 
   {
     std::vector<uint8_t> segment_batch_data;
-    segment_batch_data.resize(segment_size * cdc_thread_count + 31);  // +31 bytes (our GEAR window size - 1) at the end so it overlaps with next segment as described in SS-CDC
-    wrapped_input_stream.read(segment_batch_data.data(), segment_batch_size + 31);
+    segment_batch_data.resize(segment_size * cdc_thread_count + 63);  // +63 bytes (our GEAR window size - 1) at the end so it overlaps with next segment as described in SS-CDC
+    wrapped_input_stream.read(segment_batch_data.data(), segment_batch_size + 63);
     segment_batch_data.resize(wrapped_input_stream.gcount());
     segment_batch_data.shrink_to_fit();
 

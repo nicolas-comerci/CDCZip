@@ -128,14 +128,14 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
   if (is_use_mt || is_use_simd || is_use_sscdc) {
     auto data_span = std::span<uint8_t>(file_data, file_size);
     while (!data_span.empty()) {
-      const uint64_t segment_expected_size = segment_size + 31;
+      const uint64_t segment_expected_size = segment_size + 63;
       const uint64_t this_segment_size = std::min<uint64_t>(data_span.size(), segment_expected_size);
 
       segments.emplace_back(data_span.data(), this_segment_size);
       auto& data_segment_span = segments.back();
 
       if (this_segment_size == segment_expected_size) {
-        data_span = std::span<uint8_t>(data_span.data() + data_segment_span.size() - 31, data_span.size() - data_segment_span.size() + 31);
+        data_span = std::span<uint8_t>(data_span.data() + data_segment_span.size() - 63, data_span.size() - data_segment_span.size() + 63);
       }
       else {
         // last segment, set empty span so we quit
@@ -157,7 +157,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
     auto in_segment_data = std::min(chunk_size, segments[current_segment_i].size() - current_segment_pos);
     if (in_segment_data == 0) {
       current_segment_i++;
-      current_segment_pos = 31;
+      current_segment_pos = 63;
       in_segment_data = std::min(chunk_size, segments[current_segment_i].size() - current_segment_pos);
     }
     XXH3_64bits_reset(hash_state);
@@ -165,7 +165,7 @@ void cdcz_test_mode(const std::string& file_path, uint64_t file_size, std::unord
     current_segment_pos += in_segment_data;
     if (in_segment_data < chunk_size) {
       current_segment_i++;
-      current_segment_pos = 31;
+      current_segment_pos = 63;
       in_segment_data = chunk_size - in_segment_data;
       XXH3_64bits_update(hash_state, segments[current_segment_i].data() + current_segment_pos, in_segment_data);
       current_segment_pos += in_segment_data;
@@ -478,7 +478,7 @@ void calc_gear_at_pos(const std::string& file_path, uint64_t file_size, uint64_t
     exit(1);
   }
 
-  auto minmax_adjustment = std::min<uint64_t>(pos, 31);
+  auto minmax_adjustment = std::min<uint64_t>(pos, 63);
   file_stream.seekg(pos - minmax_adjustment);
   std::vector<uint8_t> data{};
   data.resize(minmax_adjustment + 1);
@@ -489,7 +489,7 @@ void calc_gear_at_pos(const std::string& file_path, uint64_t file_size, uint64_t
     exit(1);
   }
 
-  uint32_t pattern = 0;
+  uint64_t pattern = 0;
   for (uint64_t i = 0; i < minmax_adjustment + 1; i++) {
     pattern = (pattern << 1) + GEAR_TABLE[data[i]];
   }

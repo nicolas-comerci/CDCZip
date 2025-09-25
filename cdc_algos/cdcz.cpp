@@ -28,7 +28,7 @@ static CdcCandidatesResult find_cdc_cut_candidates_impl(
   CdcCandidatesResult result{};
   if (data.empty()) return result;
 
-  const auto make_mask = [](uint32_t bits) -> uint32_t { return 0xFFFFFFFF << (32 - bits); };
+  const auto make_mask = [](uint64_t bits) -> uint64_t { return 0xFFFFFFFFFFFFFFFF << (64 - bits); };
   const auto bits = std::lround(std::log2(avg_size));
   const auto mask_hard = make_mask(bits + 1);
   const auto mask_medium = make_mask(bits);
@@ -165,7 +165,7 @@ uint64_t select_cut_point_candidates(
     segment_data_pos += chunk_size_in_segment;
     };
 
-  // If the last used cut point is on data already on this segment (should be within the 31/window_size - 1 bytes extension of the previous segment)
+  // If the last used cut point is on data already on this segment (should be within the 63/window_size - 1 bytes extension of the previous segment)
   // we start from that pos on this segment
   if (last_cut_point > segment_start_offset) {
     segment_data_pos = last_cut_point - segment_start_offset;
@@ -205,7 +205,7 @@ uint64_t select_cut_point_candidates(
 
     for (uint64_t i = 0; i < new_cut_point_candidates.size(); i++) {
       auto& cut_point_candidate = new_cut_point_candidates[i];
-      if (!is_first_segment && cut_point_candidate.offset <= 31) {
+      if (!is_first_segment && cut_point_candidate.offset <= 63) {
         // Any supposed candidate on a segment which is not the first one, before the GEAR_WINDOW_SIZE - 1 is fully processed is either spurious
         // (an artifact of the GEAR hash not being fully loaded yet) or it already should have gotten returned at the end of the previous segment
         continue;
@@ -245,10 +245,10 @@ uint64_t select_cut_point_candidates(
     // If there is more unused data at the end of the segment than the window_size - 1 bytes of the extension, we save that data
     // as it will need to be used for the next chunk
     const auto segment_data_tail_len = segment_data.size() - segment_data_pos;
-    if (segment_data_tail_len > 31) {
-      prev_segment_remaining_data.resize(segment_data_tail_len - 31);
+    if (segment_data_tail_len > 63) {
+      prev_segment_remaining_data.resize(segment_data_tail_len - 63);
       prev_segment_remaining_data.shrink_to_fit();
-      std::copy_n(segment_data.data() + segment_data_pos, segment_data_tail_len - 31, prev_segment_remaining_data.data());
+      std::copy_n(segment_data.data() + segment_data_pos, segment_data_tail_len - 63, prev_segment_remaining_data.data());
     }
 
     return last_made_chunk_size;

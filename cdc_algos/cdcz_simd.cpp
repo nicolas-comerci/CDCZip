@@ -98,7 +98,7 @@ static void find_cdc_cut_candidates_simd_impl(
   const i32Vec ones_vec = hn::Set(i32VecD, 1);
   const i32Vec twos_vec = hn::Set(i32VecD, 2);
   const i32Vec eights_vec = hn::Set(i32VecD, 8);
-  const i32Vec window_size_minus_one_vec = hn::Set(i32VecD, 31);
+  const i32Vec window_size_minus_one_vec = hn::Set(i32VecD, 63);
 
   // Highway's portable GatherIndex requires we read with 32bit/4byte alignment as we have int32_t vectors.
   // This way we ensure we never attempt to Gather from outside the data boundaries, the last < 4 bytes can be finished off manually.
@@ -257,7 +257,7 @@ static void find_cdc_cut_candidates_simd_impl(
 
     minmax_adjustment_vec[lane_i] = new_lane_pos;
     if (cdcz_cfg.use_supercdc_minmax_adjustment) {
-      auto adjustment = std::min(31, new_lane_pos);
+      auto adjustment = std::min(63, new_lane_pos);
       new_lane_pos -= adjustment;
     }
     else {
@@ -268,7 +268,7 @@ static void find_cdc_cut_candidates_simd_impl(
     const int32_t aligned_new_lane_pos = pad_size_for_alignment(new_lane_pos, 4);
     const auto bytes_to_alignment = aligned_new_lane_pos - new_lane_pos;
     if (cdcz_cfg.use_supercdc_minmax_adjustment) {
-      // This is fine, doing adjustment for more than 31 bytes won't change the GEAR hashing result
+      // This is fine, doing adjustment for more than 63 bytes won't change the GEAR hashing result
       new_lane_pos -= bytes_to_alignment > 0 ? 4 - bytes_to_alignment : 0;
     }
     else {
@@ -330,7 +330,7 @@ static void find_cdc_cut_candidates_simd_impl(
         const int32_t lane_pos = hn::ExtractLane(vindex, lane_i);
         int32_t bit = 0;
         while (candidates_cds_bits != 0) {
-          if (candidates_cds_bits & (0b1 << 31)) {
+          if (candidates_cds_bits & (0b1 << 63)) {
             sample_feature_value(lane_i);
           }
           candidates_cds_bits <<= 1;
@@ -354,10 +354,10 @@ static void find_cdc_cut_candidates_simd_impl(
         const int32_t lane_pos = hn::ExtractLane(vindex, lane_i);
         int32_t bit = 0;
         while (candidates_easiest_bits != 0) {
-          if (candidates_easiest_bits & (0b1 << 31)) {
+          if (candidates_easiest_bits & (0b1 << 63)) {
             CutPointCandidateType cut_type = CutPointCandidateType::SUPERCDC_BACKUP_MASK;
-            if (candidates_easy_bits & (0b1 << 31)) cut_type = CutPointCandidateType::EASY_CUT_MASK;
-            if (candidates_hard_bits & (0b1 << 31)) cut_type = CutPointCandidateType::HARD_CUT_MASK;
+            if (candidates_easy_bits & (0b1 << 63)) cut_type = CutPointCandidateType::EASY_CUT_MASK;
+            if (candidates_hard_bits & (0b1 << 63)) cut_type = CutPointCandidateType::HARD_CUT_MASK;
             process_lane(lane_i, lane_pos + bit, cut_type);
           }
           candidates_backup_bits <<= 1;
@@ -383,9 +383,9 @@ static void find_cdc_cut_candidates_simd_impl(
 
   {
     // Deal with any trailing data sequentially
-    int32_t i = hn::ExtractLane(vindex_max, lane_count - 1) - 31;
+    int32_t i = hn::ExtractLane(vindex_max, lane_count - 1) - 63;
     // The hash might be nonsense if the last lane finished before the others, so we just recover it
-    uint64_t remaining_minmax_adjustment = 31;
+    uint64_t remaining_minmax_adjustment = 63;
     uint32_t pattern = 0;
     // TODO: Can trunc for max_size, though it should be handled by select cut point candidates anyway
 
@@ -488,7 +488,7 @@ static void sscdc_first_stage_impl(std::span<uint8_t> data, uint8_t* results_bit
   i32Vec vindex_max = hn::Add(vindex, hn::Set(i32VecD, bytes_per_lane));
 
   // All lanes have to initialize their GEAR values with a full window of data before those are usable, like we do with SuperCDC min-max adjustment
-  // Doing 32 bytes even if 31 should be enough, so we keep 32byte data alignment
+  // Doing 32 bytes even if 63 should be enough, so we keep 32byte data alignment
   vindex = hn::Sub(vindex, hn::Set(i32VecD, 32));
   vindex = hn::InsertLane(vindex, 0, 0);
   bool gear_initialized = false;
@@ -547,9 +547,9 @@ static void sscdc_first_stage_impl(std::span<uint8_t> data, uint8_t* results_bit
 
   {
     // Deal with any trailing data sequentially
-    int32_t i = hn::ExtractLane(vindex_max, lane_count - 1) - 31;
+    int32_t i = hn::ExtractLane(vindex_max, lane_count - 1) - 63;
     // The hash might be nonsense if the last lane finished before the others, so we just recover it
-    uint64_t remaining_minmax_adjustment = 31;
+    uint64_t remaining_minmax_adjustment = 63;
     uint32_t pattern = 0;
 
     while (i < data.size()) {
@@ -600,9 +600,9 @@ static void sscdc_second_stage_impl(
       if (lane_bits == 0) continue;
 
       std::bitset<32> lane_bitset{ lane_bits };
-      for (int8_t bit = 31; bit >= 0; bit--) {
+      for (int8_t bit = 63; bit >= 0; bit--) {
         auto is_supposed_cut = lane_bitset.test(bit);
-        in_segment_candidate_offset = in_segment_current_offset + (candidate_lane * 32u) + (31 - bit);
+        in_segment_candidate_offset = in_segment_current_offset + (candidate_lane * 64u) + (63 - bit);
         if (is_supposed_cut) {
           const auto candidate_offset = in_segment_candidate_offset + segment_start_offset;
           // Before attempting to use this new cut candidate, ensure we haven't exceeded max chunk size since the previous cut
@@ -620,8 +620,8 @@ static void sscdc_second_stage_impl(
     }
     if (
       !valid_cutoff_found ||
-      // If it's not the first segment, the first 31 bytes have invalid results as the GEAR hash hasn't had a full data window processed yet
-      (segment_start_offset != 0 && in_segment_candidate_offset <= 31)
+      // If it's not the first segment, the first 63 bytes have invalid results as the GEAR hash hasn't had a full data window processed yet
+      (segment_start_offset != 0 && in_segment_candidate_offset <= 63)
     ) {
       in_segment_current_offset += vec_bit_width;
       continue;

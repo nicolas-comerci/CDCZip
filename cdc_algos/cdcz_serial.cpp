@@ -26,7 +26,7 @@ CutPointCandidateWithContext cdc_next_cutpoint(
   uint32_t mask_medium,
   uint32_t mask_easy,
   const CDCZ_CONFIG& cdcz_cfg,
-  uint32_t initial_pattern
+  uint64_t initial_pattern
 ) {
   CutPointCandidateWithContext result;
   result.pattern = initial_pattern;
@@ -65,7 +65,7 @@ CutPointCandidateWithContext cdc_next_cutpoint(
   uint32_t remaining_minmax_adjustment = 0;
   if (cdcz_cfg.use_fastcdc_subminimum_skipping) {
     if (cdcz_cfg.use_supercdc_minmax_adjustment) {
-      remaining_minmax_adjustment = std::min<uint32_t>(i, 31);
+      remaining_minmax_adjustment = std::min<uint32_t>(i, 63);
       i -= remaining_minmax_adjustment;
     }
   }
@@ -150,7 +150,7 @@ CutPointCandidateWithContext cdc_next_cutpoint_candidate(
   uint32_t mask_medium,
   uint32_t mask_easy,
   const CDCZ_CONFIG& cdcz_cfg,
-  uint32_t initial_pattern
+  uint64_t initial_pattern
 ) {
   // We craft a CDCZ_CONFIG and settings to force cdc_next_cutpoint to give us the next possible candidate according to any of the available criteria,
   // given that the chunk invariance condition is not satisfied

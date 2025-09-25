@@ -21,7 +21,7 @@ struct CutPointCandidate {
 
 struct CutPointCandidateWithContext {
   CutPointCandidate candidate{};
-  uint32_t pattern = 0;
+  uint64_t pattern = 0;
   std::vector<uint32_t> features{};
 };
 
@@ -61,7 +61,7 @@ uint64_t select_cut_point_candidates(
   bool copy_chunk_data = true
 );
 
-inline auto promote_cut_candidate(const CDCZ_CONFIG& cdcz_cfg, uint32_t pattern, uint32_t mask_hard, uint32_t mask_medium, uint32_t mask_easy) -> CutPointCandidateType {
+inline auto promote_cut_candidate(const CDCZ_CONFIG& cdcz_cfg, uint64_t pattern, uint32_t mask_hard, uint32_t mask_medium, uint32_t mask_easy) -> CutPointCandidateType {
   // Set the candidate type according to the condition_mask we used
   CutPointCandidateType promoted_cut_type = cdcz_cfg.use_supercdc_backup_mask
     ? CutPointCandidateType::SUPERCDC_BACKUP_MASK
