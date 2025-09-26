@@ -22,9 +22,9 @@ CutPointCandidateWithContext cdc_next_cutpoint(
   uint32_t min_size,
   uint32_t avg_size,
   uint32_t max_size,
-  uint32_t mask_hard,
-  uint32_t mask_medium,
-  uint32_t mask_easy,
+  uint64_t mask_hard,
+  uint64_t mask_medium,
+  uint64_t mask_easy,
   const CDCZ_CONFIG& cdcz_cfg,
   uint64_t initial_pattern
 ) {
@@ -146,9 +146,9 @@ CutPointCandidateWithContext cdc_next_cutpoint(
 
 CutPointCandidateWithContext cdc_next_cutpoint_candidate(
   const std::span<uint8_t> data,
-  uint32_t mask_hard,
-  uint32_t mask_medium,
-  uint32_t mask_easy,
+  uint64_t mask_hard,
+  uint64_t mask_medium,
+  uint64_t mask_easy,
   const CDCZ_CONFIG& cdcz_cfg,
   uint64_t initial_pattern
 ) {
@@ -161,7 +161,7 @@ CutPointCandidateWithContext cdc_next_cutpoint_candidate(
     .use_supercdc_minmax_adjustment = false,  // as we don't use subminimum skipping, it makes no sense to attempt minmax_adjustment
     .use_supercdc_backup_mask = false,  // if we need to search for possible backup masks we will handle it by forcing mask_easy
   };
-  uint32_t condition_mask = cdcz_cfg.use_fastcdc_normalized_chunking ? mask_easy : mask_medium;
+  uint64_t condition_mask = cdcz_cfg.use_fastcdc_normalized_chunking ? mask_easy : mask_medium;
   if (cdcz_cfg.use_supercdc_backup_mask) {
     // instead of using it as a backup, we just set the SuperCDC backup mask as the mask to be used, to force any position that satisfies it to be returned
     condition_mask = condition_mask << 1;
@@ -184,9 +184,9 @@ static void find_cdc_cut_candidates_serial_impl(
   int32_t min_size,
   int32_t avg_size,
   int32_t max_size,
-  uint32_t mask_hard,
-  uint32_t mask_medium,
-  uint32_t mask_easy,
+  uint64_t mask_hard,
+  uint64_t mask_medium,
+  uint64_t mask_easy,
   const CDCZ_CONFIG& cdcz_cfg,
   bool is_first_segment
 ) {
@@ -274,9 +274,9 @@ void find_cdc_cut_candidates_serial(
   int32_t min_size,
   int32_t avg_size,
   int32_t max_size,
-  uint32_t mask_hard,
-  uint32_t mask_medium,
-  uint32_t mask_easy,
+  uint64_t mask_hard,
+  uint64_t mask_medium,
+  uint64_t mask_easy,
   const CDCZ_CONFIG& cdcz_cfg,
   bool is_first_segment
 ) {

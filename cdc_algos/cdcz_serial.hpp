@@ -11,9 +11,9 @@ void find_cdc_cut_candidates_serial(
   int32_t min_size,
   int32_t avg_size,
   int32_t max_size,
-  uint32_t mask_hard,
-  uint32_t mask_medium,
-  uint32_t mask_easy,
+  uint64_t mask_hard,
+  uint64_t mask_medium,
+  uint64_t mask_easy,
   const CDCZ_CONFIG& cdcz_cfg,
   bool is_first_segment
 );
